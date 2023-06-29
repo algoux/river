@@ -1,6 +1,11 @@
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use env_logger::Builder;
+use log::{error, trace};
+
+mod error;
+mod sandbox;
+mod utils;
 
 /// example: `river -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
@@ -73,5 +78,11 @@ fn main() {
         .filter_level(opts.verbose.log_level_filter())
         .init();
 
-    println!("{:?}", opts);
+    trace!("{:?}", opts);
+
+    let status = sandbox::Sandbox::new(opts.command).run();
+    if let Err(e) = status {
+        error!("{}", e);
+        std::process::exit(1);
+    }
 }
