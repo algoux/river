@@ -32,10 +32,10 @@ struct Opts {
     #[clap(short, long, default_value = "/STDOUT/")]
     result: String,
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Time limit, in ms. The default value is unlimited.
-    #[clap(short, long, default_value = "0")]
-    time_limit: i32,
+    #[clap(short, long)]
+    time_limit: Option<u32>,
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     /// Memory limit, in kib. The default value is unlimited.
@@ -80,7 +80,9 @@ fn main() {
 
     trace!("{:?}", opts);
 
-    let status = sandbox::Sandbox::new(opts.command).run();
+    let status = sandbox::Sandbox::new(opts.command)
+        .time_limit(opts.time_limit)
+        .run();
     if let Err(e) = status {
         error!("{}", e);
         std::process::exit(1);
