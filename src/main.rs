@@ -1,11 +1,12 @@
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use env_logger::Builder;
-use log::{error, trace};
+use log::{error, info, trace};
 
 mod error;
 mod sandbox;
 mod utils;
+mod status;
 
 /// example: `river -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
@@ -83,8 +84,14 @@ fn main() {
     let status = sandbox::Sandbox::new(opts.command)
         .time_limit(opts.time_limit)
         .run();
-    if let Err(e) = status {
-        error!("{}", e);
-        std::process::exit(1);
-    }
+
+    match status {
+        Ok(status) => {
+            info!("{}", status);
+        }
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(1);
+        }
+    };
 }

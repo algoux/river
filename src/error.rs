@@ -9,7 +9,7 @@ use windows::Win32::Foundation::WIN32_ERROR;
 pub enum Error {
     /// Windows 平台下的 LastError
     #[cfg(target_os = "windows")]
-    WinError(WIN32_ERROR),
+    WinError(String, WIN32_ERROR),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -17,10 +17,11 @@ pub type Result<T> = result::Result<T, Error>;
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match *self {
-            Error::WinError(ref e) => {
+            Error::WinError(ref api_name, ref e) => {
                 write!(
                     f,
-                    "Windows API Error: {}",
+                    "Windows API Error: `{}` {}",
+                    api_name,
                     WIN32_ERROR(e.0).to_hresult().message()
                 )
             }
