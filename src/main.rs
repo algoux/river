@@ -38,10 +38,15 @@ struct Opts {
     #[clap(short, long)]
     time_limit: Option<u32>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    /// CPU Time limit, in ms. The default value is unlimited.
+    #[clap(short, long)]
+    cpu_time_limit: Option<u32>,
+
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Memory limit, in kib. The default value is unlimited.
-    #[clap(short, long, default_value = "0")]
-    memory_limit: i32,
+    #[clap(short, long)]
+    memory_limit: Option<u32>,
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     /// Maximum number of files that can be written. The unit is bit. The default value is unlimited.
@@ -83,6 +88,8 @@ fn main() {
 
     let status = sandbox::Sandbox::new(opts.command)
         .time_limit(opts.time_limit)
+        .cpu_time_limit(opts.cpu_time_limit)
+        .memory_limit(opts.memory_limit)
         .run();
 
     match status {
