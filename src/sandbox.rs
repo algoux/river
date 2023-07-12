@@ -68,7 +68,6 @@ macro_rules! winapi_bool {
 #[cfg(target_os = "windows")]
 impl Sandbox {
     pub unsafe fn run(&mut self) -> Result<Status> {
-        let mut status: Status = Default::default();
         // 执行的目标 app，前置的命令行解析保证 inner_args 至少有一项
         let app = Vec::from((&self.inner_args[0]).as_bytes()).as_ptr();
         // 执行的文件参数
@@ -104,6 +103,12 @@ impl Sandbox {
                 GetLastError()
             }));
         }
+
+        self.wait_it(&information)
+    }
+
+    unsafe fn wait_it(&mut self, information: &PROCESS_INFORMATION) -> Result<Status> {
+        let mut status: Status = Default::default();
 
         let timeout = if let Some(t) = self.time_limit {
             t
@@ -152,7 +157,7 @@ impl Sandbox {
         status.cpu_time_used =
             (lp_kernel_time.dwLowDateTime + lp_user_time.dwLowDateTime) as u64 / 10000;
 
-        Ok(status)
+        return Ok(status);
     }
 
     unsafe fn limit(&mut self, information: &PROCESS_INFORMATION) -> Result<Status> {
