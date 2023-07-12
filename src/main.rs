@@ -86,11 +86,13 @@ fn main() {
 
     trace!("{:?}", opts);
 
-    let status = sandbox::Sandbox::new(opts.command)
-        .time_limit(opts.time_limit)
-        .cpu_time_limit(opts.cpu_time_limit)
-        .memory_limit(opts.memory_limit)
-        .run();
+    let status = unsafe {
+        sandbox::Sandbox::new(opts.command)
+            .time_limit(opts.time_limit)
+            .cpu_time_limit(opts.cpu_time_limit)
+            .memory_limit(opts.memory_limit)
+            .run()
+    };
 
     match status {
         Ok(status) => {
