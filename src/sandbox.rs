@@ -1,10 +1,12 @@
+use crate::error::Error::WinError;
 use crate::error::Result;
+use crate::status::Status;
+use crate::Opts;
+
 use std::ffi::c_void;
 use std::mem::size_of;
 
-use crate::error::Error::WinError;
-use crate::status::Status;
-
+#[cfg(target_os = "windows")]
 use windows::{
     core::{PCSTR, PSTR},
     Win32::Foundation::GetLastError,
@@ -25,35 +27,31 @@ use windows::{
 
 pub struct Sandbox {
     inner_args: Vec<String>,
-    pub time_limit: Option<u32>,
-    pub cpu_time_limit: Option<u32>,
-    pub memory_limit: Option<u32>,
+    time_limit: Option<u32>,
+    cpu_time_limit: Option<u32>,
+    memory_limit: Option<u32>,
+    input: Option<String>,
+    output: Option<String>,
+    error: Option<String>,
+    result: Option<String>,
 }
 
 impl Sandbox {
-    pub fn new(args: Vec<String>) -> Self {
+    pub fn with_opts(opts: Opts) -> Self {
         Sandbox {
-            inner_args: args,
-            time_limit: None,
-            cpu_time_limit: None,
-            memory_limit: None,
+            inner_args: opts.command,
+            time_limit: opts.time_limit,
+            cpu_time_limit: opts.cpu_time_limit,
+            memory_limit: opts.memory_limit,
+            input: opts.input,
+            output: opts.output,
+            error: opts.error,
+            result: opts.result,
         }
-    }
-
-    pub fn time_limit(mut self, l: Option<u32>) -> Self {
-        self.time_limit = l;
-        self
-    }
-    pub fn cpu_time_limit(mut self, l: Option<u32>) -> Self {
-        self.cpu_time_limit = l;
-        self
-    }
-    pub fn memory_limit(mut self, l: Option<u32>) -> Self {
-        self.memory_limit = l;
-        self
     }
 }
 
+#[cfg(target_os = "windows")]
 #[macro_export]
 macro_rules! winapi_bool {
     ($expression:expr) => {
@@ -99,9 +97,7 @@ impl Sandbox {
 
         // 唤醒被暂停的进程
         if ResumeThread(information.hThread) != 1 {
-            return Err(WinError(String::from(file!()), line!(), unsafe {
-                GetLastError()
-            }));
+            return Err(WinError(String::from(file!()), line!(), GetLastError()));
         }
 
         self.wait_it(&information)
@@ -124,9 +120,7 @@ impl Sandbox {
             // 此处不检查返回值
             WaitForSingleObject(information.hProcess, 0xFFFFFFFF);
         } else if wait_ret == WAIT_FAILED {
-            return Err(WinError(String::from(file!()), line!(), unsafe {
-                GetLastError()
-            }));
+            return Err(WinError(String::from(file!()), line!(), GetLastError()));
         }
 
         let mut pmc: PROCESS_MEMORY_COUNTERS = Default::default();
@@ -164,23 +158,13 @@ impl Sandbox {
         let job = match CreateJobObjectA(None, None) {
             Ok(resp) => resp,
             Err(_) => {
-                return Err(WinError(String::from(file!()), line!(), unsafe {
-                    GetLastError()
-                }));
+                return Err(WinError(String::from(file!()), line!(), GetLastError()));
             }
         };
 
         let mut limit: JOBOBJECT_BASIC_LIMIT_INFORMATION = Default::default();
         limit.LimitFlags = JOB_OBJECT_LIMIT_PRIORITY_CLASS;
         limit.PriorityClass = IDLE_PRIORITY_CLASS.0;
-
-        // 系统定期检查以确定与作业关联的每个进程是否累积了比设置限制更多的用户模式时间。 如果已终止，则终止进程。
-        // cpu 时间限制，此限制不会实时结束进程（需要等到下次检查？）
-        if let Some(l) = self.cpu_time_limit {
-            limit.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
-            limit.PerProcessUserTimeLimit = l as i64 * 10000;
-            limit.PerJobUserTimeLimit = l as i64 * 10000;
-        }
 
         // 内存限制
         if let Some(l) = self.memory_limit {
@@ -190,6 +174,14 @@ impl Sandbox {
                 1,
                 l as usize * 1024
             ))
+        }
+
+        // 系统定期检查以确定与作业关联的每个进程是否累积了比设置限制更多的用户模式时间。 如果已终止，则终止进程。
+        // cpu 时间限制，此限制不会实时结束进程（需要等到下次检查？）
+        if let Some(l) = self.cpu_time_limit {
+            limit.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
+            limit.PerProcessUserTimeLimit = l as i64 * 10000;
+            limit.PerJobUserTimeLimit = l as i64 * 10000;
         }
 
         // 设置 job 限制
@@ -203,6 +195,10 @@ impl Sandbox {
         // 将 job 附加到进程
         winapi_bool!(AssignProcessToJobObject(job, information.hProcess));
 
+        Ok(Default::default())
+    }
+
+    unsafe fn redirect_fd(&mut self) -> Result<Status> {
         Ok(Default::default())
     }
 }

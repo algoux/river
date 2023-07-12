@@ -5,24 +5,24 @@ use log::{error, info, trace};
 
 mod error;
 mod sandbox;
-mod utils;
 mod status;
+mod utils;
 
 /// example: `river -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
 #[clap(version = "1.0", author = "MeiK <meik2333@gmail.com>")]
-struct Opts {
+pub struct Opts {
     /// Input stream. The default value is STDIN(0)
-    #[clap(short, long, default_value = "/STDIN/")]
-    input: String,
+    #[clap(short, long)]
+    input: Option<String>,
 
     /// Output stream. The default value is STDOUT(1)
-    #[clap(short, long, default_value = "/STDOUT/")]
-    output: String,
+    #[clap(short, long)]
+    output: Option<String>,
 
     /// Error stream. The default value is STDERR(2)
-    #[clap(short, long, default_value = "/STDERR/")]
-    error: String,
+    #[clap(short, long)]
+    error: Option<String>,
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     /// Working directory. The default value is the current directory.
@@ -30,8 +30,8 @@ struct Opts {
     workdir: String,
 
     /// Output location of the running result. The default value is STDOUT(1)
-    #[clap(short, long, default_value = "/STDOUT/")]
-    result: String,
+    #[clap(short, long)]
+    result: Option<String>,
 
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Time limit, in ms. The default value is unlimited.
@@ -86,13 +86,7 @@ fn main() {
 
     trace!("{:?}", opts);
 
-    let status = unsafe {
-        sandbox::Sandbox::new(opts.command)
-            .time_limit(opts.time_limit)
-            .cpu_time_limit(opts.cpu_time_limit)
-            .memory_limit(opts.memory_limit)
-            .run()
-    };
+    let status = unsafe { sandbox::Sandbox::with_opts(opts).run() };
 
     match status {
         Ok(status) => {
