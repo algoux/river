@@ -12,6 +12,7 @@ use sys::windows::Sandbox;
 use crate::sys::SandboxImpl;
 
 mod sys;
+mod error;
 
 /// example: `river -vvv -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
@@ -90,5 +91,14 @@ fn main() {
         .init();
 
     trace!("{:?}", opts);
-    Sandbox::with_opts(opts).run();
+    let status = unsafe { Sandbox::with_opts(opts).run() };
+    match status {
+        Ok(_) => {
+            info!("success");
+        }
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(1);
+        }
+    }
 }
