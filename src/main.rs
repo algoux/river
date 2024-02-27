@@ -39,17 +39,14 @@ pub struct Opts {
     #[clap(short, long)]
     result: Option<String>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Time limit, in ms. The default value is unlimited.
     #[clap(short, long)]
     time_limit: Option<u32>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// CPU Time limit, in ms. The default value is unlimited.
     #[clap(short, long)]
     cpu_time_limit: Option<u32>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     /// Memory limit, in kib. The default value is unlimited.
     #[clap(short, long)]
     memory_limit: Option<u32>,
@@ -81,6 +78,22 @@ pub struct Opts {
     /// Network enable
     #[clap(long, default_value = "false")]
     network: bool,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Opts {
+            input: None,
+            output: None,
+            error: None,
+            result: None,
+            time_limit: None,
+            cpu_time_limit: None,
+            memory_limit: None,
+            command: vec![],
+            verbose: Default::default(),
+        }
+    }
 }
 
 fn main() {

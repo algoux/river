@@ -1,9 +1,12 @@
-use crate::sys::SandboxImpl;
-use crate::Opts;
 use windows::core::{PCSTR, PSTR};
 use windows::Win32::Foundation::GetLastError;
-use windows::Win32::System::Threading::{CreateProcessA, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOA, ResumeThread};
-use crate::error::Error::{E, WinError};
+use windows::Win32::System::Threading::{
+    CreateProcessA, ResumeThread, CREATE_SUSPENDED, PROCESS_INFORMATION, STARTUPINFOA,
+};
+
+use crate::error::Error::{WinError, E};
+use crate::sys::SandboxImpl;
+use crate::Opts;
 
 #[derive(Debug)]
 pub struct Sandbox {
@@ -64,9 +67,47 @@ impl SandboxImpl for Sandbox {
 
         // 唤醒被暂停的进程
         if ResumeThread(information.hThread) != 1 {
-            return Err(E(String::from(file!()), line!(), "唤醒进程失败".to_string()));
+            return Err(E(
+                String::from(file!()),
+                line!(),
+                "唤醒进程失败".to_string(),
+            ));
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::error::Result;
+    use crate::sys::windows::Sandbox;
+    use crate::sys::SandboxImpl;
+    use crate::Opts;
+
+    #[test]
+    fn hello() {
+        assert_eq!(1 + 1, 2);
+    }
+
+    /**
+     * 启动记事本
+     */
+    #[test]
+    fn notepad() -> Result<()> {
+        let mut opts: Opts = Opts::default();
+        opts.command.push("C:/Windows/notepad.exe".to_string());
+        unsafe { Sandbox::with_opts(opts).run() }
+    }
+
+    /**
+     * 执行不存在的可执行文件
+     */
+    #[test]
+    #[should_panic]
+    fn not_found() {
+        let mut opts: Opts = Opts::default();
+        opts.command.push("Z:/not-found.exe".to_string());
+        unsafe { Sandbox::with_opts(opts).run().unwrap(); }
     }
 }
