@@ -1,9 +1,11 @@
 use crate::Opts;
 
-#[cfg(target_os = "macos")]
-pub(crate) mod macos;
+use super::error::Result;
+
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows;
 
@@ -13,5 +15,5 @@ pub trait SandboxImpl {
     /**
      * run
      */
-    fn run(&mut self) -> ();
+    unsafe fn run(&mut self) -> Result<()>;
 }
