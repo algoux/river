@@ -1,8 +1,8 @@
-use crate::sys::Sys;
+use crate::sys::SandboxImpl;
 
-pub struct S {}
+pub struct Sandbox {}
 
-impl Sys for S {
+impl SandboxImpl for Sandbox {
     fn run() -> () {
         println!("Linux")
     }
