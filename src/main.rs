@@ -13,6 +13,7 @@ use crate::sys::SandboxImpl;
 
 mod sys;
 mod error;
+mod status;
 
 /// example: `river -vvv -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
