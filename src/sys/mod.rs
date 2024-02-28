@@ -1,4 +1,5 @@
 use crate::Opts;
+use crate::status::Status;
 
 use super::error::Result;
 
@@ -15,5 +16,5 @@ pub trait SandboxImpl {
     /**
      * run
      */
-    unsafe fn run(&mut self) -> Result<()>;
+    unsafe fn run(&mut self) -> Result<Status>;
 }
