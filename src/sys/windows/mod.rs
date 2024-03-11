@@ -1,16 +1,8 @@
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::ptr;
-use std::ptr::null;
 
-use windows::core::{PCSTR, PSTR};
-use windows::Win32::Foundation::{
-    FILETIME, GENERIC_WRITE, HANDLE, TRUE, WAIT_FAILED, WAIT_TIMEOUT,
-};
-use windows::Win32::Security::SECURITY_ATTRIBUTES;
-use windows::Win32::Storage::FileSystem::{
-    CreateFileA, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
-};
+use windows::core::PSTR;
+use windows::Win32::Foundation::{FILETIME, WAIT_FAILED, WAIT_TIMEOUT};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectA, JobObjectBasicLimitInformation,
     SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
