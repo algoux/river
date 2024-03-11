@@ -2,23 +2,30 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::core::{PCSTR, PSTR};
-use windows::Win32::Foundation::{FILETIME, WAIT_FAILED, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_FAILED, WAIT_TIMEOUT};
+use windows::Win32::Storage::FileSystem::CreateFileA;
 use windows::Win32::System::JobObjects::{
-    AssignProcessToJobObject, CreateJobObjectA, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_LIMIT_INFORMATION, JobObjectBasicLimitInformation,
-    SetInformationJobObject,
+    AssignProcessToJobObject, CreateJobObjectA, JobObjectBasicLimitInformation,
+    SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
+    JOB_OBJECT_LIMIT_PROCESS_TIME,
 };
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Threading::{
-    CREATE_SUSPENDED, CreateProcessA, GetProcessTimes, IDLE_PRIORITY_CLASS, PROCESS_INFORMATION,
-    ResumeThread, SetProcessWorkingSetSize, STARTUPINFOA, TerminateProcess, WaitForSingleObject,
+    CreateProcessA, GetProcessTimes, ResumeThread, SetProcessWorkingSetSize, TerminateProcess,
+    WaitForSingleObject, CREATE_SUSPENDED, IDLE_PRIORITY_CLASS, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOA,
 };
 
-use crate::error::Error::{E, WinError};
+use utils::utils::string_to_pcstr;
+
+use crate::error::Error::{WinError, E};
 use crate::error::Result;
-use crate::Opts;
 use crate::status::Status;
+use crate::sys::windows::utils::utils::string_to_pstr;
 use crate::sys::SandboxImpl;
+use crate::Opts;
+
+mod utils;
 
 #[macro_export]
 macro_rules! winapi {
@@ -150,11 +157,11 @@ impl SandboxImpl for Sandbox {
 
     unsafe fn run(&mut self) -> Result<Status> {
         // 执行的目标 app，前置的命令行解析保证 inner_args 至少有一项
-        let app = Vec::from((&self.inner_args[0]).as_bytes()).as_ptr();
+        let app = string_to_pcstr(&mut self.inner_args[0]);
         // 执行的文件参数
-        let command_line = &self.inner_args[1..].join(" ");
         let command_line_pstr = if self.inner_args.len() > 1 {
-            PSTR::from_raw(Vec::from(command_line.as_bytes()).as_mut_ptr())
+            let mut command_line = &mut self.inner_args[1..].join(" ");
+            string_to_pstr(&mut command_line)
         } else {
             PSTR::null()
         };
@@ -162,13 +169,20 @@ impl SandboxImpl for Sandbox {
         let mut info: STARTUPINFOA = Default::default();
         let mut information: PROCESS_INFORMATION = Default::default();
 
+        let mut binherithandles = false;
+        // 设置 stdin/stdout/stderr 的重定向
+        if self.input != None || self.output != None || self.error != None {
+            binherithandles = true;
+            info.dwFlags |= STARTF_USESTDHANDLES;
+        }
+
         // 创建进程
         winapi!(CreateProcessA(
-            PCSTR::from_raw(app),
+            app,
             command_line_pstr,
             None,
             None,
-            false,
+            binherithandles,
             // CREATE_SUSPENDED: 创建一个暂停的进程，需要 ResumeThread 之后才可以正常运行
             CREATE_SUSPENDED,
             None,
@@ -196,9 +210,9 @@ impl SandboxImpl for Sandbox {
 
 #[cfg(test)]
 mod tests {
-    use crate::Opts;
-    use crate::sys::SandboxImpl;
     use crate::sys::windows::Sandbox;
+    use crate::sys::SandboxImpl;
+    use crate::Opts;
 
     #[test]
     fn hello() {
@@ -212,9 +226,7 @@ mod tests {
     fn notepad() {
         let mut opts: Opts = Opts::default();
         opts.command.push("C:/Windows/notepad.exe".to_string());
-        let status = unsafe {
-            Sandbox::with_opts(opts).run().unwrap()
-        };
+        let status = unsafe { Sandbox::with_opts(opts).run().unwrap() };
         assert_eq!(status.status, 0);
         assert_eq!(status.exit_code, 0);
         assert_eq!(status.signal, 0);
@@ -241,9 +253,7 @@ mod tests {
         let mut opts: Opts = Opts::default();
         opts.command.push("C:/Windows/notepad.exe".to_string());
         opts.time_limit = Some(1000);
-        let status = unsafe {
-            Sandbox::with_opts(opts).run().unwrap()
-        };
+        let status = unsafe { Sandbox::with_opts(opts).run().unwrap() };
         assert!(status.time_used >= 1000);
         assert!(status.time_used < 2000);
     }
