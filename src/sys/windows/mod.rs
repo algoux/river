@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use windows::core::PSTR;
-use windows::Win32::Foundation::{FILETIME, WAIT_FAILED, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_TIMEOUT};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectA, JobObjectBasicLimitInformation,
     SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
@@ -90,19 +90,27 @@ impl Sandbox {
     }
 
     unsafe fn redirect_fd(&mut self, info: &mut STARTUPINFOA) -> Result<()> {
+        // 重定向 stdin
+        if let Some(file) = &self.input {
+            info.hStdInput = handle_from_file(file, 'r')?;
+        }
         // 重定向 stdout
         if let Some(file) = &self.output {
-            info.hStdOutput = handle_from_file(file)?;
+            info.hStdOutput = handle_from_file(file, 'w')?;
         }
         // 重定向 stderr
         if let Some(file) = &self.error {
-            info.hStdError = handle_from_file(file)?;
+            info.hStdError = handle_from_file(file, 'w')?;
         }
 
         Ok(())
     }
 
-    unsafe fn wait_it(&mut self, information: &PROCESS_INFORMATION) -> Result<Status> {
+    unsafe fn wait_it(
+        &mut self,
+        info: &STARTUPINFOA,
+        information: &PROCESS_INFORMATION,
+    ) -> Result<Status> {
         let mut status: Status = Default::default();
         let timeout = if let Some(t) = self.time_limit {
             t
@@ -118,6 +126,17 @@ impl Sandbox {
             WaitForSingleObject(information.hProcess, 0xFFFFFFFF);
         } else if wait_ret == WAIT_FAILED {
             return Err(E(file!().to_string(), line!(), "WAIT_FAILED".to_string()));
+        }
+
+        // 关闭文件流
+        if !info.hStdInput.is_invalid() {
+            winapi!(CloseHandle(info.hStdInput));
+        }
+        if !info.hStdOutput.is_invalid() {
+            winapi!(CloseHandle(info.hStdOutput));
+        }
+        if !info.hStdError.is_invalid() {
+            winapi!(CloseHandle(info.hStdError));
         }
 
         let mut pmc: PROCESS_MEMORY_COUNTERS = Default::default();
@@ -217,33 +236,17 @@ impl SandboxImpl for Sandbox {
             ));
         }
 
-        self.wait_it(&information)
+        self.wait_it(&info, &information)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use crate::sys::windows::Sandbox;
     use crate::sys::SandboxImpl;
     use crate::Opts;
-
-    #[test]
-    fn hello() {
-        assert_eq!(1 + 1, 2);
-    }
-
-    /**
-     * 启动记事本
-     */
-    #[test]
-    fn notepad() {
-        let mut opts: Opts = Opts::default();
-        opts.command.push("C:/Windows/notepad.exe".to_string());
-        let status = unsafe { Sandbox::with_opts(opts).run().unwrap() };
-        assert_eq!(status.status, 0);
-        assert_eq!(status.exit_code, 0);
-        assert_eq!(status.signal, 0);
-    }
 
     /**
      * 执行不存在的可执行文件
@@ -252,7 +255,8 @@ mod tests {
     #[should_panic]
     fn not_found() {
         let mut opts: Opts = Opts::default();
-        opts.command.push("Z:/not-found.exe".to_string());
+        opts.command
+            .push("./tests/windows/not-found.exe".to_string());
         unsafe {
             Sandbox::with_opts(opts).run().unwrap();
         }
@@ -264,10 +268,76 @@ mod tests {
     #[test]
     fn time_limit() {
         let mut opts: Opts = Opts::default();
-        opts.command.push("C:/Windows/notepad.exe".to_string());
+        opts.command
+            .push("./tests/windows/sleep/sleep.exe".to_string());
         opts.time_limit = Some(1000);
         let status = unsafe { Sandbox::with_opts(opts).run().unwrap() };
         assert!(status.time_used >= 1000);
         assert!(status.time_used < 2000);
+    }
+
+    /**
+     * 测试 stdout
+     */
+    #[test]
+    fn output() {
+        let filename = "./output.txt";
+        let mut opts: Opts = Opts::default();
+        opts.command
+            .push("./tests/windows/output/output.exe".to_string());
+        opts.output = Option::from(filename.to_string());
+        unsafe { Sandbox::with_opts(opts).run().unwrap() };
+
+        if let Ok(content) = fs::read_to_string(filename) {
+            assert_eq!(content.trim(), "Hello World!");
+            fs::remove_file(filename).unwrap()
+        } else {
+            assert!(false)
+        }
+    }
+
+    /**
+     * 测试 stderr
+     */
+    #[test]
+    fn stderr() {
+        let filename = "./stderr.txt";
+        let mut opts: Opts = Opts::default();
+        opts.command
+            .push("./tests/windows/stderr/stderr.exe".to_string());
+        opts.error = Option::from(filename.to_string());
+        unsafe { Sandbox::with_opts(opts).run().unwrap() };
+
+        if let Ok(content) = fs::read_to_string(filename) {
+            assert_eq!("Hello World!", content.trim());
+            fs::remove_file(filename).unwrap()
+        } else {
+            assert!(false)
+        }
+    }
+
+    /**
+     * 测试 stdin
+     */
+    #[test]
+    fn stdin() {
+        let filename = "./stdin.txt";
+        let out_filename = "./stdin-stdout.txt";
+        let content = "Hello Stdin!";
+        fs::write(filename, content).unwrap();
+        let mut opts: Opts = Opts::default();
+        opts.command
+            .push("./tests/windows/stdin/stdin.exe".to_string());
+        opts.input = Option::from(filename.to_string());
+        opts.output = Option::from(out_filename.to_string());
+        unsafe { Sandbox::with_opts(opts).run().unwrap() };
+
+        if let Ok(c) = fs::read_to_string(out_filename) {
+            assert_eq!(c.trim(), content.trim());
+            fs::remove_file(filename).unwrap();
+            fs::remove_file(out_filename).unwrap()
+        } else {
+            assert!(false)
+        }
     }
 }
