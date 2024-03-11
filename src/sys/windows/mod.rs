@@ -1,9 +1,16 @@
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::ptr;
+use std::ptr::null;
 
 use windows::core::{PCSTR, PSTR};
-use windows::Win32::Foundation::{FILETIME, HANDLE, WAIT_FAILED, WAIT_TIMEOUT};
-use windows::Win32::Storage::FileSystem::CreateFileA;
+use windows::Win32::Foundation::{
+    FILETIME, GENERIC_WRITE, HANDLE, TRUE, WAIT_FAILED, WAIT_TIMEOUT,
+};
+use windows::Win32::Security::SECURITY_ATTRIBUTES;
+use windows::Win32::Storage::FileSystem::{
+    CreateFileA, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_WRITE, FILE_SHARE_MODE,
+};
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectA, JobObjectBasicLimitInformation,
     SetInformationJobObject, JOBOBJECT_BASIC_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_PRIORITY_CLASS,
@@ -21,7 +28,7 @@ use utils::utils::string_to_pcstr;
 use crate::error::Error::{WinError, E};
 use crate::error::Result;
 use crate::status::Status;
-use crate::sys::windows::utils::utils::string_to_pstr;
+use crate::sys::windows::utils::utils::{handle_from_file, string_to_pstr};
 use crate::sys::SandboxImpl;
 use crate::Opts;
 
@@ -87,6 +94,19 @@ impl Sandbox {
         ));
         // 将 job 附加到进程
         winapi!(AssignProcessToJobObject(job, information.hProcess));
+        Ok(())
+    }
+
+    unsafe fn redirect_fd(&mut self, info: &mut STARTUPINFOA) -> Result<()> {
+        // 重定向 stdout
+        if let Some(file) = &self.output {
+            info.hStdOutput = handle_from_file(file)?;
+        }
+        // 重定向 stderr
+        if let Some(file) = &self.error {
+            info.hStdError = handle_from_file(file)?;
+        }
+
         Ok(())
     }
 
@@ -174,6 +194,7 @@ impl SandboxImpl for Sandbox {
         if self.input != None || self.output != None || self.error != None {
             binherithandles = true;
             info.dwFlags |= STARTF_USESTDHANDLES;
+            self.redirect_fd(&mut info)?;
         }
 
         // 创建进程
