@@ -1,7 +1,8 @@
 use clap::Parser;
 use clap_verbosity_flag::Verbosity;
 use env_logger::Builder;
-use log::{error, info, trace};
+use log::{error, trace};
+
 #[cfg(target_os = "linux")]
 use sys::linux::Sandbox;
 #[cfg(target_os = "macos")]
@@ -11,9 +12,9 @@ use sys::windows::Sandbox;
 
 use crate::sys::SandboxImpl;
 
-mod sys;
 mod error;
 mod status;
+mod sys;
 
 /// example: `river -vvv -- /usr/bin/echo hello world`
 #[derive(Parser, Debug)]
@@ -105,10 +106,14 @@ fn main() {
         .init();
 
     trace!("{:?}", opts);
+    let result = opts.result.clone();
     let status = unsafe { Sandbox::with_opts(opts).run() };
     match status {
-        Ok(_) => {
-            info!("success");
+        Ok(val) => {
+            if let Err(e) = val.write(result) {
+                error!("{}", e);
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             error!("{}", e);
