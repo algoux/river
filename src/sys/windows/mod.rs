@@ -44,7 +44,6 @@ pub struct Sandbox {
     input: Option<String>,
     output: Option<String>,
     error: Option<String>,
-    result: Option<String>,
 }
 
 impl Sandbox {
@@ -182,7 +181,6 @@ impl SandboxImpl for Sandbox {
             input: opts.input,
             output: opts.output,
             error: opts.error,
-            result: opts.result,
         }
     }
 
