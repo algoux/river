@@ -32,11 +32,6 @@ pub struct Opts {
     #[clap(short, long)]
     error: Option<String>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    /// Working directory. The default value is the current directory.
-    #[clap(short, long, default_value = "./")]
-    workdir: String,
-
     /// Output location of the running result. The default value is STDOUT(1)
     #[clap(short, long)]
     result: Option<String>,
@@ -53,21 +48,6 @@ pub struct Opts {
     #[clap(short, long)]
     memory_limit: Option<u32>,
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    /// Maximum number of files that can be written. The unit is bit. The default value is unlimited.
-    #[clap(short, long, default_value = "0")]
-    file_size_limit: i32,
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    /// Cgroup version, 1 or 2
-    #[clap(short, long, default_value = "1")]
-    cgroup: i32,
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    /// Number of processes that can be created. The default value is unlimited.
-    #[clap(short, long, default_value = "0")]
-    pids: i32,
-
     /// Program to run and command line arguments
     #[clap(last(true), required = true)]
     command: Vec<String>,
@@ -75,11 +55,6 @@ pub struct Opts {
     /// A level of verbosity, and can be used multiple times
     #[command(flatten)]
     verbose: Verbosity,
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    /// Network enable
-    #[clap(long, default_value = "false")]
-    network: bool,
 }
 
 impl Default for Opts {
