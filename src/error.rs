@@ -10,6 +10,7 @@ use windows::core::Error as WIN_ERROR;
 
 #[derive(Debug)]
 pub enum Error {
+    S(String),
     E(String, u32, String),
     IOError(IOError),
     SerdeJsonError(SerdeJsonError),
@@ -29,6 +30,9 @@ impl fmt::Display for Error {
         match *self {
             Error::E(ref filename, ref line, ref e) => {
                 write!(f, "{}:{}: Error: {}", filename, line, e)
+            }
+            Error::S(ref e) => {
+                write!(f, "{}", e)
             }
             Error::IOError(ref e) => {
                 write!(f, "{}", e)
