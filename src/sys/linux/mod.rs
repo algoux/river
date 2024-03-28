@@ -61,7 +61,7 @@ impl SandboxImpl for Sandbox {
             return Err(LinuxError(String::from(file!()), line!(), err));
         }
 
-        let pid = libc::clone(
+        let pid = linux_syscall!(libc::clone(
             runit,
             (stack as usize + STACK_SIZE) as *mut libc::c_void,
             libc::SIGCHLD
@@ -72,10 +72,7 @@ impl SandboxImpl for Sandbox {
                 | libc::CLONE_NEWCGROUP // 在新的 CGROUP 中创建沙盒
                 | libc::CLONE_NEWPID, // 外部进程对沙盒不可见
             self as *mut _ as *mut libc::c_void,
-        );
-        if pid < 0 {
-            return Err(S(format!("clone failure: {}", pid)));
-        }
+        ));
 
         let status = wait_it(pid);
 
