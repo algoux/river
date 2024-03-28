@@ -1,4 +1,6 @@
+use libc::strerror;
 use serde_json::Error as SerdeJsonError;
+use std::ffi::{CStr, NulError};
 use std::fmt::Formatter;
 use std::io::Error as IOError;
 use std::{fmt, result};
@@ -14,6 +16,10 @@ pub enum Error {
     /// Windows 平台下的 LastError
     #[cfg(target_os = "windows")]
     WinError(String, u32, WIN_ERROR),
+    #[cfg(target_os = "linux")]
+    LinuxError(String, u32, Option<i32>),
+    #[cfg(target_os = "linux")]
+    StringToCStringError(NulError),
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -40,6 +46,25 @@ impl fmt::Display for Error {
                     e.message()
                 )
             }
+            #[cfg(target_os = "linux")]
+            Error::LinuxError(ref filename, ref line, errno) => {
+                write!(f, "{}:{}: Error: {}", filename, line, errno_str(errno))
+            }
+            _ => {
+                write!(f, "{}", self)
+            }
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn errno_str(errno: Option<i32>) -> String {
+    match errno {
+        Some(no) => {
+            let stre = unsafe { strerror(no) };
+            let c_str: &CStr = unsafe { CStr::from_ptr(stre) };
+            c_str.to_str().unwrap().to_string()
+        }
+        _ => String::from("Unknown Error!"),
     }
 }
