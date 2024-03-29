@@ -1,6 +1,7 @@
 use crate::error::Error::{LinuxError, S};
 use std::ptr;
 use std::time::Instant;
+use libc::pid_t;
 
 use crate::status::Status;
 use crate::sys::SandboxImpl;
@@ -85,6 +86,23 @@ impl SandboxImpl for Sandbox {
 extern "C" fn runit(sandbox: *mut libc::c_void) -> i32 {
     let sandbox = unsafe { &mut *(sandbox as *mut Sandbox) };
     println!("{:?}", sandbox);
+
+    let pid = unsafe { linux_syscall!(libc::fork()) };
+
+    if pid > 0 {
+        // 父进程
+        runit_parent(pid)
+    } else {
+        // 子进程
+        runit_child()
+    }
+}
+
+fn runit_parent(pid: pid_t) -> i32 {
+    0
+}
+
+fn runit_child() -> i32 {
     0
 }
 
