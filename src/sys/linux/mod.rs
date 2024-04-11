@@ -166,7 +166,7 @@ fn runit_child(sandbox: &Sandbox, runit_exists: bool) -> i32 {
     }
     // 重定向输入输出流
     if let Some(file) = &sandbox.input {
-        let f = CString::new(file).unwrap();
+        let f = CString::new(file.clone()).unwrap();
         let fd = unsafe {
             syscall_or_panic!(
                 libc::open(f.as_ptr(), libc::O_RDONLY, 0o644),
@@ -176,7 +176,7 @@ fn runit_child(sandbox: &Sandbox, runit_exists: bool) -> i32 {
         unsafe { syscall_or_panic!(libc::dup2(fd, libc::STDIN_FILENO), "dup2 stdin") };
     }
     if let Some(file) = &sandbox.output {
-        let f = CString::new(file).unwrap();
+        let f = CString::new(file.clone()).unwrap();
         let fd = unsafe {
             syscall_or_panic!(
                 libc::open(f.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644),
@@ -186,7 +186,7 @@ fn runit_child(sandbox: &Sandbox, runit_exists: bool) -> i32 {
         unsafe { syscall_or_panic!(libc::dup2(fd, libc::STDOUT_FILENO), "dup2 stdout") };
     }
     if let Some(file) = &sandbox.error {
-        let f = CString::new(file).unwrap();
+        let f = CString::new(file.clone()).unwrap();
         let fd = unsafe {
             syscall_or_panic!(
                 libc::open(f.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644),

@@ -98,6 +98,7 @@ impl ExecArgs {
         // env 传递环境变量
         let mut envp_vec: Vec<*const libc::c_char> = vec![];
         envp_vec.push(ptr::null());
+        let envs = envp_vec.len();
         let envp = envp_vec.as_ptr() as *const *const libc::c_char;
 
         mem::forget(pathname_str);
@@ -108,7 +109,7 @@ impl ExecArgs {
             argv,
             args: args.len(),
             envp,
-            envs: envp_vec.len(),
+            envs,
         })
     }
 }
