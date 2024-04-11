@@ -66,6 +66,7 @@ impl SandboxImpl for Sandbox {
             runit,
             (stack as usize + STACK_SIZE) as *mut libc::c_void,
             libc::SIGCHLD
+                | libc::CLONE_NEWUSER // 在 namespaces 空间内使用新的用户
                 | libc::CLONE_NEWUTS // 设置新的 UTS 名称空间（主机名、网络名等）
                 | libc::CLONE_NEWNET // 设置新的网络空间，如果没有配置网络，则该沙盒内部将无法联网
                 | libc::CLONE_NEWNS // 为沙盒内部设置新的 namespaces 空间
@@ -83,6 +84,9 @@ impl SandboxImpl for Sandbox {
     }
 }
 
+/**
+ *  从这里开始主流程将无法获取函数返回值等信息，因此有异常就直接 panic 退出
+ */
 extern "C" fn runit(sandbox: *mut libc::c_void) -> i32 {
     let sandbox = unsafe { &mut *(sandbox as *mut Sandbox) };
     println!("{:?}", sandbox);
