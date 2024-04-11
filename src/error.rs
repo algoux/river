@@ -62,7 +62,7 @@ impl fmt::Display for Error {
 }
 
 #[cfg(target_os = "linux")]
-fn errno_str(errno: Option<i32>) -> String {
+pub fn errno_str(errno: Option<i32>) -> String {
     match errno {
         Some(no) => {
             let stre = unsafe { strerror(no) };

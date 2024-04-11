@@ -1,11 +1,14 @@
 use crate::error::Error::{LinuxError, S};
 use libc::pid_t;
+use std::ffi::CString;
+use std::path::Path;
 use std::ptr;
 use std::time::Instant;
 
 use crate::status::Status;
+use crate::sys::linux::utils::{last_err, ExecArgs};
 use crate::sys::SandboxImpl;
-use crate::Opts;
+use crate::{syscall_or_panic, Opts};
 
 mod seccomp;
 mod utils;
@@ -33,6 +36,7 @@ pub struct Sandbox {
     input: Option<String>,
     output: Option<String>,
     error: Option<String>,
+    file_size_limit: Option<u32>,
 }
 
 impl SandboxImpl for Sandbox {
@@ -45,6 +49,7 @@ impl SandboxImpl for Sandbox {
             input: opts.input,
             output: opts.output,
             error: opts.error,
+            file_size_limit: Some(0),
         }
     }
 
@@ -66,7 +71,7 @@ impl SandboxImpl for Sandbox {
             runit,
             (stack as usize + STACK_SIZE) as *mut libc::c_void,
             libc::SIGCHLD
-                | libc::CLONE_NEWUSER // 在 namespaces 空间内使用新的用户
+                | libc::CLONE_NEWUSER // 在 namespaces 空间内使用新的用户，这允许我们在不使用 root 用户的情况下创建新的 namespaces 空间
                 | libc::CLONE_NEWUTS // 设置新的 UTS 名称空间（主机名、网络名等）
                 | libc::CLONE_NEWNET // 设置新的网络空间，如果没有配置网络，则该沙盒内部将无法联网
                 | libc::CLONE_NEWNS // 为沙盒内部设置新的 namespaces 空间
@@ -89,25 +94,121 @@ impl SandboxImpl for Sandbox {
  */
 extern "C" fn runit(sandbox: *mut libc::c_void) -> i32 {
     let sandbox = unsafe { &mut *(sandbox as *mut Sandbox) };
-    println!("{:?}", sandbox);
+
+    // 判断 runit 是否存在
+    let runit_exists = Path::new("/usr/bin/runit").exists();
 
     let pid = unsafe { libc::fork() };
 
     if pid > 0 {
         // 父进程
-        runit_parent(pid)
+        runit_parent(&sandbox, pid, runit_exists)
     } else {
         // 子进程
-        runit_child()
+        runit_child(&sandbox, runit_exists)
     }
 }
 
-fn runit_parent(pid: pid_t) -> i32 {
+fn runit_parent(sandbox: &Sandbox, pid: pid_t, runit_exists: bool) -> i32 {
     0
 }
 
-fn runit_child() -> i32 {
-    0
+fn runit_child(sandbox: &Sandbox, runit_exists: bool) -> i32 {
+    // 进行资源与安全限制等
+    let mut rlimit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // CPU 时间限制，单位为 S
+    if let Some(time_limit) = sandbox.time_limit {
+        rlimit.rlim_cur = (time_limit / 1000 + 1) as u64;
+        if time_limit % 1000 > 800 {
+            rlimit.rlim_cur += 1;
+        }
+        rlimit.rlim_max = rlimit.rlim_cur;
+        unsafe {
+            syscall_or_panic!(
+                libc::setrlimit(libc::RLIMIT_CPU, &rlimit),
+                "setrlimit RLIMIT_CPU"
+            )
+        };
+    }
+    // 内存限制，单位为 kib
+    if let Some(memory_limit) = sandbox.memory_limit {
+        rlimit.rlim_cur = memory_limit as u64 * 1024 * 2;
+        rlimit.rlim_max = memory_limit as u64 * 1024 * 2;
+        unsafe {
+            syscall_or_panic!(
+                libc::setrlimit(libc::RLIMIT_AS, &rlimit),
+                "setrlimit RLIMIT_AS"
+            )
+        };
+
+        rlimit.rlim_cur = memory_limit as u64 * 1024 * 2;
+        rlimit.rlim_max = memory_limit as u64 * 1024 * 2;
+        unsafe {
+            syscall_or_panic!(
+                libc::setrlimit(libc::RLIMIT_STACK, &rlimit),
+                "setrlimit RLIMIT_STACK"
+            )
+        };
+    }
+    // 文件大小限制，单位为 bit
+    if let Some(file_size_limit) = sandbox.file_size_limit {
+        rlimit.rlim_cur = file_size_limit as u64;
+        rlimit.rlim_max = file_size_limit as u64;
+        unsafe {
+            syscall_or_panic!(
+                libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit),
+                "setrlimit RLIMIT_FSIZE"
+            )
+        };
+    }
+    // 重定向输入输出流
+    if let Some(file) = &sandbox.input {
+        let f = CString::new(file).unwrap();
+        let fd = unsafe {
+            syscall_or_panic!(
+                libc::open(f.as_ptr(), libc::O_RDONLY, 0o644),
+                format!("open input file `{}`", file)
+            )
+        };
+        unsafe { syscall_or_panic!(libc::dup2(fd, libc::STDIN_FILENO), "dup2 stdin") };
+    }
+    if let Some(file) = &sandbox.output {
+        let f = CString::new(file).unwrap();
+        let fd = unsafe {
+            syscall_or_panic!(
+                libc::open(f.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644),
+                format!("open output file `{}`", file)
+            )
+        };
+        unsafe { syscall_or_panic!(libc::dup2(fd, libc::STDOUT_FILENO), "dup2 stdout") };
+    }
+    if let Some(file) = &sandbox.error {
+        let f = CString::new(file).unwrap();
+        let fd = unsafe {
+            syscall_or_panic!(
+                libc::open(f.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644),
+                format!("open error file `{}`", file)
+            )
+        };
+        unsafe { syscall_or_panic!(libc::dup2(fd, libc::STDERR_FILENO), "dup2 stderr") };
+    }
+
+    let exec_args = if !runit_exists {
+        ExecArgs::build(&sandbox.inner_args)
+    } else {
+        ExecArgs::build(&sandbox.inner_args)
+    }
+    .unwrap();
+
+    unsafe {
+        syscall_or_panic!(
+            libc::execve(exec_args.pathname, exec_args.argv, exec_args.envp),
+            "execve"
+        )
+    }
 }
 
 unsafe fn wait_it(pid: i32) -> crate::error::Result<Status> {

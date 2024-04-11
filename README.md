@@ -36,6 +36,12 @@ Options:
           Print version
 ```
 
+**在 linux 环境下，需要额外安装 `runit`：**
+
+```shell
+$ gcc resources/runit.s -o /usr/bin/runit
+```
+
 ## 结果
 
 结果的格式为 JSON
