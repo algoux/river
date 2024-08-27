@@ -1,5 +1,6 @@
 mod error;
 mod runner;
+mod utils;
 
 use crate::runner::Runner;
 use pyo3::exceptions::PyRuntimeError;
