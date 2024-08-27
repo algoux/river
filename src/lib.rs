@@ -1,6 +1,10 @@
+mod error;
+mod runner;
+
+use crate::runner::Runner;
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use std::os::unix::process::ExitStatusExt;
-use std::process::Command;
+
 #[pyclass]
 struct RiverResult {
     time_used: i32,
@@ -101,22 +105,11 @@ impl River {
         self.err_fd
     }
 
-    fn run(&self) -> RiverResult {
-        let output = Command::new(self.file.as_str())
-            .args(self.args.iter())
-            .output()
-            .expect("failed to execute process");
-
-        let signal = if let Some(s) = output.status.signal() {
-            s
-        } else {
-            0
-        };
-        RiverResult {
-            time_used: 0,
-            memory_used: 0,
-            signal,
-            exit_code: 0,
+    #[pyo3(signature = ())]
+    fn run(&self) -> PyResult<RiverResult> {
+        match unsafe { Runner::run(self) } {
+            Ok(r) => Ok(r),
+            Err(err) => Err(PyRuntimeError::new_err(err.to_string())),
         }
     }
 
