@@ -1,14 +1,43 @@
 use pyo3::prelude::*;
+use std::os::unix::process::ExitStatusExt;
+use std::process::Command;
+#[pyclass]
+struct RiverResult {
+    time_used: i32,
+    memory_used: i32,
+    signal: i32,
+    exit_code: i32,
+}
+
+#[pymethods]
+impl RiverResult {
+    #[getter]
+    fn time_used(&self) -> i32 {
+        self.time_used
+    }
+    #[getter]
+    fn memory_used(&self) -> i32 {
+        self.memory_used
+    }
+    #[getter]
+    fn signal(&self) -> i32 {
+        self.signal
+    }
+    #[getter]
+    fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
 
 #[pyclass]
 struct River {
     file: String,
     args: Vec<String>,
-    time_limit: Option<i64>,
-    memory_limit: Option<i64>,
-    in_fd: Option<i64>,
-    out_fd: Option<i64>,
-    err_fd: Option<i64>,
+    time_limit: Option<i32>,
+    memory_limit: Option<i32>,
+    in_fd: Option<i32>,
+    out_fd: Option<i32>,
+    err_fd: Option<i32>,
 }
 
 #[pymethods]
@@ -28,48 +57,67 @@ impl River {
     }
 
     #[setter]
-    fn set_time_limit(&mut self, time_limit: i64) {
+    fn set_time_limit(&mut self, time_limit: i32) {
         self.time_limit = Some(time_limit)
     }
     #[getter]
-    fn get_time_limit(&self) -> Option<i64> {
+    fn get_time_limit(&self) -> Option<i32> {
         self.time_limit
     }
 
     #[setter]
-    fn set_memory_limit(&mut self, memory_limit: i64) {
+    fn set_memory_limit(&mut self, memory_limit: i32) {
         self.memory_limit = Some(memory_limit)
     }
     #[getter]
-    fn get_memory_limit(&self) -> Option<i64> {
+    fn get_memory_limit(&self) -> Option<i32> {
         self.memory_limit
     }
 
     #[setter]
-    fn set_in_fd(&mut self, fd: i64) {
+    fn set_in_fd(&mut self, fd: i32) {
         self.in_fd = Some(fd)
     }
     #[getter]
-    fn get_in_fd(&self) -> Option<i64> {
+    fn get_in_fd(&self) -> Option<i32> {
         self.in_fd
     }
 
     #[setter]
-    fn set_out_fd(&mut self, fd: i64) {
+    fn set_out_fd(&mut self, fd: i32) {
         self.out_fd = Some(fd)
     }
     #[getter]
-    fn get_out_fd(&self) -> Option<i64> {
+    fn get_out_fd(&self) -> Option<i32> {
         self.out_fd
     }
 
     #[setter]
-    fn set_err_fd(&mut self, fd: i64) {
+    fn set_err_fd(&mut self, fd: i32) {
         self.err_fd = Some(fd)
     }
     #[getter]
-    fn get_err_fd(&self) -> Option<i64> {
+    fn get_err_fd(&self) -> Option<i32> {
         self.err_fd
+    }
+
+    fn run(&self) -> RiverResult {
+        let output = Command::new(self.file.as_str())
+            .args(self.args.iter())
+            .output()
+            .expect("failed to execute process");
+
+        let signal = if let Some(s) = output.status.signal() {
+            s
+        } else {
+            0
+        };
+        RiverResult {
+            time_used: 0,
+            memory_used: 0,
+            signal,
+            exit_code: 0,
+        }
     }
 
     fn __str__(&self) -> String {
@@ -93,5 +141,6 @@ impl River {
 #[pymodule]
 fn river(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<River>()?;
+    m.add_class::<RiverResult>()?;
     Ok(())
 }
