@@ -35,6 +35,7 @@ impl RiverResult {
 }
 
 #[pyclass]
+#[derive(Clone, Debug)]
 struct River {
     file: String,
     args: Vec<String>,
