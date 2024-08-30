@@ -1,15 +1,27 @@
 use crate::error::{Error, RResult};
 use crate::utils::last_err;
-use crate::{River, RiverResult};
+use crate::{utils, River, RiverResult};
 use std::ptr;
 use std::time::Instant;
 
 #[macro_export]
-macro_rules! linux_syscall {
+macro_rules! syscall {
     ($expression:expr) => {{
         let ret = $expression;
         if ret < 0 {
             return Err(Error::E(last_err()));
+        };
+        ret
+    }};
+}
+
+// 当进入 clone 函数内时，我们已经无法正常返回 Rust 的 Error，只能主动 Panic 来结束
+#[macro_export]
+macro_rules! syscall_or_panic {
+    ($expression:expr) => {{
+        let ret = $expression;
+        if ret < 0 {
+            panic!("{}", last_err());
         };
         ret
     }};
@@ -36,7 +48,7 @@ impl Runner {
             return Err(Error::E(last_err()));
         }
 
-        let pid = linux_syscall!(libc::clone(
+        let pid = syscall!(libc::clone(
             runit,
             (stack as usize + STACK_SIZE) as *mut libc::c_void,
             libc::SIGCHLD
@@ -50,7 +62,10 @@ impl Runner {
             &mut river.clone() as *mut _ as *mut libc::c_void,
         ));
 
-        linux_syscall!(libc::munmap(stack, STACK_SIZE));
+        let status = wait_it(pid);
+        println!("{:?}", status);
+
+        syscall!(libc::munmap(stack, STACK_SIZE));
 
         let time_used = runner_start.elapsed();
         Ok(RiverResult {
@@ -64,6 +79,56 @@ impl Runner {
 
 extern "C" fn runit(river: *mut libc::c_void) -> i32 {
     let river = unsafe { &mut *(river as *mut River) };
-    println!("{}", river.file);
+
+    let pid = unsafe { syscall_or_panic!(libc::fork()) };
+
+    if pid > 0 {
+        // 父进程，pid 是 fork 出的子进程的 pid
+        if pid != 2 {
+            panic!("System Error!");
+        }
+    } else {
+        // 子进程
+    }
     0
+}
+
+#[derive(Debug)]
+pub struct RunnerStatus {
+    pub time_used: i64,
+    pub memory_used: i64,
+    pub exit_code: i32,
+    pub status: i32,
+    pub signal: i32,
+}
+
+fn wait_it(pid: i32) -> RunnerStatus {
+    let mut status: i32 = 0;
+    let mut rusage = utils::new_rusage();
+    let _ret = unsafe { syscall_or_panic!(libc::wait4(pid, &mut status, 0, &mut rusage)) };
+    let time_used = rusage.ru_utime.tv_sec * 1000
+        + i64::from(rusage.ru_utime.tv_usec) / 1000
+        + rusage.ru_stime.tv_sec * 1000
+        + i64::from(rusage.ru_stime.tv_usec) / 1000;
+    let memory_used = rusage.ru_maxrss;
+    let mut exit_code = 0;
+    let exited = libc::WIFEXITED(status);
+    if exited {
+        exit_code = libc::WEXITSTATUS(status);
+    }
+    let signal = if libc::WIFSIGNALED(status) {
+        libc::WTERMSIG(status)
+    } else if libc::WIFSTOPPED(status) {
+        libc::WSTOPSIG(status)
+    } else {
+        0
+    };
+
+    RunnerStatus {
+        time_used,
+        memory_used,
+        exit_code,
+        signal,
+        status,
+    }
 }
