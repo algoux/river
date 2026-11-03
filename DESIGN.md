@@ -108,7 +108,11 @@ river.Sandbox(rootfs=None, runtimes=None)
 - **内存语义**：Windows 的 Job 内存限制约束 commit 而非 RSS；惰性提交意味着
   `malloc` 大块不写入不触发 MLE（与 Linux overcommit 行为相近）。
 - **计时抖动**：Windows 计时受调度/Defender/缺页影响大于 Linux，建议调用方
-  放宽 5-10% 或取两次较优。
+  放宽 5-10% 或取两次较优。实测基线（2026-11，Win11，8 路并发压力下）：
+  固定 300ms 忙循环的墙钟测量中位数 323ms，10 次采样极差 2-4%，低于建议的
+  5-10% 放宽窗口；单次冷启动（Defender 首次扫描）可能出现更大抖动。
+- **并发**：`Sandbox` 可被多个 Python 线程并发 `run()`（内部无共享可变状态，
+  已按进程串行化的系统级操作见 docs/windows-backend.md §9.2.7–§9.2.9）。
 - **signal**：始终为合成值（见 §2.3）。
 
 ## 5. 参考实现

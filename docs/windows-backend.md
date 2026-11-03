@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1–P4 全部完成（S1–S10，判定完备）
-> + P5 的 S11 完成，S1–S11 已提交；下一步 S12（并发与压力，P5）。
+> **实现进度（2026-11，详见文末 §9）**：P1–P5 全部完成（S1–S12），S1–S12
+> 已提交；下一步 S13（pytest 三件套，P6 收官）。
 
 ## 1. 安全架构：三层防御
 
@@ -171,7 +171,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | 步 | 内容 | 行数 | 验证 | review 重点 |
 |---|---|---|---|---|
 | S11 ✅ 异常路径 + `__exit__` 强化 | ~200 | judger 被杀后无孤儿进程/无残留目录（examples/s11_smoke.py + sweep 单测） | 守卫类型(Drop)而非手动清理：spawn 的 `SuspendedGuard`（assign 失败即杀挂起子进程）+ `WorkDir::Drop` + 死主 sweep（`Sandbox::new`/`__exit__`） |
-| S12 | 并发与压力 | ~100+测试 | 8 路并发 ×50 次稳定；计时抖动基线 | 零共享状态审查 |
+| S12 ✅ 并发与压力 | ~250 | 8 路并发 ×50 次稳定（examples/s12_stress.py：400 次全 AC、无残留目录、计时抖动 2-4%）；每线程各自构造 Sandbox 的并发 sweep（examples/s12_probe.py） | 零共享状态审查：全部可变全局仅 5 处（见 §9.2.7），均已加锁/原子化 |
 
 ### P6 测试套件
 
@@ -224,6 +224,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | （S9） | S9 verdict.rs 证据优先判定（SE>MLE>TLE>exit code）+ monitor CPU/MLE 行为级单测 + examples/s9_smoke.py |
 | （S10） | S10 OLE 击杀阈值（stdio 超限事件 + monitor 双路等待 + `KillReason::OutputLimit`）+ NTSTATUS 全表（ntstatus_name）+ examples/s10_smoke.py |
 | （S11） | S11 `SuspendedGuard`（assign 失败杀挂起子进程）+ `sweep_stale_workdirs`（死主目录清扫，接入 `Sandbox::new`/`__exit__`）+ examples/s11_smoke.py |
+| （S12） | S12 并发修复：AppContainer profile 创建加锁 + 每进程只创建一次（token.rs）、DACL 授权串行化（acl.rs）、过期目录清扫串行化（workdir.rs）、`Sandbox` 改 `frozen`（可多线程并发 run）+ examples/s12_stress.py / s12_probe.py |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
@@ -253,6 +254,24 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    SetEvent；monitor 用 `WaitForMultipleObjects({process, event}, wall)`
    双路等待，命中事件 → TerminateJobObject → `KillReason::OutputLimit`。
    `stdout_file` 是截至被杀为止的全量留档（被杀时程序尚在写的块不计）。
+7. **并发下的 AppContainer profile（S12 重大发现）**：
+   `CreateAppContainerProfile` 是**写系统状态**的 API（写 AppContainer
+   映射注册表键 + profile 目录），并发调用会互相破坏——8 路并发实测报
+   `ERROR_KEY_DELETED` / `ERROR_INVALIDARG` / `ERROR_FILE_NOT_FOUND` /
+   `RPC_E_SERVERCALL_RETRYLATER`，全部判成 SE。修法与 Chromium sandbox
+   库一致：**创建操作加锁串行化**（token.rs `PROFILE_CREATE_LOCK`），
+   且每个进程只创建一次（`created_profiles` 缓存），之后只用纯读的
+   `DeriveAppContainerSidFromAppContainerName`。
+   **注意**：不能把"derive 成功"当作"profile 已存在"——derive 出来的
+   SID 若从未真正创建过，子进程采用该 SID 启动时会以
+   `ERROR_FILE_NOT_FOUND` 失败（映射键与 profile 目录不存在）。必须真的
+   `CreateAppContainerProfile` 过一次（缓存标记的就是这件事）。
+8. **DACL 授权是 read-modify-write（S12）**：`GetNamedSecurityInfo` →
+   `SetEntriesInAclW` → `SetNamedSecurityInfo` 不是原子操作，并发授权
+   同一目录会丢 ACE。acl.rs 用进程级 `GRANT_LOCK` 串行化整个
+   check-then-modify 循环（操作只需几微秒，正确性优先）。
+9. **过期目录清扫要加锁（S12）**：两个线程同时清扫会互相删除/遍历同一
+   目录 → `ERROR_SHARING_VIOLATION`。workdir.rs 用 `SWEEP_LOCK` 串行化。
 
 ### 9.3 踩坑记录（写后续代码前必读）
 
@@ -324,6 +343,14 @@ verdict.rs 的映射表独立成文件便于逐条 review。
     进程，未入 Job 的挂起子进程会成为永久孤儿——spawn.rs 用
     `SuspendedGuard`（Drop 即 TerminateProcess，成功路径 disarm）兜住
     `AssignProcessToJobObject` 失败。
+24. **并发下最先炸的是 AppContainer profile（S12）**：见 §9.2.7——写系统的
+    `CreateAppContainerProfile` 必须加锁；且"derive 得到 SID"≠"profile 已
+    存在"。这条坑在串行测试里完全看不见（单线程永远正常），只有真正并发
+    才暴露——所以 S12 这类压力测试不是走过场。
+25. **pyo3 0.30 的 `#[pyclass]` 默认 `!Sync`**：需要多线程并发调用同一个
+    实例的方法时应声明 `frozen`（Sandbox 无可变状态，声明后语义才明确）。
+    另注意 `py.detach` 期间 GIL 已释放，Rust 侧的锁（如 profile 创建锁）
+    是唯一的互斥保证。
 
 ### 9.4 下一步（按序）
 
@@ -340,14 +367,14 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
      原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
      禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. ~~S9/S10 判定完备~~ ✅ / ~~S11 异常路径 + `__exit__`~~ ✅（见 §9.1/
-   §9.2.5/§9.2.6；S8.5 桌面隔离经确认不做，见踩坑 18）。下一步 **S12 并发
-   与压力**（P5）
+3. ~~S9–S12~~ ✅（见 §9.1/§9.2.5–§9.2.9；S8.5 桌面隔离经确认不做，见踩坑
+   18）。下一步 **S13 pytest 三件套**（P6 收官：`test_functional` /
+   `test_attack` / `test_limits` + README 能力矩阵）
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（45 个单测）；Python 冒烟：
+- 构建/测试：`cargo test --lib -- --test-threads=1`（49 个单测）；Python 冒烟：
   `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
   被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
@@ -357,5 +384,8 @@ verdict.rs 的映射表独立成文件便于逐条 review。
   + 限额内 AC 回归）；`examples/s10_smoke.py`：S10 OLE（喷泉 mid-run 击杀、
   `stdout_file` 留档 vs 截断样本、恰好等于限额仍 AC）；
   `examples/s11_smoke.py`：S11 生命周期（杀 judger 树 → 无孤儿进程、残留
-  目录被下次构造清扫、foreign 目录不误删）
+  目录被下次构造清扫、foreign 目录不误删）；
+  `examples/s12_stress.py`：S12 压力（8 路 ×50 次 = 400 次全 AC、无残留目录、
+  计时抖动基线 2-4%）；`examples/s12_probe.py`：每线程各自构造 Sandbox 的
+  并发 sweep 场景
 - 行尾：Windows 下子进程输出带 `\r\n`，测试断言统一用 `rstrip()` 或精确字节

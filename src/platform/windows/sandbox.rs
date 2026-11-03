@@ -33,7 +33,13 @@ use crate::status::Status;
 ///
 /// `rootfs` is not supported on Windows (Windows processes always resolve
 /// system DLLs from the real `System32`): passing it raises `ValueError`.
-#[pyclass(module = "river")]
+///
+/// Concurrency (S12): the class is `frozen` — it holds no mutable state
+/// (only the configured `runtimes`), and every run keeps all of its state in
+/// locals. `run()` may therefore be called concurrently from several Python
+/// threads on the same `Sandbox`; per-run resources (job, working directory,
+/// stdio) are independent.
+#[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,

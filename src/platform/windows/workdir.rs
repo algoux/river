@@ -107,7 +107,15 @@ impl Drop for WorkDir {
 /// removed only when its owning pid no longer exists, so live runs —
 /// including ours — are never touched. Names without a parseable owner pid
 /// (other tools' `river-*` dirs) are skipped.
+///
+/// Concurrency (S12): two threads sweeping at once would race on the same
+/// directory (one deletes it while the other walks it) and surface as
+/// `ERROR_SHARING_VIOLATION`. The sweep is therefore serialized through a
+/// process-global lock.
 pub(crate) fn sweep_stale_workdirs() {
+    static SWEEP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     let entries = match fs::read_dir(workdir_root()) {
         Ok(e) => e,
         Err(_) => return,

@@ -13,9 +13,16 @@
 //! Grants are idempotent: an identical ACE (same SID, same mask) is detected
 //! and not duplicated, so re-granting a `runtimes` directory on every run
 //! never grows its DACL.
+//!
+//! Concurrency (S12): the DACL update is a **read-modify-write** and is not
+//! atomic — two threads granting the same directory concurrently can lose
+//! one of the ACEs (last writer wins). All grants are therefore serialized
+//! through a process-global lock: the operation is a couple of microseconds,
+//! and correctness beats parallelism here.
 
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
@@ -28,6 +35,9 @@ use windows_sys::Win32::Security::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
+
+/// Serializes DACL read-modify-write cycles (see module docs).
+static GRANT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Windows SDK `ACCESS_ALLOWED_ACE` (header, then mask, then the SID bytes).
 #[repr(C)]
@@ -63,6 +73,10 @@ fn win32_error(code: u32) -> io::Error {
 /// directories the judger itself created, and for `runtimes` directories
 /// owned by the same user. No elevation needed.
 pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
+    // Serialize the whole check-then-modify cycle: concurrent grants on the
+    // same path would otherwise race on the DACL (lost ACE).
+    let _guard = GRANT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     if ace_already_present(path, sid, rights)? {
         return Ok(());
     }
@@ -242,5 +256,44 @@ mod tests {
 
     fn has_exactly(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> {
         ace_already_present(path, sid, rights)
+    }
+
+    /// S12: the DACL update is a read-modify-write; concurrent grants on the
+    /// same directory must not lose the ACE (the old unsynchronized version
+    /// raced and could drop the grant entirely).
+    #[test]
+    fn concurrent_grants_keep_the_ace() {
+        let ac = AppContainer::create_or_open().unwrap();
+        let dir = std::env::temp_dir().join(format!("river-acl-cc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                // The SID pointer must outlive the thread: leak a copy of the
+                // profile SID by deriving it again inside the thread.
+                std::thread::spawn(move || {
+                    let ac = AppContainer::create_or_open().unwrap();
+                    grant_ro(&dir, ac.sid()).unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+
+        // The ACE must be present (not lost to the race). The absolute ACE
+        // count is not 1: the directory inherits ACEs from its parent, and
+        // `SetEntriesInAclW` merges per trustee — what matters is that the
+        // grant survived and was not duplicated by the concurrent writers.
+        assert!(
+            has_exactly(&dir, ac.sid(), RUNTIMES_GRANT_RIGHTS).unwrap(),
+            "concurrent grants lost the ACE"
+        );
+        // Re-granting after the storm must not add anything.
+        let count = ace_count(&dir).unwrap();
+        grant_ro(&dir, ac.sid()).unwrap();
+        assert_eq!(ace_count(&dir).unwrap(), count, "concurrent grants duplicated ACEs");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

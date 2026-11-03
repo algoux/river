@@ -460,4 +460,36 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
+
+    /// S12: eight threads driving the full spawn→monitor→verdict pipeline
+    /// at once. Every run must produce its own, independent outcome — no
+    /// cross-talk between runs (zero shared state).
+    #[test]
+    fn concurrent_runs_do_not_interfere() {
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                std::thread::spawn(move || {
+                    // Half the threads run a fast program, half a killed one.
+                    if i % 2 == 0 {
+                        let o = run_monitored("cmd", &["/c", "echo hi"], None).unwrap();
+                        assert_eq!(o.kill_reason, KillReason::None);
+                        assert_eq!(o.exit_code, 0);
+                        assert_eq!(o.residual_processes, 0);
+                        assert!(o.wall_time_ms < 30_000);
+                    } else {
+                        let o = run_monitored(
+                            "ping",
+                            &["/n", "30", "127.0.0.1"],
+                            Some(Duration::from_millis(300)),
+                        )
+                        .unwrap();
+                        assert_eq!(o.kill_reason, KillReason::WallTimeout);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("worker thread panicked");
+        }
+    }
 }
