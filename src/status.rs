@@ -2,9 +2,10 @@ use pyo3::prelude::*;
 
 /// Result of [`Sandbox.run`][crate::Sandbox::run].
 ///
-/// Field units (part of the frozen API contract):
-/// - `time_used` / `wall_time_used`: milliseconds (CPU time / wall clock time)
-/// - `memory_used`: kilobytes (peak committed memory of the process tree)
+/// Field units (part of the frozen API contract, mirrored in field names):
+/// - `time_used_ms` / `wall_time_used_ms`: milliseconds (CPU time / wall
+///   clock time)
+/// - `memory_used_kb`: kilobytes (peak committed memory of the process tree)
 /// - `status`: one of `"AC" | "TLE" | "MLE" | "OLE" | "RE" | "SE"`
 ///   - `AC`  : exited normally (exit code 0)
 ///   - `TLE` : CPU time or wall clock time limit exceeded
@@ -23,9 +24,9 @@ use pyo3::prelude::*;
 #[pyclass(module = "river")]
 #[derive(Default)]
 pub struct Status {
-    pub time_used: u64,
-    pub wall_time_used: u64,
-    pub memory_used: u64,
+    pub time_used_ms: u64,
+    pub wall_time_used_ms: u64,
+    pub memory_used_kb: u64,
     pub status: String,
     pub signal: i32,
     pub exit_code: i32,
@@ -39,20 +40,20 @@ pub struct Status {
 impl Status {
     /// CPU time used, in milliseconds.
     #[getter]
-    fn time_used(&self) -> u64 {
-        self.time_used
+    fn time_used_ms(&self) -> u64 {
+        self.time_used_ms
     }
 
     /// Wall clock time used, in milliseconds.
     #[getter]
-    fn wall_time_used(&self) -> u64 {
-        self.wall_time_used
+    fn wall_time_used_ms(&self) -> u64 {
+        self.wall_time_used_ms
     }
 
     /// Peak memory usage, in kilobytes.
     #[getter]
-    fn memory_used(&self) -> u64 {
-        self.memory_used
+    fn memory_used_kb(&self) -> u64 {
+        self.memory_used_kb
     }
 
     /// Verdict string: `"AC" | "TLE" | "MLE" | "OLE" | "RE" | "SE"`.
@@ -99,8 +100,8 @@ impl Status {
 
     fn __repr__(&self) -> String {
         format!(
-            "Status(status={:?}, exit_code={:?}, signal={:?}, time_used={}ms, memory_used={}kb)",
-            self.status, self.exit_code, self.signal, self.time_used, self.memory_used
+            "Status(status={:?}, exit_code={:?}, signal={:?}, time_used_ms={}, wall_time_used_ms={}, memory_used_kb={})",
+            self.status, self.exit_code, self.signal, self.time_used_ms, self.wall_time_used_ms, self.memory_used_kb
         )
     }
 }

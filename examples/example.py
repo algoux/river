@@ -42,7 +42,7 @@ with sandbox:
         stderr_limit_kb=256 * 1024,  # kb | None，如果未设置，则默认为无限
     )
     print(r)
-    print(r.time_used, r.memory_used, r.wall_time_used)  # ms / kb / ms
+    print(r.time_used_ms, r.memory_used_kb, r.wall_time_used_ms)  # ms / kb / ms
     print(r.status, r.signal, r.exit_code, r.stdout_truncated, r.stderr_truncated)
     print(r.stdout, r.stderr)  # 截断后的 bytes
 
