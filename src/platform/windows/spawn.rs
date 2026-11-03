@@ -141,6 +141,41 @@ pub(crate) fn env_block(vars: &[(String, String)]) -> Vec<u16> {
     block
 }
 
+/// Guard for a freshly created, still-suspended child: if anything fails
+/// between `CreateProcessW` and the successful job assignment, the child is
+/// terminated on drop. Closing its handles alone is NOT enough — a suspended
+/// process survives handle closure and would leak forever as an orphan
+/// outside any job (S11).
+struct SuspendedGuard {
+    /// `None` once the child has been handed off successfully (disarmed).
+    child: Option<SpawnedChild>,
+}
+
+impl SuspendedGuard {
+    fn new(child: SpawnedChild) -> Self {
+        SuspendedGuard { child: Some(child) }
+    }
+
+    /// Take ownership of the child, disarming the kill-on-drop.
+    fn disarm(mut self) -> SpawnedChild {
+        self.child.take().expect("guard disarmed twice")
+    }
+}
+
+impl Drop for SuspendedGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::TerminateProcess;
+        if let Some(child) = &self.child {
+            // SAFETY: process handle is owned and valid.
+            unsafe {
+                TerminateProcess(child.process.as_raw_handle() as HANDLE, 1);
+            }
+            // Reap so the pid is released promptly; best effort.
+            let _ = child.wait_exit();
+        }
+    }
+}
+
 /// Spawn `executable` with `args` inside `job`, wired to the stdio of
 /// `stdio_set`. The child is suspended and job-assigned on success; the
 /// judger-side duplicates of the child-facing stdio handles are closed here.
@@ -328,9 +363,16 @@ pub(crate) fn spawn_bare(
         thread: unsafe { OwnedHandle::from_raw_handle(pi.hThread as RawHandle) },
         pid: pi.dwProcessId,
     };
+    // From here to the successful assign, any error must terminate the
+    // suspended child (it is outside the job and would outlive its handles).
+    let guarded = SuspendedGuard::new(child);
 
     // Attach before resume so no grandchild can escape the job.
-    job.assign(child.process.as_raw_handle() as HANDLE)?;
+    if let Err(e) = job.assign(guarded.child.as_ref().unwrap().process.as_raw_handle() as HANDLE) {
+        return Err(e); // guard drops → suspended child terminated
+    }
+
+    let child = guarded.disarm();
 
     // Close the judger-side stdio duplicates: EOF on the reader side now
     // depends only on the child lifetime (S1 lesson).

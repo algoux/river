@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1–P4 全部完成（S1–S10，判定完备），
-> S1–S10 已提交；下一步 S11（异常路径 + `__exit__` 强化，P5）。
+> **实现进度（2026-11，详见文末 §9）**：P1–P4 全部完成（S1–S10，判定完备）
+> + P5 的 S11 完成，S1–S11 已提交；下一步 S12（并发与压力，P5）。
 
 ## 1. 安全架构：三层防御
 
@@ -165,13 +165,12 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 |---|---|---|---|---|
 | S9 ✅ 看门狗 + TLE/MLE | ~200 | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE（examples/s9_smoke.py + 行为级单测） | 强杀后 GetProcessTimes 可读；证据优先于 exit code（MLE>TLE>exit code） |
 | S10 ✅ 完整 NTSTATUS 表 + OLE | ~250 | 段错误/栈溢出分类（rustc 探针）；输出喷泉 mid-run 击杀判 OLE+truncated（examples/s10_smoke.py） | `*_limit` 是击杀阈值：读线程超限 SetEvent → monitor WaitForMultipleObjects 强杀；恰好等于限额仍 AC；`truncated` 只在真正丢字节时置位；NTSTATUS 表逐条对照 ntstatus_name |
-| S10 | 完整 NTSTATUS 表 + OLE | ~120 | 段错误/栈溢出分类；输出喷泉判 OLE+truncated | 映射表逐条对照文档 |
 
 ### P5 生命周期
 
 | 步 | 内容 | 行数 | 验证 | review 重点 |
 |---|---|---|---|---|
-| S11 | 异常路径 + `__exit__` 强化 | ~200 | judger 被杀后无孤儿进程/无残留目录 | 守卫类型(Drop)而非手动清理 |
+| S11 ✅ 异常路径 + `__exit__` 强化 | ~200 | judger 被杀后无孤儿进程/无残留目录（examples/s11_smoke.py + sweep 单测） | 守卫类型(Drop)而非手动清理：spawn 的 `SuspendedGuard`（assign 失败即杀挂起子进程）+ `WorkDir::Drop` + 死主 sweep（`Sandbox::new`/`__exit__`） |
 | S12 | 并发与压力 | ~100+测试 | 8 路并发 ×50 次稳定；计时抖动基线 | 零共享状态审查 |
 
 ### P6 测试套件
@@ -222,6 +221,9 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
 | `3d929c7` | S8 spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
 | `cb6f7f6` | S8 修整：移除探针中的 GUI 触发路径（打包版 notepad stub 句柄杀不掉真窗口，泄漏桌面窗口）；EXTENSION_POINT 验证定版为子进程内核状态自查询 |
+| （S9） | S9 verdict.rs 证据优先判定（SE>MLE>TLE>exit code）+ monitor CPU/MLE 行为级单测 + examples/s9_smoke.py |
+| （S10） | S10 OLE 击杀阈值（stdio 超限事件 + monitor 双路等待 + `KillReason::OutputLimit`）+ NTSTATUS 全表（ntstatus_name）+ examples/s10_smoke.py |
+| （S11） | S11 `SuspendedGuard`（assign 失败杀挂起子进程）+ `sweep_stale_workdirs`（死主目录清扫，接入 `Sandbox::new`/`__exit__`）+ examples/s11_smoke.py |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
@@ -313,6 +315,15 @@ verdict.rs 的映射表独立成文件便于逐条 review。
     `usize` 再转回，否则 `thread::spawn` 编译失败。
 21. **EOF 后读线程可能多收到块**：OLE 击杀是竞速语义——程序在被杀前写出
     的块全部进 `stdout_file` 留档，断言只应要求"≥1 块且 > 截断样本"。
+22. **venv 的 python.exe 是启动器（S11 冒烟定位）**：`subprocess.Popen`
+    拿到的 pid 是启动器的，真正跑解释器（和 river 扩展、per-run 目录
+    命名）的是它的子进程——凡按 pid 关联目录/进程的测试，要用目录名反查
+    或差异 glob，不能信 Popen 的 pid；杀 judger 要 `taskkill /T /F` 杀
+    整棵树，只杀启动器会留下真解释器。
+23. **CreateProcessW 成功后的失败路径必须杀挂起子进程**：句柄关闭不杀
+    进程，未入 Job 的挂起子进程会成为永久孤儿——spawn.rs 用
+    `SuspendedGuard`（Drop 即 TerminateProcess，成功路径 disarm）兜住
+    `AssignProcessToJobObject` 失败。
 
 ### 9.4 下一步（按序）
 
@@ -329,14 +340,14 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
      原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
      禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. ~~S9 看门狗 + TLE/MLE~~ ✅ / ~~S10 NTSTATUS 表 + OLE~~ ✅（见 §9.1/§9.2.5/
-   §9.2.6；S8.5 桌面隔离经确认不做，见踩坑 18）。下一步 **S11 异常路径 +
-   `__exit__` 强化**（P5）
+3. ~~S9/S10 判定完备~~ ✅ / ~~S11 异常路径 + `__exit__`~~ ✅（见 §9.1/
+   §9.2.5/§9.2.6；S8.5 桌面隔离经确认不做，见踩坑 18）。下一步 **S12 并发
+   与压力**（P5）
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（44 个单测）；Python 冒烟：
+- 构建/测试：`cargo test --lib -- --test-threads=1`（45 个单测）；Python 冒烟：
   `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
   被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
@@ -344,5 +355,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
   `examples/s8_smoke.py`：攻击清单 1–7（win32k/hook/禁网/文件/注册表/TLE）；
   `examples/s9_smoke.py`：S9 判定完备（while(1)/sleep/malloc 炸弹 → TLE/TLE/MLE
   + 限额内 AC 回归）；`examples/s10_smoke.py`：S10 OLE（喷泉 mid-run 击杀、
-  `stdout_file` 留档 vs 截断样本、恰好等于限额仍 AC）
+  `stdout_file` 留档 vs 截断样本、恰好等于限额仍 AC）；
+  `examples/s11_smoke.py`：S11 生命周期（杀 judger 树 → 无孤儿进程、残留
+  目录被下次构造清扫、foreign 目录不误删）
 - 行尾：Windows 下子进程输出带 `\r\n`，测试断言统一用 `rstrip()` 或精确字节

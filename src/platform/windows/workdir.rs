@@ -100,6 +100,58 @@ impl Drop for WorkDir {
     }
 }
 
+/// Best-effort sweep of working directories abandoned by a **dead** judger
+/// process (e.g. the judger was hard-killed mid-run: `Drop` never ran, and
+/// while `KILL_ON_JOB_CLOSE` reaped the sandboxed processes, the directory
+/// remained). Directory names look like `river-{pid}-{nanos}-{n}`; a dir is
+/// removed only when its owning pid no longer exists, so live runs —
+/// including ours — are never touched. Names without a parseable owner pid
+/// (other tools' `river-*` dirs) are skipped.
+pub(crate) fn sweep_stale_workdirs() {
+    let entries = match fs::read_dir(workdir_root()) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(pid) = owner_pid_of(name) else { continue };
+        if pid_is_alive(pid) {
+            continue;
+        }
+        // Never follow reparse points while deleting (same rule as `Drop`).
+        let _ = remove_dir_no_follow_checked(&entry.path());
+    }
+}
+
+/// Owner pid encoded in a `river-{pid}-...` working-directory name.
+fn owner_pid_of(dir_name: &str) -> Option<u32> {
+    dir_name
+        .strip_prefix("river-")?
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Does a process with this pid currently exist?
+fn pid_is_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: querying another process by pid; handle closed on success.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return false; // pid does not exist (or is inaccessible)
+    }
+    // SAFETY: handle valid.
+    let state = unsafe { WaitForSingleObject(handle, 0) };
+    // SAFETY: handle valid.
+    unsafe { CloseHandle(handle) };
+    state == WAIT_TIMEOUT // still running
+}
+
 /// Mark a file read-only for the sandboxed program.
 fn mark_read_only(path: &Path) -> io::Result<()> {
     let mut attrs = get_attributes(path)?;
@@ -357,5 +409,30 @@ mod tests {
             "cleanup must not delete through a junction"
         );
         fs::remove_dir_all(&victim).ok();
+    }
+
+    #[test]
+    fn sweep_removes_dead_owner_and_keeps_live_and_foreign() {
+        // A dir owned by our (live) pid must survive; a dir owned by a pid
+        // that cannot exist must be swept; foreign names are ignored.
+        let live = workdir_root().join(format!("river-{}-1-0", std::process::id()));
+        let dead = workdir_root().join("river-4194303-1-0"); // pid max is smaller
+        let foreign = workdir_root().join("river-not-a-judger-dir");
+        fs::create_dir_all(&live).unwrap();
+        fs::create_dir_all(&dead).unwrap();
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(dead.join("stale.txt"), b"stale").unwrap();
+
+        assert!(pid_is_alive(std::process::id()));
+        assert!(!pid_is_alive(4_194_303));
+
+        sweep_stale_workdirs();
+
+        assert!(live.is_dir(), "live-owner dir must survive the sweep");
+        assert!(!dead.exists(), "dead-owner dir must be swept");
+        assert!(foreign.is_dir(), "unparseable names must be left alone");
+
+        fs::remove_dir_all(&live).ok();
+        fs::remove_dir_all(&foreign).ok();
     }
 }

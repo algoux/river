@@ -17,7 +17,7 @@ use crate::platform::windows::token::AppContainer;
 use crate::platform::windows::verdict::{
     SE, SIG_NONE, Verdict, classify_with_evidence,
 };
-use crate::platform::windows::workdir::WorkDir;
+use crate::platform::windows::workdir::{WorkDir, sweep_stale_workdirs};
 use crate::platform::{RunSpec, parse_copy_in, validate};
 use crate::status::Status;
 
@@ -51,6 +51,10 @@ impl Sandbox {
                  read-only runtime directories instead",
             ));
         }
+        // Recover working directories abandoned by a hard-killed judger (its
+        // sandboxed processes died with KILL_ON_JOB_CLOSE, but the per-run
+        // dirs have no process to drop them). Never touches live owners.
+        sweep_stale_workdirs();
         Ok(Self {
             rootfs: None,
             runtimes: runtimes.unwrap_or_default(),
@@ -61,14 +65,20 @@ impl Sandbox {
         slf
     }
 
-    /// Exit protocol: no leftover sandboxed processes, temporary working
-    /// directories removed, tokens/handles released. Always returns `false`.
+    /// Exit protocol (S11): everything a `run` leaves behind is owned by
+    /// per-run RAII guards — the `Job` (KILL_ON_JOB_CLOSE kills any still
+    /// alive processes), the `WorkDir` (removed on drop, reparse-safe), and
+    /// the stdio handles — so a normal block exit has nothing left to do.
+    /// As a defensive net, a stale-directory sweep runs here too, covering
+    /// dirs abandoned by a *different*, hard-killed judger process. Always
+    /// returns `false` (never suppresses block exceptions).
     fn __exit__(
         &self,
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
     ) -> bool {
+        sweep_stale_workdirs();
         false
     }
 
