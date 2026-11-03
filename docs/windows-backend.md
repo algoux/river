@@ -219,7 +219,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `f6892b0` | S5 workdir.rs（per-run 目录、copy_in 落盘、reparse 安全清理）+ example.py 可运行 |
 | `667aeda` | S6 token.rs（AppContainer profile/SID，userenv extern 手写声明） |
 | `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
-| S8 | spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
+| `3d929c7` | S8 spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
