@@ -210,6 +210,16 @@ impl StdioSet {
         })
     }
 
+    /// Move the three child-facing ends out (they go into `STARTUPINFO`).
+    /// The set keeps inert NUL handles so it stays droppable.
+    pub(crate) fn take_child_ends(&mut self) -> io::Result<(File, File, File)> {
+        Ok((
+            std::mem::replace(&mut self.child_stdin, File::open("NUL")?),
+            std::mem::replace(&mut self.child_stdout, File::open("NUL")?),
+            std::mem::replace(&mut self.child_stderr, File::open("NUL")?),
+        ))
+    }
+
     /// Wait for all worker threads and collect both outputs.
     pub(crate) fn finish(self) -> io::Result<(Output, Output)> {
         if let Some(feeder) = self.feeder {
