@@ -14,3 +14,8 @@ dynamic = ["version"]
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[tool.uv]
+# The extension is built and installed by `maturin develop`; uv should only
+# manage the environment's dependencies.
+package = false
