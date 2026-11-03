@@ -1,13 +1,11 @@
-/// A Python module implemented in Rust. The name of this module must match
-/// the `lib.name` setting in the `Cargo.toml`, else Python will not be able to
-/// import the module.
+mod sandbox;
+mod status;
+
 #[pyo3::pymodule]
 mod river {
-    use pyo3::prelude::*;
+    #[pymodule_export]
+    use super::status::Status;
 
-    /// Formats the sum of two numbers as string.
-    #[pyfunction]
-    fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
-        Ok((a + b).to_string())
-    }
+    #[pymodule_export]
+    use super::sandbox::Sandbox;
 }
