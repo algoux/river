@@ -14,8 +14,9 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
@@ -141,6 +142,37 @@ impl Job {
         } else {
             Ok(info.PeakProcessMemoryUsed as u64)
         }
+    }
+
+    /// Total CPU time (user + kernel) consumed by the job's process tree.
+    ///
+    /// Why the job and not `GetProcessTimes` (S13 finding): on Windows 8+ the
+    /// per-process CPU times of *another* process read back as 0 through
+    /// `GetProcessTimes` — even with `PROCESS_ALL_ACCESS`, and even after the
+    /// target exited (only a sliver of kernel time shows up). A process
+    /// reading *its own* times works fine, which is why this looked like a
+    /// river bug but is a Windows accounting rule.
+    /// The job's accounting information is the supported way to get CPU time
+    /// for a whole tree — and it is what a judge actually wants: the CPU of
+    /// the main process *and* its descendants.
+    pub(crate) fn cpu_time_ms(&self) -> io::Result<u64> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: handle owned; out-struct sized correctly.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.raw(),
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut _,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // The accounting times are in 100ns ticks.
+        let ticks = info.TotalUserTime.max(0) as u64 + info.TotalKernelTime.max(0) as u64;
+        Ok(ticks / 10_000)
     }
 
     /// Kill every process in the job.

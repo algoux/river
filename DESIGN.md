@@ -68,7 +68,7 @@ river.Sandbox(rootfs=None, runtimes=None)
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `time_used_ms` / `wall_time_used_ms` | `int` | CPU 时间 / 墙钟时间（ms）；TLE 判定取两者超限的并集 |
+| `time_used_ms` / `wall_time_used_ms` | `int` | CPU 时间 / 墙钟时间（ms）；TLE 判定取两者超限的并集。Windows 上 CPU 时间统计**整棵进程树**（主进程 + 全部子孙，Job accounting 语义） |
 | `memory_used_kb` | `int` | 峰值内存（KB）。Windows 上为 commit 语义（见已知差异 §4） |
 | `status` | `Literal["AC","TLE","MLE","OLE","RE","SE"]` | 判定 |
 | `signal` | `int` | **合成值**：正常 0；沙箱强杀（TLE/MLE/OLE）为 9。Windows 无信号，此字段模仿 Linux 惯例便于调用方移植 |

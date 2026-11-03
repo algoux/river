@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1–P5 全部完成（S1–S12），S1–S12
-> 已提交；下一步 S13（pytest 三件套，P6 收官）。
+> **实现进度（2026-11，详见文末 §9）**：P1–P6 全部完成（S1–S13），S1–S13
+> 已提交——Windows 后端首版完成，pytest 三件套 + README 能力矩阵齐备。
 
 ## 1. 安全架构：三层防御
 
@@ -91,7 +91,7 @@ validate(spec)                          已完成
            + SEM_NOGPFAULTERRORBOX + CREATE_SUSPENDED → ResumeThread
   ④ monitor：主线程 WaitForSingleObject(wall 预算，GIL 已释放)
            + 2×管道读线程（计数/截断/落盘 *_file）
-  ⑤ 收尾：GetExitCodeProcess / GetProcessTimes / Job PeakProcessMemoryUsed
+  ⑤ 收尾：GetExitCodeProcess / Job accounting(CPU) / Job PeakProcessMemoryUsed
            → verdict 映射（NTSTATUS 表）→ Status
   ⑥ 清理：TerminateJobObject(若存活) → 句柄关闭(KILL_ON_JOB_CLOSE 兜底)
            → reparse-point 安全删除临时目录
@@ -99,8 +99,11 @@ validate(spec)                          已完成
 
 ## 4. 判定与测量
 
-- **双计时**：CPU = `GetProcessTimes`，wall = `QueryPerformanceCounter`；
-  TLE = 看门狗 wall 超限 ∪ Job CPU 超限（`Sleep` 挂机靠前者抓）
+- **双计时**：CPU = **Job accounting**（`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`，
+  统计整棵进程树），wall = `QueryPerformanceCounter`；
+  TLE = 看门狗 wall 超限 ∪ 实测 CPU 超限（`Sleep` 挂机靠前者抓）
+  —— 注意 Windows 8+ 上 `GetProcessTimes` 读**别的进程**恒为 0，
+  必须用 Job accounting（见 §9.2.10）
 - **内存**：`JobObjectExtendedLimitInformation.PeakProcessMemoryUsed`（commit 语义，
   与 Linux RSS 的差异已在 DESIGN.md §4 承诺）
 - **MLE 判定优先于 RE**：强杀后以"Job 内存超限证据"归类，而非看 exit code
@@ -163,7 +166,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 
 | 步 | 内容 | 行数 | 验证 | review 重点 |
 |---|---|---|---|---|
-| S9 ✅ 看门狗 + TLE/MLE | ~200 | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE（examples/s9_smoke.py + 行为级单测） | 强杀后 GetProcessTimes 可读；证据优先于 exit code（MLE>TLE>exit code） |
+| S9 ✅ 看门狗 + TLE/MLE | ~200 | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE（examples/s9_smoke.py + 行为级单测） | 强杀后 CPU 证据仍可读（改用 Job accounting，见 §9.2.10）；证据优先于 exit code（MLE>TLE>exit code） |
 | S10 ✅ 完整 NTSTATUS 表 + OLE | ~250 | 段错误/栈溢出分类（rustc 探针）；输出喷泉 mid-run 击杀判 OLE+truncated（examples/s10_smoke.py） | `*_limit` 是击杀阈值：读线程超限 SetEvent → monitor WaitForMultipleObjects 强杀；恰好等于限额仍 AC；`truncated` 只在真正丢字节时置位；NTSTATUS 表逐条对照 ntstatus_name |
 
 ### P5 生命周期
@@ -177,10 +180,26 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 
 | 步 | 内容 | 验证 |
 |---|---|---|
-| S13 | pytest 三件套：`test_functional/test_attack/test_limits`（攻击样本 ctypes 编写）+ README 能力矩阵 | 全绿 |
+| S13 ✅ pytest 三件套 | 55 pytest（functional 21 / attack 19 / limits 15）+ README 能力矩阵 | 全绿；顺带修掉 CPU 时间测量 bug（见 §9.2.10） | 攻击样本用纯 Python 探针（沙箱内 ctypes 不可用，见踩坑 15）；子进程"允许但有界"按既定设计断言 |
 
 **节奏约定**：每步一个 commit（`feat(win32): S<n> ...`）；单步预计超 250 行时
 先停下协商拆分，不硬写。
+
+### 6.1 测试套件（S13）
+
+```
+tests/
+├── conftest.py          fixtures：被测解释器、runtimes、sandbox、宿主秘密文件
+├── test_functional.py   21 例：API 契约的正常路径（copy_in/env/stdin/stdout_file/校验异常）
+├── test_attack.py       19 例：§7 攻击清单的 pytest 化（每个都断言"被拒绝"的行为级证据）
+└── test_limits.py       15 例：CPU/墙钟/内存/输出四类限额与判定
+```
+
+每个测试都**在沙箱内跑真实程序**（被测解释器 = `sys.executable`），
+因此每次约 100ms。攻击探针用**纯 Python**（不用 ctypes）——win32k 锁定下
+`ctypes` 连加载都失败（踩坑 15），所以"ctypes 加载失败"本身就是
+win32k 策略生效的直接证据。
+
 
 ## 7. 攻击样本回归清单（S8 起逐步变绿，S13 全量 pytest 化）
 
@@ -225,6 +244,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | （S10） | S10 OLE 击杀阈值（stdio 超限事件 + monitor 双路等待 + `KillReason::OutputLimit`）+ NTSTATUS 全表（ntstatus_name）+ examples/s10_smoke.py |
 | （S11） | S11 `SuspendedGuard`（assign 失败杀挂起子进程）+ `sweep_stale_workdirs`（死主目录清扫，接入 `Sandbox::new`/`__exit__`）+ examples/s11_smoke.py |
 | （S12） | S12 并发修复：AppContainer profile 创建加锁 + 每进程只创建一次（token.rs）、DACL 授权串行化（acl.rs）、过期目录清扫串行化（workdir.rs）、`Sandbox` 改 `frozen`（可多线程并发 run）+ examples/s12_stress.py / s12_probe.py |
+| （S13） | S13 pytest 三件套（tests/：functional 21 / attack 19 / limits 15）+ README 能力矩阵 + **CPU 时间测量修复**（改用 Job accounting，见 §9.2.10） |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
@@ -272,6 +292,15 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    check-then-modify 循环（操作只需几微秒，正确性优先）。
 9. **过期目录清扫要加锁（S12）**：两个线程同时清扫会互相删除/遍历同一
    目录 → `ERROR_SHARING_VIOLATION`。workdir.rs 用 `SWEEP_LOCK` 串行化。
+10. **CPU 时间必须读 Job 的 accounting，不是 `GetProcessTimes`（S13 重大
+    发现）**：Windows 8+ 起，**别的进程**的 CPU 时间用 `GetProcessTimes`
+    一律读回 0——即使拿 `PROCESS_ALL_ACCESS` 打开、即使目标已经退出（只剩
+    一点点 kernel 时间）；只有进程读**自己**的时间是对的。river 一直
+    因此把 `time_used_ms` 报成 ~0，CPU 限额的 TLE 证据链整个失效
+    （`while True` 撞 CPU 限额会判 RE 而不是 TLE）。
+    正确来源是 Job 的 `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`
+    （`TotalUserTime`/`TotalKernelTime`）——它统计**整棵树**（主进程 +
+    所有子孙），这正是评测需要的语义。改动见 `Job::cpu_time_ms`。
 
 ### 9.3 踩坑记录（写后续代码前必读）
 
@@ -351,6 +380,15 @@ verdict.rs 的映射表独立成文件便于逐条 review。
     实例的方法时应声明 `frozen`（Sandbox 无可变状态，声明后语义才明确）。
     另注意 `py.detach` 期间 GIL 已释放，Rust 侧的锁（如 profile 创建锁）
     是唯一的互斥保证。
+26. **写 pytest 攻击用例时不要用 ctypes（S13）**：win32k 锁定下
+    `import ctypes` 直接失败（见踩坑 15），`ctypes.WinDLL('kernel32')`
+    也起不来（"DLL 初始化例程失败"）。攻击探针要用纯 Python
+    （`os`/`open`/`winreg`/`socket`/`subprocess`/`os.kill`），
+    "ctypes 加载失败"本身就是 win32k 策略生效的证据。
+27. **Job 的 `PROCESS_TIME` 限额粒度很粗**：Windows 按 ~10ms 粒度检查，
+    实测 500ms 的 CPU 限额在 ~1200ms 才触发（且含进程启动开销）。判定
+    不能依赖"恰好在限额处被杀"，必须用**实测 CPU 时间与限额比较**
+    （这正是 S9 引入的证据逻辑）。
 
 ### 9.4 下一步（按序）
 
@@ -367,16 +405,18 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
      原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
      禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. ~~S9–S12~~ ✅（见 §9.1/§9.2.5–§9.2.9；S8.5 桌面隔离经确认不做，见踩坑
-   18）。下一步 **S13 pytest 三件套**（P6 收官：`test_functional` /
-   `test_attack` / `test_limits` + README 能力矩阵）
+3. ~~S9–S13~~ ✅（见 §9.1/§9.2.5–§9.2.10）。**Windows 后端首版完成**：
+   S1–S13 全部提交，49+2 Rust 单测 + 55 pytest 全绿，README 能力矩阵
+   齐备。后续方向（按需排期）：Linux/macOS 后端（§1 的统一模型已定义，
+   但尚未实现）、`allow_network` 能力、copy_in 可写白名单、私有桌面
+   隔离 GUI（见踩坑 18）、S12 之后的压力基线常态化。
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（49 个单测）；Python 冒烟：
-  `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
-  被测程序）
+- 构建/测试：`cargo test --lib -- --test-threads=1`（51 个单测）；pytest：
+  `uv sync --extra test && uv run maturin develop && uv run pytest`（55 例）；
+  Python 冒烟：`uv run python -c ...`（用 `sys.executable` 作为被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
   AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证；
   `examples/s8_smoke.py`：攻击清单 1–7（win32k/hook/禁网/文件/注册表/TLE）；

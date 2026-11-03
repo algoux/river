@@ -1,0 +1,223 @@
+"""Functional tests: the frozen API contract behaves as documented.
+
+Covers the sandbox's normal-operation surface:
+- run() returns a real `Status` with the documented fields
+- `copy_in` (bytes and host files), `cwd`, `env`
+- stdin (bytes and file), stdout/stderr capture, `*_file` archives
+- the `with` block protocol
+- validation errors raise (not `SE`)
+"""
+
+import os
+
+import pytest
+
+import river
+
+
+def test_plain_run_is_ac(sandbox, python_exe):
+    r = sandbox.run(python_exe, ["-c", "print('hello')"])
+    assert r.status == "AC"
+    assert r.signal == 0
+    assert r.exit_code == 0
+    assert r.stdout.strip() == b"hello"
+    assert not r.stdout_truncated
+    assert not r.stderr_truncated
+    assert r.wall_time_used_ms >= 0
+    assert r.time_used_ms >= 0
+    assert r.memory_used_kb > 0
+
+
+def test_nonzero_exit_is_re(sandbox, python_exe):
+    r = sandbox.run(python_exe, ["-c", "raise SystemExit(3)"])
+    assert r.status == "RE"
+    assert r.exit_code == 3
+
+
+def test_stderr_is_captured_separately(sandbox, python_exe):
+    r = sandbox.run(python_exe, ["-c", "import sys; sys.stderr.write('bad\\n')"])
+    assert r.status == "AC"
+    assert r.stderr.strip() == b"bad"
+    assert r.stdout == b""
+
+
+def test_copy_in_bytes_reaches_the_program(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write(open(sys.argv[1]).read())",
+         "in.txt"],
+        copy_in={"in.txt": b"payload"},
+    )
+    assert r.status == "AC"
+    assert r.stdout == b"payload"
+
+
+def test_copy_in_host_file_is_copied(sandbox, python_exe, tmp_path):
+    src = tmp_path / "input.txt"
+    src.write_bytes(b"from-host")
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write(open(sys.argv[1]).read())",
+         "input.txt"],
+        copy_in={"input.txt": str(src)},
+    )
+    assert r.status == "AC"
+    assert r.stdout == b"from-host"
+
+
+def test_copy_in_is_read_only_for_the_program(sandbox, python_exe):
+    # The program may read its input but must not modify it (DESIGN §3.3).
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys\n"
+               "try:\n"
+               "    open(sys.argv[1], 'w').write('x')\n"
+               "    print('MUTABLE')\n"
+               "except OSError:\n"
+               "    print('READONLY')\n",
+         "in.txt"],
+        copy_in={"in.txt": b"immutable"},
+    )
+    assert r.status == "AC"
+    assert r.stdout.strip() == b"READONLY"
+
+
+def test_copy_in_nested_paths_are_created(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write(open(sys.argv[1]).read())",
+         "a/b/c.txt"],
+        copy_in={"a/b/c.txt": b"nested"},
+    )
+    assert r.status == "AC"
+    assert r.stdout == b"nested"
+
+
+def test_cwd_is_inside_the_sandbox(sandbox, python_exe):
+    r = sandbox.run(python_exe, ["-c", "import os; print(os.getcwd())"])
+    assert r.status == "AC"
+    # The cwd is the private per-run directory, never the host cwd.
+    assert b"river-" in r.stdout
+
+
+def test_env_is_merged_into_the_whitelist(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import os; print(os.environ.get('RIVER_TEST'))"],
+        env={"RIVER_TEST": "value-42"},
+    )
+    assert r.status == "AC"
+    assert r.stdout.strip() == b"value-42"
+
+
+def test_env_does_not_leak_the_host_environment(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import os; print(len(os.environ))"],
+        env={"RIVER_TEST": "1"},
+    )
+    assert r.status == "AC"
+    # The environment block is a whitelist, not a copy of the host env.
+    assert int(r.stdout.strip()) < 50
+
+
+def test_stdin_bytes_are_fed(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        stdin=b"piped-input",
+    )
+    assert r.status == "AC"
+    assert r.stdout == b"piped-input"
+
+
+def test_stdin_file_is_fed(sandbox, python_exe, tmp_path):
+    src = tmp_path / "input.bin"
+    src.write_bytes(b"file-input")
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        stdin_file=str(src),
+    )
+    assert r.status == "AC"
+    assert r.stdout == b"file-input"
+
+
+def test_stdin_and_stdin_file_are_mutually_exclusive(sandbox, python_exe, tmp_path):
+    src = tmp_path / "input.bin"
+    src.write_bytes(b"x")
+    with pytest.raises(ValueError):
+        sandbox.run(python_exe, ["-c", "pass"], stdin=b"a", stdin_file=str(src))
+
+
+def test_stdout_file_keeps_the_full_stream(sandbox, python_exe, tmp_path):
+    out = tmp_path / "full.out"
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write('z' * 5000); sys.stdout.flush()"],
+        stdout_limit_kb=1,
+        stdout_file=str(out),
+    )
+    assert r.status == "OLE"  # past the kill threshold
+    assert r.stdout_truncated
+    assert len(r.stdout) == 1024
+    # The archive holds everything written before the kill.
+    assert out.stat().st_size >= 1024
+
+
+def test_exactly_at_the_stdout_limit_is_ac(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stdout.write('z' * 1024); sys.stdout.flush()"],
+        stdout_limit_kb=1,
+    )
+    assert r.status == "AC"
+    assert not r.stdout_truncated
+    assert len(r.stdout) == 1024
+
+
+def test_stderr_limit_is_independent(sandbox, python_exe):
+    r = sandbox.run(
+        python_exe,
+        ["-c", "import sys; sys.stderr.write('e' * 4096); sys.stderr.flush()"],
+        stderr_limit_kb=1,
+    )
+    assert r.status == "OLE"
+    assert r.stderr_truncated
+    assert not r.stdout_truncated
+
+
+def test_rootfs_is_rejected_on_windows():
+    with pytest.raises(ValueError):
+        river.Sandbox(rootfs="/tmp")
+
+
+def test_invalid_copy_in_key_raises(sandbox, python_exe):
+    with pytest.raises(ValueError):
+        sandbox.run(python_exe, ["-c", "pass"], copy_in={"../escape": b"x"})
+    with pytest.raises(ValueError):
+        sandbox.run(python_exe, ["-c", "pass"], copy_in={r"C:\abs": b"x"})
+
+
+def test_with_block_never_suppresses_exceptions():
+    sb = river.Sandbox()
+    with pytest.raises(RuntimeError):
+        with sb:
+            raise RuntimeError("boom")
+
+
+def test_status_repr_mentions_the_verdict(sandbox, python_exe):
+    r = sandbox.run(python_exe, ["-c", "pass"])
+    assert "AC" in repr(r)
+
+
+def test_the_working_directory_is_removed_after_the_run(sandbox, python_exe):
+    import glob
+    import tempfile
+
+    pattern = os.path.join(tempfile.gettempdir(), "river-*")
+    before = set(glob.glob(pattern))
+    r = sandbox.run(python_exe, ["-c", "pass"])
+    assert r.status == "AC"
+    after = set(glob.glob(pattern))
+    assert after - before == set(), "the per-run directory was left behind"

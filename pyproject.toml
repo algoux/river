@@ -12,6 +12,10 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+# S13 test suite (pytest three-pack: functional / attack / limits).
+test = ["pytest>=7.0"]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
 
@@ -19,3 +23,14 @@ features = ["pyo3/extension-module"]
 # The extension is built and installed by `maturin develop`; uv should only
 # manage the environment's dependencies.
 package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The sandbox tests spawn real processes; they must not run in parallel
+# with each other on purpose (they are independent, but each run costs
+# ~100ms of process creation).
+addopts = "-ra"
+markers = [
+    "attack: attack-surface tests (must be denied inside the sandbox)",
+    "slow: takes more than a second",
+]

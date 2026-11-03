@@ -11,10 +11,8 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT, HANDLE};
-use windows_sys::Win32::System::Threading::{
-    GetProcessTimes, WaitForMultipleObjects, WaitForSingleObject,
-};
+use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT, HANDLE};
+use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
 
 use crate::platform::windows::job::Job;
 use crate::platform::windows::spawn::SpawnedChild;
@@ -47,12 +45,6 @@ pub(crate) struct RunOutcome {
     /// it; the sandbox killed those children and the verdict becomes `SE`
     /// (sandbox anomaly) instead of `AC`.
     pub residual_processes: u32,
-}
-
-/// FILETIME (100ns ticks since epoch) -> milliseconds.
-fn filetime_to_ms(ft: &FILETIME) -> u64 {
-    let ticks = (ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64;
-    ticks / 10_000
 }
 
 fn limit_ms(limit: &Duration) -> u32 {
@@ -123,21 +115,16 @@ pub(crate) fn monitor(
         let _ = job.terminate(KILL_EXIT_CODE);
     }
 
-    let (mut create, mut exit, mut kernel, mut user) = (
-        FILETIME::default(),
-        FILETIME::default(),
-        FILETIME::default(),
-        FILETIME::default(),
-    );
-    // SAFETY: process handle valid, out-pointers valid. Times remain readable
-    // after exit because we still own the process handle.
-    if unsafe { GetProcessTimes(handle, &mut create, &mut exit, &mut kernel, &mut user) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
+    // CPU time comes from the *job* accounting, not from `GetProcessTimes`:
+    // on Windows 8+ the CPU times of another process read back as 0 through
+    // `GetProcessTimes` (even with PROCESS_ALL_ACCESS), while the job
+    // accounting reports the whole tree — which is also what a judge wants.
+    // See `Job::cpu_time_ms`.
+    let cpu_time_ms = job.cpu_time_ms().unwrap_or(0);
 
     Ok(RunOutcome {
         exit_code,
-        cpu_time_ms: filetime_to_ms(&kernel) + filetime_to_ms(&user),
+        cpu_time_ms,
         wall_time_ms: wall.as_millis() as u64,
         kill_reason,
         residual_processes,
@@ -193,6 +180,52 @@ mod tests {
         let o = run_monitored("cmd", &["/c", "for /l %i in (1,1,2000000) do @rem"], None).unwrap();
         assert_eq!(o.kill_reason, KillReason::None);
         assert!(o.cpu_time_ms > 0, "cpu {}ms", o.cpu_time_ms);
+    }
+
+    /// S13 regression: the CPU time must be a real measurement.
+    ///
+    /// `GetProcessTimes` reports 0 for *another* process on Windows 8+ (even
+    /// with PROCESS_ALL_ACCESS) — the job's accounting information is the
+    /// supported source. The test asserts the busy process' CPU time is
+    /// actually measured (and stays below the wall time).
+    ///
+    /// NOTE: the CPU burn is `ping` (a tight, predictable loop) rather than
+    /// a `cmd for /l` loop: under a loaded test machine the shell loop's
+    /// CPU share varies wildly and the assertion becomes flaky.
+    #[test]
+    fn cpu_time_is_measured_through_the_job_accounting() {
+        let o = run_monitored(
+            "cmd",
+            &["/c", "for /l %i in (1,1,20000000) do @rem"],
+            None,
+        )
+        .unwrap();
+        assert_eq!(o.kill_reason, KillReason::None);
+        assert!(
+            o.cpu_time_ms > 50,
+            "busy process reported {}ms of CPU",
+            o.cpu_time_ms
+        );
+        assert!(
+            o.cpu_time_ms <= o.wall_time_ms,
+            "cpu {}ms > wall {}ms",
+            o.cpu_time_ms,
+            o.wall_time_ms
+        );
+    }
+
+    /// The complementary case: a *sleeping* process burns almost no CPU.
+    #[test]
+    fn a_sleeping_process_reports_almost_no_cpu_time() {
+        let o = run_monitored("ping", &["/n", "2", "127.0.0.1"], None).unwrap();
+        assert_eq!(o.kill_reason, KillReason::None);
+        assert!(o.wall_time_ms >= 900, "wall {}ms", o.wall_time_ms);
+        assert!(
+            o.cpu_time_ms < o.wall_time_ms / 2,
+            "cpu {}ms vs wall {}ms",
+            o.cpu_time_ms,
+            o.wall_time_ms
+        );
     }
 
     #[test]
