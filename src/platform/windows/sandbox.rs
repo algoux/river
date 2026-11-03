@@ -242,7 +242,15 @@ impl Sandbox {
                 cwd_path.as_deref(),
                 Some(&security),
             )?;
-            let outcome = monitor(&child, &job, wall_limit)?;
+            // S10: the reader threads fire the overflow event past an output
+            // kill threshold; the monitor waits on it alongside the process
+            // and reaps the job (verdict OLE) instead of waiting for exit.
+            let outcome = monitor(
+                &child,
+                &job,
+                wall_limit,
+                Some(set.overflow_event_handle()),
+            )?;
             let peak_bytes = job.peak_process_memory_used()?;
             let (out, err) = set.finish()?;
             Ok((outcome, peak_bytes, out, err))

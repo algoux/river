@@ -11,8 +11,10 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT};
-use windows_sys::Win32::System::Threading::{GetProcessTimes, WaitForSingleObject};
+use windows_sys::Win32::Foundation::{FILETIME, WAIT_OBJECT_0, WAIT_TIMEOUT, HANDLE};
+use windows_sys::Win32::System::Threading::{
+    GetProcessTimes, WaitForMultipleObjects, WaitForSingleObject,
+};
 
 use crate::platform::windows::job::Job;
 use crate::platform::windows::spawn::SpawnedChild;
@@ -30,6 +32,9 @@ pub(crate) enum KillReason {
     None,
     /// Wall clock limit exceeded; the job was terminated by us.
     WallTimeout,
+    /// A stdout/stderr channel produced more than its kill threshold; the
+    /// reader thread fired the overflow event and we terminated the job.
+    OutputLimit,
 }
 
 pub(crate) struct RunOutcome {
@@ -50,31 +55,60 @@ fn filetime_to_ms(ft: &FILETIME) -> u64 {
     ticks / 10_000
 }
 
-/// Resume the child, wait up to `wall_limit` (None = safety ceiling), kill on
-/// timeout, and collect timing.
+fn limit_ms(limit: &Duration) -> u32 {
+    limit.as_millis().min(u32::MAX as u128) as u32
+}
+
+/// Resume the child, wait up to `wall_limit` (None = safety ceiling) for
+/// either the process to exit or an output channel to overflow its kill
+/// threshold, kill on timeout/overflow, and collect timing.
 pub(crate) fn monitor(
     child: &SpawnedChild,
     job: &Job,
     wall_limit: Option<Duration>,
+    overflow_event: Option<HANDLE>,
 ) -> io::Result<RunOutcome> {
     let limit = wall_limit.unwrap_or(SAFETY_WALL_LIMIT);
     let started = Instant::now();
     child.resume()?;
 
     let handle = child.process.as_raw_handle() as _;
-    // SAFETY: process handle is owned and valid.
-    let wait =
-        unsafe { WaitForSingleObject(handle, limit.as_millis().min(u32::MAX as u128) as u32) };
-
-    let kill_reason = if wait == WAIT_OBJECT_0 {
-        KillReason::None
-    } else if wait == WAIT_TIMEOUT {
-        job.terminate(KILL_EXIT_CODE)?;
-        // SAFETY: handle still valid; the job kill guarantees signaling.
-        unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-        KillReason::WallTimeout
+    let kill_reason = if let Some(ev) = overflow_event {
+        // Wait on {process, overflow event} so an output fountain is reaped
+        // mid-run instead of being flagged only after it exits.
+        let mut handles = [handle, ev];
+        const EV_SIGNAL: u32 = WAIT_OBJECT_0 + 1;
+        match unsafe {
+            WaitForMultipleObjects(2, handles.as_ptr(), 0 /* any */, limit_ms(&limit))
+        } {
+            WAIT_OBJECT_0 => KillReason::None,
+            EV_SIGNAL => {
+                job.terminate(KILL_EXIT_CODE)?;
+                // SAFETY: handle still valid; the job kill guarantees signaling.
+                unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+                KillReason::OutputLimit
+            }
+            WAIT_TIMEOUT => {
+                job.terminate(KILL_EXIT_CODE)?;
+                // SAFETY: handle still valid; the job kill guarantees signaling.
+                unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+                KillReason::WallTimeout
+            }
+            _ => return Err(io::Error::last_os_error()),
+        }
     } else {
-        return Err(io::Error::last_os_error());
+        // SAFETY: process handle is owned and valid.
+        let wait = unsafe { WaitForSingleObject(handle, limit_ms(&limit)) };
+        if wait == WAIT_OBJECT_0 {
+            KillReason::None
+        } else if wait == WAIT_TIMEOUT {
+            job.terminate(KILL_EXIT_CODE)?;
+            // SAFETY: handle still valid; the job kill guarantees signaling.
+            unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+            KillReason::WallTimeout
+        } else {
+            return Err(io::Error::last_os_error());
+        }
     };
 
     let exit_code = child.wait_exit()?;
@@ -114,7 +148,7 @@ pub(crate) fn monitor(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use crate::platform::windows::verdict::{SIGKILL, classify_with_evidence};
+    use crate::platform::windows::verdict::{SIGKILL, classify_with_evidence, ntstatus_name};
     use crate::platform::windows::job::JobLimits;
     use crate::platform::windows::spawn::spawn_bare;
     use crate::platform::windows::stdio::{StdinSource, StdioSet};
@@ -133,7 +167,7 @@ mod tests {
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None, None)?;
-        let outcome = monitor(&child, &job, wall_limit)?;
+        let outcome = monitor(&child, &job, wall_limit, None)?;
         set.finish()?;
         Ok(outcome)
     }
@@ -192,7 +226,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
-        let outcome = monitor(&child, &job, None).unwrap();
+        let outcome = monitor(&child, &job, None, None).unwrap();
         assert_eq!(outcome.kill_reason, KillReason::None);
         assert!(
             outcome.residual_processes > 0,
@@ -239,7 +273,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
-        let outcome = monitor(&child, &job, None).unwrap();
+        let outcome = monitor(&child, &job, None, None).unwrap();
         set.finish().unwrap();
         assert!(
             outcome.cpu_time_ms > u64::from(cpu_limit),
@@ -287,7 +321,8 @@ mod tests {
         let child = spawn_bare(&probe, &[], &job, &mut set, None, None).unwrap();
         // Wall watchdog as a backstop: whichever comes first (heap abort or
         // watchdog kill), the evidence must classify MLE.
-        let outcome = monitor(&child, &job, Some(std::time::Duration::from_secs(15))).unwrap();
+        let outcome =
+            monitor(&child, &job, Some(std::time::Duration::from_secs(15)), None).unwrap();
         set.finish().unwrap();
         let peak = job.peak_process_memory_used().unwrap();
         assert!(
@@ -305,6 +340,110 @@ mod tests {
         );
         assert_eq!(v.status, "MLE");
         assert_eq!(v.signal, SIGKILL);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn output_fountain_is_killed_and_classified_ole() {
+        // A process that floods stdout past its kill threshold must be
+        // reaped mid-run by the monitor (not merely flagged at exit) and
+        // classified OLE with signal 9; capture stays truncated at the limit.
+        use crate::platform::windows::verdict::OLE;
+        let out_limit = 4096u64;
+        let job = Job::new(&JobLimits {
+            memory_limit_bytes: Some(512 * 1024 * 1024),
+            cpu_time_limit_ms: None,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+        })
+        .unwrap();
+        let mut set = StdioSet::new(
+            StdinSource::Null,
+            Some(out_limit),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let ev = set.overflow_event_handle();
+        let args: Vec<String> = ["/c", "for /l %i in (1,1,100000) do @echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
+        let outcome = monitor(&child, &job, None, Some(ev)).unwrap();
+        let (out, _err) = set.finish().unwrap();
+        assert_eq!(outcome.kill_reason, KillReason::OutputLimit);
+        assert!(outcome.wall_time_ms < 20_000, "fountain reaped mid-run");
+        assert!(out.truncated);
+        assert_eq!(out.data.len() as u64, out_limit);
+        let v = classify_with_evidence(
+            &outcome.kill_reason,
+            outcome.exit_code,
+            outcome.residual_processes,
+            None,
+            outcome.cpu_time_ms,
+            None,
+            0,
+        );
+        assert_eq!(v.status, OLE);
+        assert_eq!(v.signal, SIGKILL);
+    }
+
+    #[test]
+    fn access_violation_and_stack_overflow_classify_re_with_ntstatus() {
+        // Null dereference -> 0xC0000005; unbounded recursion -> a stack
+        // overflow NTSTATUS. Both are RE with the raw code passed through.
+        let work = tempfile_dir("river-s10-crash");
+        let av = compile_probe(
+            &work,
+            "fn main() { unsafe { std::ptr::null_mut::<u8>().write_volatile(1) } }",
+        );
+        let o = run_monitored(&av.display().to_string(), &[], None).unwrap();
+        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.exit_code, 0xC000_0005, "access violation exit code");
+        let v = classify_with_evidence(
+            &o.kill_reason,
+            o.exit_code,
+            o.residual_processes,
+            None,
+            o.cpu_time_ms,
+            None,
+            0,
+        );
+        assert_eq!(v.status, "RE");
+        assert_eq!(ntstatus_name(o.exit_code), Some("STATUS_ACCESS_VIOLATION"));
+
+        // NOTE: plain infinite recursion is *optimized away* by LLVM at -O
+        // (side-effect-free infinite recursion is UB and may become a
+        // stack-neutral infinite loop). Force real stack growth: a large
+        // per-frame buffer, a volatile read so the frame cannot be erased,
+        // and a non-tail use of the recursive result.
+        let so = compile_probe(
+            &work,
+            "fn rec(x: u64) -> u64 { \
+                 let buf = [x as u8; 1 << 16]; \
+                 let v = unsafe { std::ptr::read_volatile(buf.as_ptr()) } as u64; \
+                 rec(std::hint::black_box(x)).wrapping_add(v) \
+             } \
+             fn main() { std::hint::black_box(rec(1)); }",
+        );
+        let o = run_monitored(&so.display().to_string(), &[], None).unwrap();
+        assert_eq!(o.kill_reason, KillReason::None);
+        assert!(
+            crate::platform::windows::verdict::is_ntstatus(o.exit_code),
+            "stack overflow must end as NTSTATUS, got {:#x}",
+            o.exit_code
+        );
+        let v = classify_with_evidence(
+            &o.kill_reason,
+            o.exit_code,
+            o.residual_processes,
+            None,
+            o.cpu_time_ms,
+            None,
+            0,
+        );
+        assert_eq!(v.status, "RE");
         let _ = std::fs::remove_dir_all(&work);
     }
 

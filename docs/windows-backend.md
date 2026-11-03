@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1–P3 全部完成（S1–S8）+ P4 的 S9
-> 完成，S1–S9 已提交；下一步 S10（完整 NTSTATUS 表 + OLE 判定，P4）。
+> **实现进度（2026-11，详见文末 §9）**：P1–P4 全部完成（S1–S10，判定完备），
+> S1–S10 已提交；下一步 S11（异常路径 + `__exit__` 强化，P5）。
 
 ## 1. 安全架构：三层防御
 
@@ -164,6 +164,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | 步 | 内容 | 行数 | 验证 | review 重点 |
 |---|---|---|---|---|
 | S9 ✅ 看门狗 + TLE/MLE | ~200 | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE（examples/s9_smoke.py + 行为级单测） | 强杀后 GetProcessTimes 可读；证据优先于 exit code（MLE>TLE>exit code） |
+| S10 ✅ 完整 NTSTATUS 表 + OLE | ~250 | 段错误/栈溢出分类（rustc 探针）；输出喷泉 mid-run 击杀判 OLE+truncated（examples/s10_smoke.py） | `*_limit` 是击杀阈值：读线程超限 SetEvent → monitor WaitForMultipleObjects 强杀；恰好等于限额仍 AC；`truncated` 只在真正丢字节时置位；NTSTATUS 表逐条对照 ntstatus_name |
 | S10 | 完整 NTSTATUS 表 + OLE | ~120 | 段错误/栈溢出分类；输出喷泉判 OLE+truncated | 映射表逐条对照文档 |
 
 ### P5 生命周期
@@ -236,13 +237,20 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    残余 > 0 → verdict **SE**（防甩锅）。`CHILD_PROCESS_DISABLED` 弃用。
 3. **网络**：一律禁网（AppContainer 无 capability 即默认断网），无放行参数。
 4. **进程列表查询**：`JobObjectBasicProcessIdList`（可变长缓冲，234 时翻倍重试）。
-5. **verdict 证据优先级（S9 定版）**：SE（残余子孙）> MLE（异常终结 + 峰值
-   commit 内存钉在限额，slack = max(1MiB, limit/8)）> TLE（看门狗 wall 击杀 ∪
-   实测 CPU 超限）> exit code（0=AC 否则 RE）。MLE 排在 TLE 之前，因为
-   malloc 炸弹通常由 wall 看门狗收割——内存证据才指明真正死因。干净退出
-   （exit 0）即使峰值贴近限额也保持 AC（程序在限额内完成了）。Job 的
-   commit 限额让超额分配**失败**而非成功，故峰值天然停在限额之下一个分配
-   粒度内，slack 必须覆盖这个间隙。
+5. **verdict 证据优先级（S9/S10 定版）**：SE（残余子孙）> OLE（`OutputLimit`
+   击杀，直接观测）> MLE（异常终结 + 峰值 commit 内存钉在限额，slack =
+   max(1MiB, limit/8)）> TLE（看门狗 wall 击杀 ∪ 实测 CPU 超限）> exit code
+   （0=AC 否则 RE，NTSTATUS 表逐条命名见 `verdict.rs ntstatus_name`）。
+   MLE 排在 TLE 之前，因为 malloc 炸弹通常由 wall 看门狗收割——内存证据才
+   指明真正死因。OLE 是读线程的直接观测，排在推断类证据之前。干净退出
+   （exit 0）即使峰值贴近限额也保持 AC。Job 的 commit 限额让超额分配**失败**
+   而非成功，故峰值天然停在限额之下一个分配粒度内，slack 必须覆盖这个间隙。
+6. **OLE 击杀阈值语义（S10）**：`stdout_limit_kb`/`stderr_limit_kb` 是
+   **击杀阈值**（严格超出才杀；恰好等于限额仍 AC，`truncated` 亦不置位）。
+   stdio.rs 建一个 manual-reset 事件，读线程发现 `total > limit` 即
+   SetEvent；monitor 用 `WaitForMultipleObjects({process, event}, wall)`
+   双路等待，命中事件 → TerminateJobObject → `KillReason::OutputLimit`。
+   `stdout_file` 是截至被杀为止的全量留档（被杀时程序尚在写的块不计）。
 
 ### 9.3 踩坑记录（写后续代码前必读）
 
@@ -297,6 +305,14 @@ verdict.rs 的映射表独立成文件便于逐条 review。
     对它们仍有效），且实测打包版 notepad 在 AC 内无法真正启动；普通 Win32
     GUI 程序的窗口暴露到用户桌面不作隔离（不引入 CreateDesktopW 独立
     桌面方案）。attack list 第 7 项的"弹窗骚扰"仅对被测进程本体成立。
+19. **`-O` 会把无副作用无限递归优化成不增长栈的死循环**（LLVM UB 规则，
+    S10 实测挂死一次测试二进制）：栈溢出探针必须用大帧（64KiB 数组）+
+    `read_volatile` + `std::hint::black_box` + 非尾调用位置，否则测试要等
+    24h 安全上限。
+20. **裸 HANDLE 不是 Send**：跨线程传递事件/句柄裸值时在 ReaderSpec 里存
+    `usize` 再转回，否则 `thread::spawn` 编译失败。
+21. **EOF 后读线程可能多收到块**：OLE 击杀是竞速语义——程序在被杀前写出
+    的块全部进 `stdout_file` 留档，断言只应要求"≥1 块且 > 截断样本"。
 
 ### 9.4 下一步（按序）
 
@@ -313,19 +329,20 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
      原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
      禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. ~~S9 看门狗 + TLE/MLE~~ ✅ 已完成（见 §9.1/§9.2.5）；S10 起按原表
-   （下一步 **S10 完整 NTSTATUS 表 + OLE**；S8.5 桌面隔离经确认不做，
-   见踩坑 18）
+3. ~~S9 看门狗 + TLE/MLE~~ ✅ / ~~S10 NTSTATUS 表 + OLE~~ ✅（见 §9.1/§9.2.5/
+   §9.2.6；S8.5 桌面隔离经确认不做，见踩坑 18）。下一步 **S11 异常路径 +
+   `__exit__` 强化**（P5）
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（39 个单测）；Python 冒烟：
+- 构建/测试：`cargo test --lib -- --test-threads=1`（44 个单测）；Python 冒烟：
   `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
   被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
   AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证；
   `examples/s8_smoke.py`：攻击清单 1–7（win32k/hook/禁网/文件/注册表/TLE）；
   `examples/s9_smoke.py`：S9 判定完备（while(1)/sleep/malloc 炸弹 → TLE/TLE/MLE
-  + 限额内 AC 回归）
+  + 限额内 AC 回归）；`examples/s10_smoke.py`：S10 OLE（喷泉 mid-run 击杀、
+  `stdout_file` 留档 vs 截断样本、恰好等于限额仍 AC）
 - 行尾：Windows 下子进程输出带 `\r\n`，测试断言统一用 `rstrip()` 或精确字节

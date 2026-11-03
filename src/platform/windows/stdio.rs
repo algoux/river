@@ -8,12 +8,13 @@
 
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 
 use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
 use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Threading::SetEvent;
 
 /// Source of the child's stdin.
 pub(crate) enum StdinSource {
@@ -45,6 +46,12 @@ pub(crate) struct Output {
 struct ReaderSpec {
     limit: Option<u64>,
     sink: Option<PathBuf>,
+    /// Raw handle (as `usize`: raw pointers are not `Send`) of the
+    /// output-overflow event (see `StdioSet`); set when the channel's total
+    /// output strictly exceeds `limit` — the kill threshold (DESIGN.md §2.2:
+    /// `*_limit` kills, `*_file` archives, `r.stdout` samples). `None` in
+    /// stdio-only tests without a monitor.
+    overflow_event: Option<usize>,
 }
 
 /// All plumbing for one run's stdio. Owns the judger-side ends and the worker
@@ -59,6 +66,11 @@ pub(crate) struct StdioSet {
     feeder: Option<JoinHandle<()>>,
     stdout_reader: JoinHandle<Output>,
     stderr_reader: JoinHandle<Output>,
+    /// Manual-reset event fired by a reader thread when a channel's total
+    /// output strictly exceeds its kill threshold. The monitor waits on it
+    /// alongside the process handle so an output fountain is killed mid-run
+    /// (verdict OLE) instead of only being flagged at exit.
+    overflow_event: OwnedHandle,
 }
 
 fn make_pipe() -> io::Result<(File, File)> {
@@ -132,11 +144,20 @@ fn reader_thread(mut read: File, spec: ReaderSpec) -> Output {
                         if room > 0 {
                             out.data.extend_from_slice(&chunk[..room]);
                         }
-                        if out.data.len() as u64 >= limit {
-                            // Keep draining (discard) so the child never
-                            // blocks on a full pipe; the monitor decides the
-                            // verdict (OLE) at kill time.
+                        // Kill threshold: total output strictly past the
+                        // limit wakes the monitor, which terminates the job
+                        // and classifies OLE. Exactly `limit` bytes is still
+                        // legal (AC), and only then is the capture marked
+                        // truncated (bytes were actually dropped).
+                        if out.total > limit {
                             out.truncated = true;
+                            if let Some(ev) = spec.overflow_event {
+                                // SAFETY: the event handle is owned by the
+                                // `StdioSet`, which outlives this thread (it
+                                // is dropped by `finish`, after this thread
+                                // joins).
+                                unsafe { SetEvent(ev as HANDLE) };
+                            }
                         }
                     }
                 }
@@ -176,6 +197,22 @@ impl StdioSet {
         set_inheritable(&child_stdin)?;
 
         // stdout / stderr
+        // Manual-reset overflow event: both readers may fire it; manual reset
+        // keeps the signal latched until the monitor observes it.
+        // SAFETY: out-pointer valid; handle wrapped on success.
+        let ev_raw = unsafe { windows_sys::Win32::System::Threading::CreateEventW(
+            std::ptr::null(),
+            1, // manual reset
+            0,
+            std::ptr::null(),
+        ) };
+        if ev_raw.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let overflow_event = unsafe { OwnedHandle::from_raw_handle(ev_raw as RawHandle) };
+        // Stored as usize in ReaderSpec: raw pointers are not Send.
+        let ev = overflow_event.as_raw_handle() as usize;
+
         let (out_read, child_stdout) = make_pipe()?;
         set_inheritable(&child_stdout)?;
         let stdout_reader = std::thread::spawn(move || {
@@ -184,6 +221,7 @@ impl StdioSet {
                 ReaderSpec {
                     limit: stdout_limit,
                     sink: stdout_file,
+                    overflow_event: Some(ev),
                 },
             )
         });
@@ -196,6 +234,7 @@ impl StdioSet {
                 ReaderSpec {
                     limit: stderr_limit,
                     sink: stderr_file,
+                    overflow_event: Some(ev),
                 },
             )
         });
@@ -207,7 +246,13 @@ impl StdioSet {
             feeder,
             stdout_reader,
             stderr_reader,
+            overflow_event,
         })
+    }
+
+    /// Raw handle of the output-overflow event for the monitor's wait set.
+    pub(crate) fn overflow_event_handle(&self) -> HANDLE {
+        self.overflow_event.as_raw_handle() as HANDLE
     }
 
     /// Move the three child-facing ends out (they go into `STARTUPINFO`).
