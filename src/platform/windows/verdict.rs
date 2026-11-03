@@ -51,6 +51,23 @@ pub(crate) fn classify(kill_reason: &KillReason, exit_code: u32) -> Verdict {
     }
 }
 
+/// A run whose main process exited while descendants were still alive is a
+/// sandbox anomaly (`SE`), not a normal result: the program tried to keep
+/// working (or keep producing output) through a child process.
+pub(crate) fn classify_with_residual(
+    kill_reason: &KillReason,
+    exit_code: u32,
+    residual_processes: u32,
+) -> Verdict {
+    if residual_processes > 0 && matches!(kill_reason, KillReason::None) {
+        return Verdict {
+            status: SE,
+            signal: SIGKILL,
+        };
+    }
+    classify(kill_reason, exit_code)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -166,7 +166,7 @@ mod tests {
         JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: 1,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
         }
     }
 
@@ -200,8 +200,9 @@ mod tests {
     }
 
     #[test]
-    fn process_limit_blocks_children() {
-        // The inner cmd cannot spawn: the job allows exactly one process.
+    fn descendants_are_allowed_up_to_the_cap() {
+        // `cmd /c cmd /c exit 5` needs two live processes; with the default
+        // cap the wrapper works and the inner exit code propagates.
         let (code, _, _) = run_to_completion(
             "cmd",
             &["/c", "cmd /c exit 5"],
@@ -209,7 +210,31 @@ mod tests {
             &limits(),
         )
         .unwrap();
-        assert_ne!(code, 0);
+        assert_eq!(code, 5);
+    }
+
+    #[test]
+    fn process_cap_blocks_fork_bomb() {
+        // A tight cap (2) must stop a process that keeps spawning children.
+        let tight = JobLimits {
+            memory_limit_bytes: Some(512 * 1024 * 1024),
+            cpu_time_limit_ms: None,
+            max_processes: 2,
+        };
+        let job = Job::new(&tight).unwrap();
+        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let args: Vec<String> = ["/c", "for /l %i in (1,1,50) do @start /b cmd /c exit"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set).unwrap();
+        child.resume().unwrap();
+        let _ = child.wait_exit();
+        // The cap bounds the damage: far fewer than 50 children survive.
+        let alive = job.alive_process_count().unwrap();
+        assert!(alive <= 2, "alive processes: {alive}");
+        let _ = job.terminate(1);
+        set.finish().unwrap();
     }
 
     #[test]

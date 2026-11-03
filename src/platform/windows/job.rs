@@ -14,7 +14,8 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicProcessIdList,
     JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
     TerminateJobObject,
 };
@@ -45,9 +46,17 @@ pub(crate) struct JobLimits {
     pub memory_limit_bytes: Option<u64>,
     /// None = no CPU time limit.
     pub cpu_time_limit_ms: Option<u64>,
-    /// Hard cap on concurrently alive processes in the job.
+    /// Cap on concurrently alive processes in the job (main process
+    /// included). The main process is the only *judged* process; descendants
+    /// are tolerated up to this cap so ordinary wrappers (`cmd /c`,
+    /// interpreter helpers) keep working, while fork bombs stay bounded.
+    /// Residual descendants are killed as soon as the main process exits
+    /// (see `monitor`), so a program cannot offload its work to a child.
     pub max_processes: u32,
 }
+
+/// Default cap on simultaneously alive processes (main process included).
+pub(crate) const DEFAULT_MAX_PROCESSES: u32 = 64;
 
 impl JobLimits {
     /// Effective memory limit: the user limit, or the physical-memory safety
@@ -141,6 +150,49 @@ impl Job {
             Err(io::Error::last_os_error())
         } else {
             Ok(())
+        }
+    }
+
+    /// Number of processes currently alive in the job.
+    ///
+    /// Used to detect residual descendants after the main process exited:
+    /// a program must not offload its work to a child and let the child keep
+    /// running (or keep writing answers) after the main process is gone.
+    pub(crate) fn alive_process_count(&self) -> io::Result<u32> {
+        // The process-id list is variable-length; query with a generous
+        // buffer and grow it if the job holds more processes than fit.
+        const INITIAL_CAPACITY: u32 = 64;
+        let mut capacity = INITIAL_CAPACITY;
+        loop {
+            let byte_len = std::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                + (capacity as usize - 1) * std::mem::size_of::<usize>();
+            let mut buf = vec![0u8; byte_len];
+            // SAFETY: buffer is at least as large as the structure requires
+            // for `capacity` entries; the length is passed along.
+            let ok = unsafe {
+                QueryInformationJobObject(
+                    self.raw(),
+                    JobObjectBasicProcessIdList,
+                    buf.as_mut_ptr() as *mut _,
+                    byte_len as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                // ERROR_MORE_DATA (234) means the buffer was too small.
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() == Some(234) {
+                    capacity = capacity.saturating_mul(2);
+                    if capacity > 4096 {
+                        return Err(err);
+                    }
+                    continue;
+                }
+                return Err(err);
+            }
+            // SAFETY: the call filled the buffer with a valid structure.
+            let list = unsafe { &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+            return Ok(list.NumberOfProcessIdsInList);
         }
     }
 }

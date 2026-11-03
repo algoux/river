@@ -37,6 +37,11 @@ pub(crate) struct RunOutcome {
     pub cpu_time_ms: u64,
     pub wall_time_ms: u64,
     pub kill_reason: KillReason,
+    /// Processes still alive in the job after the main process exited.
+    /// Non-zero means the program handed its work to a child that outlived
+    /// it; the sandbox killed those children and the verdict becomes `SE`
+    /// (sandbox anomaly) instead of `AC`.
+    pub residual_processes: u32,
 }
 
 /// FILETIME (100ns ticks since epoch) -> milliseconds.
@@ -75,6 +80,15 @@ pub(crate) fn monitor(
     let exit_code = child.wait_exit()?;
     let wall = started.elapsed();
 
+    // The main process is done: any process still alive in the job is a
+    // descendant that outlived its parent. Kill it immediately (no program
+    // may keep running after the judged process is gone) and report it so
+    // the verdict can be `SE` instead of a misleading `AC`.
+    let residual_processes = job.alive_process_count().unwrap_or(0);
+    if residual_processes > 0 {
+        let _ = job.terminate(KILL_EXIT_CODE);
+    }
+
     let (mut create, mut exit, mut kernel, mut user) = (
         FILETIME::default(),
         FILETIME::default(),
@@ -92,6 +106,7 @@ pub(crate) fn monitor(
         cpu_time_ms: filetime_to_ms(&kernel) + filetime_to_ms(&user),
         wall_time_ms: wall.as_millis() as u64,
         kill_reason,
+        residual_processes,
     })
 }
 
@@ -111,7 +126,7 @@ mod tests {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: 1,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
         })?;
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -157,5 +172,33 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
         // The job kill uses our exit code.
         assert_eq!(o.exit_code, KILL_EXIT_CODE);
+    }
+
+    #[test]
+    fn residual_descendants_are_detected_and_killed() {
+        // The main process exits immediately while a child keeps running:
+        // the child must be reported as residual and killed, not left behind.
+        let job = Job::new(&JobLimits {
+            memory_limit_bytes: Some(512 * 1024 * 1024),
+            cpu_time_limit_ms: None,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+        })
+        .unwrap();
+        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let args: Vec<String> = ["/c", "start /b ping -n 30 127.0.0.1 & exit 0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set).unwrap();
+        let outcome = monitor(&child, &job, None).unwrap();
+        assert_eq!(outcome.kill_reason, KillReason::None);
+        assert!(
+            outcome.residual_processes > 0,
+            "expected a residual descendant, got {}",
+            outcome.residual_processes
+        );
+        // After the monitor returned, nothing may still be alive.
+        assert_eq!(job.alive_process_count().unwrap(), 0);
+        set.finish().unwrap();
     }
 }

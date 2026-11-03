@@ -1,9 +1,18 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
+use crate::platform::windows::job::{Job, JobLimits};
+use crate::platform::windows::monitor::monitor;
+use crate::platform::windows::spawn::spawn_bare;
+use crate::platform::windows::stdio::{StdinSource, StdioSet};
+use crate::platform::windows::verdict::{
+    AC, RE, SE, SIG_NONE, SIGKILL, TLE, Verdict, classify_with_residual,
+};
 use crate::platform::{RunSpec, parse_copy_in, validate};
 use crate::status::Status;
 
@@ -127,10 +136,90 @@ impl Sandbox {
             stderr_file,
         };
         validate(&spec)?;
-        let _ = spec.effective_wall_time_limit_ms();
-        // TODO(win32): AppContainer/low-IL token + Job Object + mitigation
-        // policies + piped stdio per DESIGN (see conversation baseline).
-        Ok(Status::default())
+
+        // --- translate the frozen contract into P1 primitives -------------
+        // P1 scope: measurement core without sandboxing. cwd/env/copy_in are
+        // honored from S5/S7 (workdir + ACL layer); runtimes from S7.
+        let stdin_src = match (&spec.stdin, &spec.stdin_file) {
+            (Some(bytes), _) => StdinSource::Bytes(bytes.clone()),
+            (None, Some(path)) => StdinSource::File(path.clone()),
+            _ => StdinSource::Null,
+        };
+        let limits = JobLimits {
+            memory_limit_bytes: spec.memory_limit_kb.map(|kb| kb.saturating_mul(1024)),
+            cpu_time_limit_ms: spec.time_limit_ms,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+        };
+        let wall_limit = spec
+            .effective_wall_time_limit_ms()
+            .map(Duration::from_millis);
+        let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
+        let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
+        let exe = spec.executable.clone();
+        let args = spec.args.clone();
+        let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
+
+        // Blocking pipeline with the GIL released.
+        let result = py.detach(move || -> io::Result<_> {
+            let job = Job::new(&limits)?;
+            let mut set = StdioSet::new(
+                stdin_src,
+                stdout_limit,
+                stderr_limit,
+                stdout_file,
+                stderr_file,
+            )?;
+            let child = spawn_bare(&exe, &args, &job, &mut set)?;
+            let outcome = monitor(&child, &job, wall_limit)?;
+            let peak_bytes = job.peak_process_memory_used()?;
+            let (out, err) = set.finish()?;
+            Ok((outcome, peak_bytes, out, err))
+        });
+
+        match result {
+            Ok((outcome, peak_bytes, out, err)) => {
+                let mut verdict: Verdict = classify_with_residual(
+                    &outcome.kill_reason,
+                    outcome.exit_code,
+                    outcome.residual_processes,
+                );
+                // CPU-limit evidence: the job kills the process on CPU
+                // overrun; classify via the measured time (S9 moves this
+                // into the monitor with evidence priority).
+                if (verdict.status == AC || verdict.status == RE)
+                    && let Some(limit) = spec.time_limit_ms
+                    && outcome.cpu_time_ms > limit
+                {
+                    verdict = Verdict {
+                        status: TLE,
+                        signal: SIGKILL,
+                    };
+                }
+                Ok(Status {
+                    time_used_ms: outcome.cpu_time_ms,
+                    wall_time_used_ms: outcome.wall_time_ms,
+                    memory_used_kb: peak_bytes / 1024,
+                    status: verdict.status.to_string(),
+                    signal: verdict.signal,
+                    exit_code: outcome.exit_code as i32,
+                    stdout: out.data,
+                    stderr: err.data,
+                    stdout_truncated: out.truncated,
+                    stderr_truncated: err.truncated,
+                })
+            }
+            Err(e) => {
+                // Infra failure: report as SE per the frozen contract
+                // (validation errors raise; runtime failures surface here).
+                Ok(Status {
+                    status: SE.to_string(),
+                    signal: SIG_NONE,
+                    exit_code: -1,
+                    stderr: e.to_string().into_bytes(),
+                    ..Default::default()
+                })
+            }
+        }
     }
 
     fn __repr__(&self) -> String {
