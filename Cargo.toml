@@ -1,0 +1,11 @@
+[package]
+name = "river"
+version = "0.0.1"
+edition = "2024"
+
+[lib]
+name = "river"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = "0.30.1"
