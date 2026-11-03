@@ -218,7 +218,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `ad20ee3` | S4 run() 接线（真实 Status；GIL 用 py.detach；SE 契约）+ 分层进程策略 |
 | `f6892b0` | S5 workdir.rs（per-run 目录、copy_in 落盘、reparse 安全清理）+ example.py 可运行 |
 | `667aeda` | S6 token.rs（AppContainer profile/SID，userenv extern 手写声明） |
-| `4f2db29` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
+| `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 28/28 绿。**进程已跑在 AppContainer 身份下**：cwd 可写、
