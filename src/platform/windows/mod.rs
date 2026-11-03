@@ -4,4 +4,5 @@ pub mod sandbox;
 pub mod spawn;
 pub mod stdio;
 pub mod verdict;
+pub mod workdir;
 pub use sandbox::Sandbox;

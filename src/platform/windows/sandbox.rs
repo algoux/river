@@ -13,6 +13,7 @@ use crate::platform::windows::stdio::{StdinSource, StdioSet};
 use crate::platform::windows::verdict::{
     AC, RE, SE, SIG_NONE, SIGKILL, TLE, Verdict, classify_with_residual,
 };
+use crate::platform::windows::workdir::WorkDir;
 use crate::platform::{RunSpec, parse_copy_in, validate};
 use crate::status::Status;
 
@@ -158,9 +159,26 @@ impl Sandbox {
         let exe = spec.executable.clone();
         let args = spec.args.clone();
         let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
+        let copy_in = spec.copy_in.clone();
+        let cwd_rel = spec.cwd.clone();
 
         // Blocking pipeline with the GIL released.
         let result = py.detach(move || -> io::Result<_> {
+            // Per-run working directory: the only writable place the program
+            // sees. `WorkDir` removes itself on drop (also on error paths).
+            let workdir = WorkDir::create()?;
+            if let Some(files) = &copy_in {
+                workdir.provision(files)?;
+            }
+            // The process starts inside the working directory; an explicit
+            // `cwd` (relative to it) is applied below when supported.
+            let cwd_path = match &cwd_rel {
+                Some(rel) => {
+                    let p = workdir.path().join(rel);
+                    if p.is_dir() { Some(p) } else { None }
+                }
+                None => Some(workdir.path().to_path_buf()),
+            };
             let job = Job::new(&limits)?;
             let mut set = StdioSet::new(
                 stdin_src,
@@ -169,7 +187,7 @@ impl Sandbox {
                 stdout_file,
                 stderr_file,
             )?;
-            let child = spawn_bare(&exe, &args, &job, &mut set)?;
+            let child = spawn_bare(&exe, &args, &job, &mut set, cwd_path.as_deref())?;
             let outcome = monitor(&child, &job, wall_limit)?;
             let peak_bytes = job.peak_process_memory_used()?;
             let (out, err) = set.finish()?;

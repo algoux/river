@@ -12,6 +12,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 /// Source of a `copy_in` entry: inline bytes or a host-side file path.
+#[derive(Clone)]
 pub(crate) enum CopyInSource {
     Bytes(Vec<u8>),
     Path(PathBuf),

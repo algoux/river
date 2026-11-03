@@ -95,6 +95,7 @@ pub(crate) fn spawn_bare(
     args: &[String],
     job: &Job,
     stdio_set: &mut StdioSet,
+    cwd: Option<&Path>,
 ) -> io::Result<SpawnedChild> {
     let (child_stdin, child_stdout, child_stderr) = stdio_set.take_child_ends()?;
 
@@ -117,6 +118,8 @@ pub(crate) fn spawn_bare(
     };
     let mut pi = PROCESS_INFORMATION::default();
 
+    let cwd_wide = cwd.map(|c| to_wide(&c.display().to_string()));
+
     // SAFETY: pointers are valid; stdio handles are inheritable (S1);
     // out-struct is valid.
     let ok = unsafe {
@@ -128,7 +131,10 @@ pub(crate) fn spawn_bare(
             1, // bInheritHandles
             CREATE_SUSPENDED,
             std::ptr::null(), // inherit parent environment (P2 will change this)
-            std::ptr::null(), // inherit cwd (P2: sandbox working dir)
+            cwd_wide
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null()),
             &mut si,
             &mut pi,
         )
@@ -184,7 +190,7 @@ mod tests {
         let job = Job::new(limits)?;
         let mut set = StdioSet::new(stdin, None, None, None, None)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set)?;
+        let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None)?;
         child.resume()?;
         let code = child.wait_exit()?;
         let (out, err) = set.finish()?;
@@ -227,7 +233,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set).unwrap();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None).unwrap();
         child.resume().unwrap();
         let _ = child.wait_exit();
         // The cap bounds the damage: far fewer than 50 children survive.
@@ -245,7 +251,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = spawn_bare(Path::new("ping"), &args, &job, &mut set).unwrap();
+        let child = spawn_bare(Path::new("ping"), &args, &job, &mut set, None).unwrap();
         child.resume().unwrap();
         brief_pause();
         let started = Instant::now();
@@ -261,7 +267,7 @@ mod tests {
         let job = Job::new(&limits()).unwrap();
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
         let args: Vec<String> = ["/c", "echo hi"].iter().map(|s| s.to_string()).collect();
-        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set).unwrap();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None).unwrap();
         child.resume().unwrap();
         let code = child.wait_exit().unwrap();
         assert_eq!(code, 0);

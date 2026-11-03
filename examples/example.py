@@ -10,63 +10,67 @@ import river
 # rootfs 仅 Linux/macOS 支持（chroot/sandbox-exec）；Windows 上传入即报错
 # —— Windows 进程永远从真实 System32 加载系统 DLL，rootfs 语义不成立，
 # 运行时环境一律通过 runtimes 提供。
+#
+# 注意（当前进度）：runtimes / env 增量合并尚未实现（S6/S7）；
+# copy_in / cwd / 各项限制 / 三通道 IO 已可用。
 sandbox = river.Sandbox(
     rootfs=None,  # str | None，Linux/macOS 专属
-    runtimes=[
-        "E:/runtimes/python313",  # 只读
-        "E:/runtimes/jdk21",  # 只读
-    ],
+    runtimes=[],
 )
 
+import sys
+
+PYTHON = sys.executable  # 演示用：以本机 Python 作为被测运行时
+
 with sandbox:
-    # ── 场景 1：编译好的自包含 exe（典型 ACM 提交）────────────────────
+    # ── 场景 1：运行一个程序并施加资源限制 ─────────────────────────
     r = sandbox.run(
-        "D:/oj/work/submissions/1001/main.exe",  # str，宿主机路径
-        args=["arg1", "arg2"],  # list[str]，默认 []
+        PYTHON,  # str，宿主机路径
+        args=["-c", "print(sum(map(int, input().split())))"],
         cwd=None,  # str | None，沙箱内相对路径，默认沙箱根（私有 cwd）
-        env={
-            "ENV_VAR1": "value1",
-        },  # dict[str, str] | None，增量合并进白名单基底（SystemRoot/TEMP/TMP 恒存在）
+        env=None,  # dict[str, str] | None，增量合并进白名单基底（S7 生效）
         time_limit_ms=5000,  # ms | None，如果未设置，则默认为无限
-        memory_limit_kb=1024 * 1024,  # kb | None，如果未设置，则默认为无限
-        wall_time_limit_ms=10000,  # ms | None，如果未设置，则默认为 time_limit_ms * 2 + 1000
+        memory_limit_kb=256 * 1024,  # kb | None，如果未设置，则默认为无限
+        wall_time_limit_ms=10000,  # ms | None，默认为 time_limit_ms * 2 + 1000
         stdin=b"1 2\n",  # bytes | None，与 stdin_file 互斥
-        stdin_file=None,  # str | None，与 stdin 互斥，宿主机路径
-        copy_in={
-            # 沙箱相对路径 -> bytes 或宿主机路径，程序对这些文件默认只读
-            # "input.txt": "D:/oj/data/P1001/1.in",  # file I/O 型题目
+        stdin_file=None,  # str | None，宿主机路径
+        copy_in={  # 沙箱相对路径 -> bytes 或宿主机路径，程序只读
         },
-        stdout_file=None,  # str | None，宿主机路径，完整输出留档（截至被杀为止）
+        stdout_file=None,  # str | None，宿主机路径，完整输出留档
         stdout_limit_kb=256 * 1024,  # kb | None，如果未设置，则默认为无限
-        stderr_file=None,  # str | None，宿主机路径
-        stderr_limit_kb=256 * 1024,  # kb | None，如果未设置，则默认为无限
+        stderr_file=None,
+        stderr_limit_kb=256 * 1024,
     )
     print(r)
+    assert r.status == "AC"
+    assert r.stdout.rstrip() == b"3"
     print(r.time_used_ms, r.memory_used_kb, r.wall_time_used_ms)  # ms / kb / ms
     print(r.status, r.signal, r.exit_code, r.stdout_truncated, r.stderr_truncated)
-    print(r.stdout, r.stderr)  # 截断后的 bytes
 
-    # ── 场景 2：解释型语言 —— 可执行文件来自 runtimes，代码走 copy_in ──
+    # ── 场景 2：copy_in 投放数据文件（file I/O 型题目 / 解释型语言代码）──
     r2 = sandbox.run(
-        "E:/runtimes/python313/python.exe",
-        args=["main.py"],
+        PYTHON,
+        args=["-c", "print(sum(map(int, open('nums.txt').read().split())))"],
         copy_in={
-            "main.py": b"print(sum(map(int, input().split())))\n",
+            "nums.txt": b"1 2 3 4 5\n",  # bytes 直接写入
+            # "data.txt": "D:/oj/data/P1001/1.in",  # 或宿主机路径拷贝
         },
-        stdin=b"1 2\n",
         time_limit_ms=5000,
         memory_limit_kb=512 * 1024,  # 解释器有底噪，给宽些
     )
-    assert r2.stdout == b"3\n"
+    assert r2.status == "AC"
+    assert r2.stdout.rstrip() == b"15"
+    print("copy_in:", r2.status, r2.stdout)
 
-    # ── 场景 3：Java —— 运行时目录 + env 组合 ──────────────────────
+    # ── 场景 3：TLE —— wall 看门狗强杀 ────────────────────────────
     r3 = sandbox.run(
-        "E:/runtimes/jdk21/bin/java.exe",
-        args=["-Djava.io.tmpdir=.", "Main"],
-        env={"JAVA_HOME": "E:/runtimes/jdk21"},
-        copy_in={"Main.class": "D:/oj/work/submissions/1002/Main.class"},
-        stdin=b"1 2\n",
-        time_limit_ms=10000,
+        PYTHON,
+        args=["-c", "import time; time.sleep(30)"],
+        time_limit_ms=5000,
+        wall_time_limit_ms=500,  # 500ms 后由沙箱强杀
     )
+    assert r3.status == "TLE" and r3.signal == 9
+    print("watchdog:", r3.status, r3.signal, f"wall={r3.wall_time_used_ms}ms")
 
 # with 块退出的协议保证：无残留进程、临时目录已删除、令牌/句柄已释放
+print("example OK")

@@ -371,12 +371,13 @@ mod tests {
         std::fs::write(&path, b"hello\nworld\n").unwrap();
         let (out, _) = spawn_with(
             &["/c", "findstr hello"],
-            StdinSource::File(path),
+            StdinSource::File(path.clone()),
             None,
             None,
             None,
         )
         .unwrap();
+        std::fs::remove_file(&path).ok();
         // findstr preserves the input's line endings (LF here)
         assert_eq!(out.data, b"hello\n");
     }
