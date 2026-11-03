@@ -220,6 +220,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `667aeda` | S6 token.rs（AppContainer profile/SID，userenv extern 手写声明） |
 | `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
 | `3d929c7` | S8 spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
+| `cb6f7f6` | S8 修整：移除探针中的 GUI 触发路径（打包版 notepad stub 句柄杀不掉真窗口，泄漏桌面窗口）；EXTENSION_POINT 验证定版为子进程内核状态自查询 |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
 看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
@@ -279,6 +280,16 @@ verdict.rs 的映射表独立成文件便于逐条 review。
     钩子 DLL 注入其他进程时静默不生效；其行为级注入验证在 Win11 上不可
     靠（无策略也不注入），故测试用子进程自查询 GetProcessMitigationPolicy
     （policy index 6）验证内核已应用状态。
+17. **测试永不启动 GUI / 打包应用**：Win11 的 notepad.exe 是 Store 执行别名
+    stub——`TerminateProcess(句柄)`/Job Object 都杀不掉它激活出来的真窗口
+    进程（真进程由 DCOMLaunch 创建，激活链断裂，不在父子谱系内）。S8 迭代
+    中曾因此向用户桌面泄漏两个 notepad 窗口（已清理，触发路径已删除）。
+    测试只产生管道 IO 的控制台子进程。
+18. **孙进程 GUI 暴露属已知且接受的设计现状**（与所有者确认，2026-11）：
+    被测进程允许派生子进程（§9.2.2），子孙继承 AC 令牌（文件/网络限制
+    对它们仍有效），且实测打包版 notepad 在 AC 内无法真正启动；普通 Win32
+    GUI 程序的窗口暴露到用户桌面不作隔离（不引入 CreateDesktopW 独立
+    桌面方案）。attack list 第 7 项的"弹窗骚扰"仅对被测进程本体成立。
 
 ### 9.4 下一步（按序）
 
@@ -295,7 +306,8 @@ verdict.rs 的映射表独立成文件便于逐条 review。
    - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
      原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
      禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. S9–S13 按原表
+3. S9–S13 按原表（下一步 **S9 看门狗 + TLE/MLE**；S8.5 桌面隔离经确认不做，
+   见踩坑 18）
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
