@@ -3,7 +3,6 @@
 //! closed before this function returns (the S1 lesson: a surviving write end
 //! starves the reader threads of EOF).
 
-use std::fs::File;
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;

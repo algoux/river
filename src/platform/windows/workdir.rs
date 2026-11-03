@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    DeleteFileW, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW,
+    DeleteFileW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW,
     INVALID_FILE_ATTRIBUTES, RemoveDirectoryW,
 };
 
@@ -152,7 +152,7 @@ fn remove_dir_no_follow_checked(dir: &Path) -> io::Result<()> {
     let mut first_err = None;
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
-        Err(e) => {
+        Err(_e) => {
             // Nothing readable: try to remove the directory itself.
             return match remove_dir_entry(dir) {
                 Ok(()) => Ok(()),

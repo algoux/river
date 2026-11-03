@@ -3,6 +3,7 @@ pub mod monitor;
 pub mod sandbox;
 pub mod spawn;
 pub mod stdio;
+pub mod token;
 pub mod verdict;
 pub mod workdir;
 pub use sandbox::Sandbox;
