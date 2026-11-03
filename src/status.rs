@@ -101,7 +101,12 @@ impl Status {
     fn __repr__(&self) -> String {
         format!(
             "Status(status={:?}, exit_code={:?}, signal={:?}, time_used_ms={}, wall_time_used_ms={}, memory_used_kb={})",
-            self.status, self.exit_code, self.signal, self.time_used_ms, self.wall_time_used_ms, self.memory_used_kb
+            self.status,
+            self.exit_code,
+            self.signal,
+            self.time_used_ms,
+            self.wall_time_used_ms,
+            self.memory_used_kb
         )
     }
 }

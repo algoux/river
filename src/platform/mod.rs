@@ -87,9 +87,7 @@ pub(crate) fn validate(spec: &RunSpec) -> PyResult<()> {
         let path = Path::new(key);
         if path.is_absolute()
             || key.contains(':')
-            || path
-                .components()
-                .any(|c| matches!(c, Component::ParentDir))
+            || path.components().any(|c| matches!(c, Component::ParentDir))
         {
             return Err(PyValueError::new_err(format!(
                 "invalid copy_in key {key:?}: must be a relative path inside the sandbox working directory"
