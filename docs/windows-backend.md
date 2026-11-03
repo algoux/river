@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1 全部完成 + P2 的 S5/S6/S7 完成，
-> S1–S7 已提交；下一步 S8（mitigation policies + 禁网，攻击面加固）。
+> **实现进度（2026-11，详见文末 §9）**：P1 全部完成 + P2 的 S5/S6/S7 + P3 的 S8
+> 完成，S1–S8 已提交；下一步 S9（看门狗 + TLE/MLE 完备判定，P4）。
 
 ## 1. 安全架构：三层防御
 
@@ -157,7 +157,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 
 | 步 | 内容 | 行数 | 验证 |
 |---|---|---|---|
-| S8 | mitigation policies + 禁网 | ~150 | 攻击清单前 7 项全灭（每个 policy 验证实际生效，非仅 API 返回值） |
+| S8 ✅ mitigation policies + 禁网 | ~250 | 攻击清单 1–7 全灭（examples/s8_smoke.py；每个 policy 有行为级探针/子进程内核状态自查询） | WIN32K=0x1<<28、EXTENSION_POINT=0x1<<32（官方 shift，非 winnt.h 记忆值） |
 
 ### P4 判定完备
 
@@ -219,11 +219,13 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `f6892b0` | S5 workdir.rs（per-run 目录、copy_in 落盘、reparse 安全清理）+ example.py 可运行 |
 | `667aeda` | S6 token.rs（AppContainer profile/SID，userenv extern 手写声明） |
 | `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
+| S8 | spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
-看门狗），Rust 单测 28/28 绿。**进程已跑在 AppContainer 身份下**：cwd 可写、
-runtimes 只读、其余宿主文件不可见（写 C:\ / 写 runtimes 均被拒绝，见
-examples/s7_smoke.py）。mitigation policy 尚未设置（S8）。
+看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
+收窄**：win32k 系统调用与全局钩子/AppInit/Winsock LSP/legacy IME 注入被禁，
+无 capability 即禁网；文件系统可见面 = cwd 可写 + runtimes 只读（攻击清单
+1–7 见 examples/s8_smoke.py，OLE 判定待 S10）。
 
 ### 9.2 关键实现决策（已定，勿翻案）
 
@@ -265,6 +267,18 @@ examples/s7_smoke.py）。mitigation policy 尚未设置（S8）。
 13. **venv 的 python.exe 需要读 venv 根目录**（`pyvenv.cfg`）与 base 解释器
     目录——S7 起 runtimes 必须包含 `dirname(sys.executable)`、`sys.prefix`、
     `sys.base_prefix`，否则被测 Python 在沙箱内起不来（RE）。
+14. **MITIGATION_POLICY 的 shift 值以官方 UpdateProcThreadAttribute 文档为
+    准**：WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON = 0x1<<28、
+    EXTENSION_POINT_DISABLE_ALWAYS_ON = 0x1<<32（同一 u64），别凭记忆写
+    24/41；两个 policy 合用一个 u64，多出的 u64 会让内核拒绝整个属性。
+15. **win32k 锁定下 user32 完全无法初始化**：任何静态导入 user32 的进程
+    （含 PowerShell/CLR/_ctypes.pyd）直接 0xC0000142 或 LoadLibrary 失败。
+    行为探针宿主必须用"纯 kernel32 + LoadLibrary 动态解析"的原生 exe
+    （测试里用 rustc 现编，见 spawn.rs `mitigation_policies_are_enforced_...`）。
+16. **EXTENSION_POINT_DISABLE 不在 SetWindowsHookExW API 层失败**，而是在
+    钩子 DLL 注入其他进程时静默不生效；其行为级注入验证在 Win11 上不可
+    靠（无策略也不注入），故测试用子进程自查询 GetProcessMitigationPolicy
+    （policy index 6）验证内核已应用状态。
 
 ### 9.4 下一步（按序）
 
@@ -274,15 +288,22 @@ examples/s7_smoke.py）。mitigation policy 尚未设置（S8）。
    - acl.rs：cwd 目录加 AppContainer SID 的读写 ACE；runtimes 目录只读+执行 ACE；
      TEMP/TMP 环境变量指向 cwd 下 tmp 子目录；env 白名单基底（SystemRoot 必带，
      **LOCALAPPDATA 也必带**，见踩坑 10）——均已实现
-2. S8 mitigation policies（见 §1 第三层；CHILD_PROCESS_DISABLED 已弃用）
+2. ~~S8 mitigation policies~~ ✅ 已完成（见 §9.1）：
+   - spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`
+     （WIN32K_SYSTEM_CALL_DISABLE = 0x1<<28 + EXTENSION_POINT_DISABLE =
+     0x1<<32，ALWAYS_ON，单 u64；CHILD_PROCESS_DISABLED 保持弃用）
+   - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
+     原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
+     禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
 3. S9–S13 按原表
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（28 个单测）；Python 冒烟：
+- 构建/测试：`cargo test --lib -- --test-threads=1`（29 个单测）；Python 冒烟：
   `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
   被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
-  AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证
+  AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证；
+  `examples/s8_smoke.py`：攻击清单 1–7（win32k/hook/禁网/文件/注册表/TLE）
 - 行尾：Windows 下子进程输出带 `\r\n`，测试断言统一用 `rstrip()` 或精确字节

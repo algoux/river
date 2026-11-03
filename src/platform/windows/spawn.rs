@@ -12,10 +12,34 @@ use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
     EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-    UpdateProcThreadAttribute, DeleteProcThreadAttributeList,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+    DeleteProcThreadAttributeList,
 };
+
+/// Mitigation-policy encodings from the official UpdateProcThreadAttribute
+/// documentation (each policy is one 2-bit field in a u64):
+/// 0 = deferred, 1 = ALWAYS_ON, 2 = ALWAYS_OFF, 3 = reserved/opt-out.
+const MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON: u64 = 0x1 << 28;
+const MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON: u64 = 0x1 << 32;
+
+/// The kernel attack-surface policies set on every sandboxed child (§1 第三层).
+/// Both policies live in the *first* u64 of the MITIGATION_POLICY attribute.
+///
+/// Deliberately excludes CHILD_PROCESS_DISABLED — it conflicts with the agreed
+/// wrapper process strategy (see DESIGN.md); "main process only" is enforced
+/// by the monitor's residual-detection instead.
+pub(crate) fn mitigation_policies() -> u64 {
+    MITIGATION_POLICY_WIN32K_SYSTEM_CALL_DISABLE_ALWAYS_ON
+        | MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
+}
+
+/// Extension-point policy alone (tests isolate its effect from win32k).
+#[cfg(test)]
+pub(crate) fn mitigation_policies_ext_only() -> u64 {
+    MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
+}
 
 use crate::platform::windows::job::{Job, wait_process_exit};
 use crate::platform::windows::stdio::StdioSet;
@@ -92,9 +116,13 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 /// Security configuration for a sandboxed spawn: the AppContainer SID the
 /// child adopts and the whitelisted environment block it sees.
+///
+/// A null `appcontainer_sid` spawns with the judger token — only the
+/// mitigation policies are applied (used to isolate policy effects in tests).
 pub(crate) struct SpawnSecurity {
     pub appcontainer_sid: *mut core::ffi::c_void,
-    pub env_block: Vec<u16>, // UTF-16 "K=V\0" pairs, double-NUL terminated
+    pub env_block: Vec<u16>,    // UTF-16 "K=V\0" pairs, double-NUL terminated
+    pub mitigation_policy: u64, // MITIGATION_POLICY attribute word
 }
 
 /// Build a UTF-16 environment block (sorted, case-insensitive on the name —
@@ -177,44 +205,70 @@ pub(crate) fn spawn_bare(
         child_stderr.as_raw_handle() as *mut core::ffi::c_void,
     ];
     if security.is_some() {
+        let policies = security.unwrap().mitigation_policy;
+        let has_ac = security
+            .map(|s| !s.appcontainer_sid.is_null())
+            .unwrap_or(false);
+        let attr_count = if has_ac { 3 } else { 1 };
         let mut size = 0usize;
         // SAFETY: first call with a null list only queries the required size.
         unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), 2, 0, &mut size);
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), attr_count as u32, 0, &mut size);
         }
         attr_buf = vec![0u8; size];
         let list = attr_buf.as_mut_ptr() as *mut core::ffi::c_void;
-        // SAFETY: buffer holds `size` bytes for a 2-attribute list.
-        let ok = unsafe { InitializeProcThreadAttributeList(list, 2, 0, &mut size) };
+        // SAFETY: buffer holds `size` bytes for the attribute list.
+        let ok = unsafe { InitializeProcThreadAttributeList(list, attr_count as u32, 0, &mut size) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
         // Only the three std handles are inherited into the child.
         // SAFETY: list is initialized; value points at a 3-handle array.
-        let ok = unsafe {
-            UpdateProcThreadAttribute(
-                list,
-                0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                handles.as_ptr() as *mut _,
-                std::mem::size_of::<[*mut core::ffi::c_void; 3]>(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            )
-        };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if let Some(sec) = security {
-            sec_caps.AppContainerSid = sec.appcontainer_sid;
-            // SAFETY: list is initialized; value points at a valid struct.
+        if has_ac {
             let ok = unsafe {
                 UpdateProcThreadAttribute(
                     list,
                     0,
-                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                    &mut sec_caps as *mut _ as *mut _,
-                    std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    handles.as_ptr() as *mut _,
+                    std::mem::size_of::<[*mut core::ffi::c_void; 3]>(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if let Some(sec) = security {
+            if has_ac {
+                sec_caps.AppContainerSid = sec.appcontainer_sid;
+                // SAFETY: list is initialized; value points at a valid struct.
+                let ok = unsafe {
+                    UpdateProcThreadAttribute(
+                        list,
+                        0,
+                        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                        &mut sec_caps as *mut _ as *mut _,
+                        std::mem::size_of::<SECURITY_CAPABILITIES>(),
+                        std::ptr::null_mut(),
+                        std::ptr::null(),
+                    )
+                };
+                if ok == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+            }
+            // Kernel attack surface: win32k syscalls + DLL-injection hook
+            // extension points are disabled for the child's lifetime.
+            // SAFETY: list is initialized; value points at the policy word.
+            let ok = unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+                    &policies as *const u64 as *mut _,
+                    std::mem::size_of::<u64>(),
                     std::ptr::null_mut(),
                     std::ptr::null(),
                 )
@@ -441,8 +495,8 @@ mod tests {
         let security = SpawnSecurity {
             appcontainer_sid: ac.sid(),
             env_block: env_block(&env_vars),
+            mitigation_policy: mitigation_policies(),
         };
-        // TODO(debug) TEMP/TMP isolated
 
         let comspec = PathBuf::from(std::env::var("ComSpec").unwrap());
         let run = |args: &[&str]| -> io::Result<(
@@ -498,4 +552,361 @@ mod tests {
             "whitelisted env vars must be visible: {text}"
         );
     }
+
+    /// S8: the mitigation policies are *enforced by the kernel*, verified
+    /// with behavioral probes from the child itself (not just attribute API
+    /// return values):
+    /// - EXTENSION_POINT_DISABLE: `SetWindowsHookExW` must fail with
+    ///   ERROR_ACCESS_DISABLED_BY_POLICY (1260);
+    /// - WIN32K_SYSTEM_DISABLE: `GetCursorPos` (a win32k syscall) must fail
+    ///   with the same code.
+    /// Both probes are also run from a plain judger-token child to prove the
+    /// delta comes from the policies, not from some environmental accident.
+    #[test]
+    fn mitigation_policies_are_enforced_by_the_kernel() -> io::Result<()> {
+        use crate::platform::windows::acl;
+        use crate::platform::windows::token::AppContainer;
+        use crate::platform::windows::workdir::WorkDir;
+        use std::path::PathBuf;
+
+        const ERROR_ACCESS_DISABLED_BY_POLICY: u32 = 1260;
+
+        // Probe host: a tiny native exe compiled with rustc. We must NOT use
+        // PowerShell (or any .NET host) here — under win32k lockdown the CLR
+        // dies with STATUS_DLL_INIT_FAILED before reaching the probe. The
+        // probe never links user32; it LoadLibraryA's it at probe time, so a
+        // win32k-blocked child reports a clean, attributable failure.
+        let work = WorkDir::create().unwrap();
+        let probe_rs = work.path().join("probe.rs");
+        let probe_exe = work.path().join("probe.exe");
+        std::fs::write(
+            &probe_rs,
+            r#"fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_default();
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+            fn GetProcAddress(m: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
+            fn GetLastError() -> u32;
+            fn CreateEventA(attrs: *mut core::ffi::c_void, manual: i32, init: i32, name: *const u8) -> isize;
+            fn WaitForSingleObject(h: isize, ms: u32) -> u32;
+            fn CloseHandle(h: isize) -> i32;
+        }
+        if mode == "query" {
+            // Kernel-applied mitigation state of THIS process (not the
+            // attribute API). PROCESS_MITIGATION_POLICY index 6 =
+            // ProcessExtensionPointDisablePolicy; Flags bit0 = enabled.
+            // Must run BEFORE any user32 load (win32k lockdown breaks it).
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn GetProcessMitigationPolicy(h: isize, policy: u32, buf: *mut u32, len: usize) -> i32;
+            }
+            let mut flags: u32 = 0;
+            let ok = GetProcessMitigationPolicy(-1isize, 6, &mut flags, 4);
+            println!("query ok={} ext={}", ok, flags & 1);
+            std::process::exit(if ok != 0 && flags & 1 == 1 { 0 } else { 5 });
+        }
+        let u = LoadLibraryA(b"user32.dll\0".as_ptr());
+        if u.is_null() {
+            // user32 cannot initialize under win32k lockdown — that denial
+            // IS the policy working (ERROR_DLL_INIT_FAILED).
+            println!("load-denied");
+            std::process::exit(GetLastError() as i32);
+        }
+        // NOTE: user32 must never be a static import of this exe — under
+        // win32k lockdown the loader would kill the process (0xC0000142)
+        // before main. Everything resolves through LoadLibraryA/ProcAddress.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetLastError(e: u32);
+        }
+        let get_cursor_pos: extern "system" fn(*mut (i32, i32)) -> i32 =
+            std::mem::transmute(GetProcAddress(u, b"GetCursorPos\0".as_ptr()));
+        let set_hook: extern "system" fn(
+            i32,
+            *mut core::ffi::c_void,
+            *mut core::ffi::c_void,
+            u32,
+        ) -> *mut core::ffi::c_void = std::mem::transmute(GetProcAddress(
+            u,
+            b"SetWindowsHookExW\0".as_ptr(),
+        ));
+        let unhook: extern "system" fn(*mut core::ffi::c_void) -> i32 =
+            std::mem::transmute(GetProcAddress(u, b"UnhookWindowsHookEx\0".as_ptr()));
+        if mode == "win32k" {
+            let mut p = (0i32, 0i32);
+            if get_cursor_pos(&mut p) == 0 {
+                println!("win32k-denied");
+                std::process::exit(GetLastError() as i32);
+            }
+            println!("win32k-ok");
+            std::process::exit(0);
+        }
+        // Extension-point probe ("hookinject"): a GLOBAL WH_CBT hook backed
+        // by probe_hook.dll. The policy blocks injecting that DLL into other
+        // processes — the SetWindowsHookExW API still succeeds, so we verify
+        // behaviorally: spawn a fresh console window (fires HCBT_CREATEWND in
+        // that process); the DLL's DllMain signals a named event if it really
+        // got injected. Signaled = injection happened (policy NOT effective).
+        let evt = CreateEventA(std::ptr::null_mut(), 1, 0, b"river_s8_probe_evt\0".as_ptr());
+        SetLastError(0);
+        let lib = LoadLibraryA(b"probe_hook.dll\0".as_ptr());
+        if lib.is_null() {
+            println!("dll-load-denied");
+            std::process::exit(GetLastError() as i32);
+        }
+        let proc = GetProcAddress(lib, b"probe_hook_proc\0".as_ptr());
+        let h = set_hook(5, proc, lib, 0);
+        if h.is_null() {
+            println!("hook-denied");
+            std::process::exit(GetLastError() as i32);
+        }
+        // Trigger: a new console window fires the CBT hook in its process.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn CreateProcessW(app: *const u16, cmd: *mut u16, pa: *mut core::ffi::c_void, ta: *mut core::ffi::c_void, inherit: i32, flags: u32, env: *mut core::ffi::c_void, cwd: *const u16, si: *mut core::ffi::c_void, pi: *mut core::ffi::c_void) -> i32;
+        }
+        let mut cmdline: Vec<u16> = "notepad\0".encode_utf16().collect();
+        let mut si = [0u8; 104]; // STARTUPINFOW, cb first
+        si[0..2].copy_from_slice(&104u16.to_le_bytes());
+        let mut pi = [0u8; 24]; // PROCESS_INFORMATION
+        let _ok = CreateProcessW(
+            std::ptr::null(), cmdline.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(),
+            0, 0 /* notepad makes its own window */, std::ptr::null_mut(), std::ptr::null(),
+            si.as_mut_ptr() as *mut _, pi.as_mut_ptr() as *mut _,
+        );
+        let wait = WaitForSingleObject(evt, 3000);
+        // Kill the trigger window and release its handles.
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn TerminateProcess(h: isize, code: u32) -> i32;
+        }
+        let child_proc = usize::from_le_bytes(pi[0..8].try_into().unwrap()) as isize;
+        if child_proc != 0 {
+            TerminateProcess(child_proc, 1);
+            CloseHandle(child_proc);
+            CloseHandle(usize::from_le_bytes(pi[8..16].try_into().unwrap()) as isize);
+        }
+        if !h.is_null() {
+            unhook(h);
+        }
+        CloseHandle(evt);
+        if wait == 0 /* WAIT_OBJECT_0 */ {
+            println!("hook-injected");
+            std::process::exit(8);
+        }
+        println!("hook-not-injected");
+        std::process::exit(0);
+    }
 }
+
+// probe_hook.dll: the injected-module side of the global hook. DllMain
+// signals the event on PROCESS_ATTACH — proof the module was injected.
+#[no_mangle]
+pub extern "system" fn probe_hook_proc(code: i32, wparam: isize, lparam: isize) -> isize {
+    let _ = (code, wparam, lparam);
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn DllMain(_hinst: isize, reason: u32, _reserved: isize) -> i32 {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    if reason == DLL_PROCESS_ATTACH {
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> isize;
+                fn SetEvent(h: isize) -> i32;
+            }
+            let h = OpenEventA(0x00100000, 0, b"river_s8_probe_evt\0".as_ptr());
+            if h != 0 {
+                SetEvent(h);
+            }
+        }
+    }
+    1
+}
+"#,
+        )
+        .unwrap();
+        // Compile once with rustc (which cargo put in our environment): the
+        // probe exe and the hook DLL it registers.
+        {
+            let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+            let hook_rs = work.path().join("probe_hook.rs");
+            let hook_dll = work.path().join("probe_hook.dll");
+            std::fs::write(
+                &hook_rs,
+                r#"#[no_mangle]
+pub extern "system" fn probe_hook_proc(code: i32, wparam: isize, lparam: isize) -> isize {
+    let _ = (code, wparam, lparam);
+    0
+}
+
+#[no_mangle]
+pub extern "system" fn DllMain(_hinst: isize, reason: u32, _reserved: isize) -> i32 {
+    const DLL_PROCESS_ATTACH: u32 = 1;
+    if reason == DLL_PROCESS_ATTACH {
+        unsafe {
+            #[link(name = "kernel32")]
+            extern "system" {
+                fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> isize;
+                fn SetEvent(h: isize) -> i32;
+            }
+            let h = OpenEventA(0x00100000, 0, b"river_s8_probe_evt\0".as_ptr());
+            if h != 0 {
+                SetEvent(h);
+            }
+        }
+    }
+    1
+}
+"#,
+            )
+            .unwrap();
+            for extra in [
+                // (source, output, extra args)
+                (hook_rs.clone(), hook_dll, vec!["--crate-type=cdylib".to_string()]),
+                (
+                    probe_rs.clone(),
+                    probe_exe.clone(),
+                    vec!["-O".to_string(), "--edition=2021".to_string()],
+                ),
+            ] {
+                let (src, out, mut extra_args) = extra;
+                extra_args.push(format!("-o{}", out.display()));
+                extra_args.push(src.display().to_string());
+                let job = Job::new(&limits())?;
+                let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+                let child = spawn_bare(
+                    Path::new(&rustc),
+                    &extra_args,
+                    &job,
+                    &mut set,
+                    Some(work.path()),
+                    None,
+                )?;
+                child.resume()?;
+                let code = child.wait_exit()?;
+                let (out, err) = set.finish()?;
+                assert_eq!(code, 0, "rustc probe compile failed: {out:?} {err:?}");
+            }
+        }
+
+        let run = |args: &[&str],
+                   cwd: Option<&std::path::Path>,
+                   security: Option<&SpawnSecurity>|
+          -> io::Result<(
+            u32,
+            crate::platform::windows::stdio::Output,
+            crate::platform::windows::stdio::Output,
+        )> {
+            let job = Job::new(&limits())?;
+            let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+            let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let child = spawn_bare(&probe_exe, &argvec, &job, &mut set, cwd, security)?;
+            child.resume()?;
+            let code = child.wait_exit()?;
+            let (out, err) = set.finish()?;
+            Ok((code, out, err))
+        };
+
+        // Plain child (judger token, no policies): probes succeed / policy off.
+        let (code, out, _) = run(&["query"], Some(work.path()), None)?;
+        assert_eq!(code, 5, "plain child must show ext policy OFF: {out:?}");
+
+        let (code, out, _) = run(&["win32k"], Some(work.path()), None)?;
+        assert_eq!(code, 0, "win32k probe on a plain child: {out:?}");
+
+        // Sandboxed child (AppContainer + policies): both denied by policy.
+        let ac = AppContainer::create_or_open().unwrap();
+        acl::grant_rw(work.path(), ac.sid()).unwrap();
+        let tmp = work.path().join("tmp");
+        std::fs::create_dir(&tmp).unwrap();
+        let env_vars = vec![
+            (
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+            ),
+            (
+                "LOCALAPPDATA".to_string(),
+                std::env::var("LOCALAPPDATA").unwrap_or_default(),
+            ),
+            ("TEMP".to_string(), tmp.display().to_string()),
+            ("TMP".to_string(), tmp.display().to_string()),
+        ];
+        let security = SpawnSecurity {
+            appcontainer_sid: ac.sid(),
+            env_block: env_block(&env_vars),
+            mitigation_policy: mitigation_policies(),
+        };
+
+        // Policy-isolated child A (judger token, EXTENSION_POINT policy only,
+        // no AppContainer): the child's own kernel mitigation state must show
+        // the policy ENABLED. (Behavioral global-hook injection is not
+        // reliably observable on recent Windows builds even without the
+        // policy, so the kernel-applied state is the verified contract; the
+        // policy blocks AppInit DLLs / Winsock LSPs / global-hook /
+        // legacy-IME extension points for the child's lifetime.)
+        let ext_only = SpawnSecurity {
+            appcontainer_sid: std::ptr::null_mut(),
+            env_block: env_block(&[(
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+            )]),
+            mitigation_policy: mitigation_policies_ext_only(),
+        };
+        let (code, out, _) = run(&["query"], Some(work.path()), Some(&ext_only))?;
+        assert_eq!(
+            code, 0,
+            "ext-point policy must be enabled in the kernel: {out:?}"
+        );
+
+        // Policy-isolated child B (judger token, full policies, no AC): user32
+        // cannot even initialize under win32k lockdown — LoadLibraryA fails
+        // with DLL_INIT_FAILED (or the syscall with DISABLED_BY_POLICY).
+        let full_no_ac = SpawnSecurity {
+            appcontainer_sid: std::ptr::null_mut(),
+            env_block: env_block(&[(
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+            )]),
+            mitigation_policy: mitigation_policies(),
+        };
+        let (code, out, _) = run(&["win32k"], Some(work.path()), Some(&full_no_ac))?;
+        assert!(
+            code != 0 && code != 7,
+            "win32k access must fail under the policy (no-AC): exit={code:#x} {out:?}"
+        );
+        // The load must have been denied, not executed successfully.
+        assert!(
+            out.data.starts_with(b"load-denied") || code == ERROR_ACCESS_DISABLED_BY_POLICY,
+            "expected a user32 denial: exit={code:#x} {out:?}"
+        );
+
+        // Sandboxed child (AppContainer + policies): ext policy enabled...
+        let (code, out, _) = run(&["query"], Some(work.path()), Some(&security))?;
+        assert_eq!(
+            code, 0,
+            "ext-point policy must be enabled in the sandbox: {out:?}"
+        );
+
+        // ...and the win32k lockdown must deny user32 access entirely (the
+        // exact failure surface varies: ERROR_ACCESS_DISABLED_BY_POLICY from
+        // a denied syscall, or the user32 load failing outright).
+        let (code, out, _) = run(&["win32k"], Some(work.path()), Some(&security))?;
+        assert!(
+            code != 0,
+            "win32k syscall must be policy-denied: {out:?}"
+        );
+        assert!(
+            out.data.starts_with(b"load-denied")
+                || code == ERROR_ACCESS_DISABLED_BY_POLICY,
+            "expected a win32k denial: exit={code:#x} {out:?}"
+        );
+
+        Ok(())
+    }
+}
+

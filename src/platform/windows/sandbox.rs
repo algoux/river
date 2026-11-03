@@ -9,7 +9,9 @@ use pyo3::types::PyAny;
 use crate::platform::windows::acl;
 use crate::platform::windows::job::{Job, JobLimits};
 use crate::platform::windows::monitor::monitor;
-use crate::platform::windows::spawn::{SpawnSecurity, env_block, spawn_bare};
+use crate::platform::windows::spawn::{
+    SpawnSecurity, env_block, mitigation_policies, spawn_bare,
+};
 use crate::platform::windows::stdio::{StdinSource, StdioSet};
 use crate::platform::windows::token::AppContainer;
 use crate::platform::windows::verdict::{
@@ -208,6 +210,7 @@ impl Sandbox {
             let security = SpawnSecurity {
                 appcontainer_sid: sid,
                 env_block: env_block(&env_vars),
+                mitigation_policy: mitigation_policies(),
             };
 
             // The process starts inside the working directory; an explicit
