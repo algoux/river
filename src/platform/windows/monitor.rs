@@ -130,7 +130,7 @@ mod tests {
         })?;
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None)?;
+        let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None, None)?;
         let outcome = monitor(&child, &job, wall_limit)?;
         set.finish()?;
         Ok(outcome)
@@ -189,7 +189,7 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None).unwrap();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
         let outcome = monitor(&child, &job, None).unwrap();
         assert_eq!(outcome.kill_reason, KillReason::None);
         assert!(

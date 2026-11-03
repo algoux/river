@@ -3,8 +3,8 @@
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
 无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1 全部完成 + P2 的 S5/S6 完成，
-> S1–S6 已提交；下一步 S7（ACL + spawn 接入 AppContainer，安全里程碑）。
+> **实现进度（2026-11，详见文末 §9）**：P1 全部完成 + P2 的 S5/S6/S7 完成，
+> S1–S7 已提交；下一步 S8（mitigation policies + 禁网，攻击面加固）。
 
 ## 1. 安全架构：三层防御
 
@@ -151,7 +151,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 |---|---|---|---|---|
 | S5 ✅ `workdir.rs` 临时目录+copy_in | ~200 | copy_in 落 cwd；块退出目录消失；junction 删净 | 删除不跟随 reparse；异常不泄漏目录 |
 | S6 ✅ `token.rs` AppContainer profile/SID | ~150 | 令牌起进程身份正确 | profile 复用策略 |
-| S7 | `acl.rs` + 接入 spawn | ~250 | **安全里程碑**：写 C:\ 失败、写 cwd 成功、读 runtimes 成功；python via runtimes 跑通 | ACE 权限位精确（READ\|EXECUTE 无 WRITE/DELETE）；TEMP 指向 cwd |
+| S7 ✅ `acl.rs` + 接入 spawn | ~300 | **安全里程碑达成**：写 C:\ 失败、写 cwd 成功、读 runtimes 成功（写 runtimes 也拒绝）；python via runtimes 跑通 | ACE 权限位精确（READ\|EXECUTE 无 WRITE/DELETE）；TEMP 指向 cwd |
 
 ### P3 攻击面加固
 
@@ -218,11 +218,12 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 | `ad20ee3` | S4 run() 接线（真实 Status；GIL 用 py.detach；SE 契约）+ 分层进程策略 |
 | `f6892b0` | S5 workdir.rs（per-run 目录、copy_in 落盘、reparse 安全清理）+ example.py 可运行 |
 | `667aeda` | S6 token.rs（AppContainer profile/SID，userenv extern 手写声明） |
+| `4f2db29` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
 
 当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
-看门狗），Rust 单测 26/26 绿。**但整个进程还跑在 judger 自己的权限下**——
-AppContainer（S6 的 SID）尚未接入 spawn（S7），文件 ACL 尚未授予（S7），
-mitigation policy 尚未设置（S8）。
+看门狗），Rust 单测 28/28 绿。**进程已跑在 AppContainer 身份下**：cwd 可写、
+runtimes 只读、其余宿主文件不可见（写 C:\ / 写 runtimes 均被拒绝，见
+examples/s7_smoke.py）。mitigation policy 尚未设置（S8）。
 
 ### 9.2 关键实现决策（已定，勿翻案）
 
@@ -251,26 +252,37 @@ mitigation policy 尚未设置（S8）。
    进程后可能残留 target/debug/.cargo-lock，需手动删除。
 9. **Windows 子进程 stdout 是文本模式**——需要在 python.exe 侧注意；
    river 的管道本身是二进制透传。
+10. **AppContainer spawn 的环境块必须包含 LOCALAPPDATA**：白名单基底只有
+    SystemRoot 时 `CreateProcessW` 返回 `ERROR_ENVVAR_NOT_FOUND`（203）。
+    此外内核会用 AppContainer profile 的路径**覆盖**子进程的
+    LOCALAPPDATA/TEMP/TMP 等（即使块里显式给了别的值）——profile 的 Temp
+    目录是沙箱私有的，反而是好事；cwd 的 `tmp/` 仍会创建并作为白名单值。
+11. **SetEntriesInAclW 对同一 trustee 的多个 grant 是合并掩码**（rw ∪ ro），
+    不是并列 ACE——acl.rs 用"完全相同的 SID+mask 则跳过"实现幂等，重复
+    grant runtimes 目录不会让 DACL 无限增长。
+12. **EXTENDED_STARTUPINFO_PRESENT 时 `STARTUPINFOW.cb` 必须是
+    `sizeof(STARTUPINFOEXW)`**，传 `sizeof(STARTUPINFOW)` 会报 87。
+13. **venv 的 python.exe 需要读 venv 根目录**（`pyvenv.cfg`）与 base 解释器
+    目录——S7 起 runtimes 必须包含 `dirname(sys.executable)`、`sys.prefix`、
+    `sys.base_prefix`，否则被测 Python 在沙箱内起不来（RE）。
 
 ### 9.4 下一步（按序）
 
-1. **S7 `acl.rs` + spawn 接入**（安全里程碑）：
+1. ~~**S7 `acl.rs` + spawn 接入**~~ ✅ 已完成（见 §9.1）：
    - spawn.rs 加 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`（SID 来自 token.rs）
-     与 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（只继承三个 std 句柄）
+     与 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（只继承三个 std 句柄）——均已实现
    - acl.rs：cwd 目录加 AppContainer SID 的读写 ACE；runtimes 目录只读+执行 ACE；
-     TEMP/TMP 环境变量指向 cwd 下 tmp 子目录；env 白名单基底（SystemRoot 必带）
-   - 验证：写 C:\ 失败 / 写 cwd 成功 / 读 runtimes 成功 / python via runtimes 跑通
-   - 注意：给宿主目录（runtimes）加 ACE 需要对该目录有 WRITE_DAC 权限（自己的
-     目录即可，无需管理员）
+     TEMP/TMP 环境变量指向 cwd 下 tmp 子目录；env 白名单基底（SystemRoot 必带，
+     **LOCALAPPDATA 也必带**，见踩坑 10）——均已实现
 2. S8 mitigation policies（见 §1 第三层；CHILD_PROCESS_DISABLED 已弃用）
 3. S9–S13 按原表
 4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（26 个单测）；Python 冒烟：
+- 构建/测试：`cargo test --lib -- --test-threads=1`（28 个单测）；Python 冒烟：
   `uv run maturin develop` 后 `uv run python -c ...`（用 `sys.executable` 作为
   被测程序）
-- example.py：`uv run python examples/example.py`（当前三个场景可运行；头部
-  注释标注了 runtimes/env 尚未生效）
+- example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
+  AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证
 - 行尾：Windows 下子进程输出带 `\r\n`，测试断言统一用 `rstrip()` 或精确字节

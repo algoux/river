@@ -1,26 +1,30 @@
+import os
+import sys
+
 import river
 
 # 统一三平台的心智模型：
-#   私有可写 cwd（每次 run 新建，块退出即销毁）
+#   私有可写 cwd（每次 run 新建，块退出即销毁；Windows 上进程跑在
+#   AppContainer 身份下，cwd 经 ACL 授权可写、其余宿主文件不可见）
 #   + runtimes（宿主机目录以只读方式并入沙箱：Windows 用 ACL 授权，
 #     Linux/macOS 用只读 bind mount）
 #   + copy_in（每 run 投放的私有文件）
-#   + env
+#   + env（增量合并进白名单基底：SystemRoot/LOCALAPPDATA/TEMP/TMP）
 #
 # rootfs 仅 Linux/macOS 支持（chroot/sandbox-exec）；Windows 上传入即报错
 # —— Windows 进程永远从真实 System32 加载系统 DLL，rootfs 语义不成立，
 # 运行时环境一律通过 runtimes 提供。
-#
-# 注意（当前进度）：runtimes / env 增量合并尚未实现（S6/S7）；
-# copy_in / cwd / 各项限制 / 三通道 IO 已可用。
-sandbox = river.Sandbox(
-    rootfs=None,  # str | None，Linux/macOS 专属
-    runtimes=[],
-)
-
-import sys
 
 PYTHON = sys.executable  # 演示用：以本机 Python 作为被测运行时
+base = getattr(sys, "base_prefix", os.path.dirname(PYTHON))
+# runtimes：宿主目录以只读+执行方式授权给沙箱（Windows=ACL，Linux/macOS=bind）
+# venv 的 python.exe 需要读 venv 根（pyvenv.cfg）与 base 解释器目录
+RUNTIMES = sorted({os.path.dirname(PYTHON), sys.prefix, base})
+
+sandbox = river.Sandbox(
+    rootfs=None,  # str | None，Linux/macOS 专属
+    runtimes=RUNTIMES,  # list[str] | None，只读暴露给沙箱
+)
 
 with sandbox:
     # ── 场景 1：运行一个程序并施加资源限制 ─────────────────────────
@@ -28,7 +32,7 @@ with sandbox:
         PYTHON,  # str，宿主机路径
         args=["-c", "print(sum(map(int, input().split())))"],
         cwd=None,  # str | None，沙箱内相对路径，默认沙箱根（私有 cwd）
-        env=None,  # dict[str, str] | None，增量合并进白名单基底（S7 生效）
+        env=None,  # dict[str, str] | None，增量合并进白名单基底
         time_limit_ms=5000,  # ms | None，如果未设置，则默认为无限
         memory_limit_kb=256 * 1024,  # kb | None，如果未设置，则默认为无限
         wall_time_limit_ms=10000,  # ms | None，默认为 time_limit_ms * 2 + 1000

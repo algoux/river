@@ -6,10 +6,12 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
+use crate::platform::windows::acl;
 use crate::platform::windows::job::{Job, JobLimits};
 use crate::platform::windows::monitor::monitor;
-use crate::platform::windows::spawn::spawn_bare;
+use crate::platform::windows::spawn::{SpawnSecurity, env_block, spawn_bare};
 use crate::platform::windows::stdio::{StdinSource, StdioSet};
+use crate::platform::windows::token::AppContainer;
 use crate::platform::windows::verdict::{
     AC, RE, SE, SIG_NONE, SIGKILL, TLE, Verdict, classify_with_residual,
 };
@@ -138,9 +140,7 @@ impl Sandbox {
         };
         validate(&spec)?;
 
-        // --- translate the frozen contract into P1 primitives -------------
-        // P1 scope: measurement core without sandboxing. cwd/env/copy_in are
-        // honored from S5/S7 (workdir + ACL layer); runtimes from S7.
+        // --- translate the frozen contract into P1/P2 primitives ----------
         let stdin_src = match (&spec.stdin, &spec.stdin_file) {
             (Some(bytes), _) => StdinSource::Bytes(bytes.clone()),
             (None, Some(path)) => StdinSource::File(path.clone()),
@@ -161,6 +161,8 @@ impl Sandbox {
         let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
         let copy_in = spec.copy_in.clone();
         let cwd_rel = spec.cwd.clone();
+        let env_map = spec.env.clone().unwrap_or_default();
+        let runtimes = self.runtimes.clone();
 
         // Blocking pipeline with the GIL released.
         let result = py.detach(move || -> io::Result<_> {
@@ -170,6 +172,44 @@ impl Sandbox {
             if let Some(files) = &copy_in {
                 workdir.provision(files)?;
             }
+
+            // S7: AppContainer identity + ACL grants. The child adopts the
+            // AppContainer at spawn time; its visible filesystem is exactly
+            // the granted surface (cwd rw, runtimes ro, system DLLs default).
+            let appcontainer = AppContainer::create_or_open()?;
+            let sid = appcontainer.sid();
+            acl::grant_rw(workdir.path(), sid)?;
+            for rt in &runtimes {
+                acl::grant_ro(rt, sid)?;
+            }
+
+            // Whitelisted environment: base + caller overrides (incremental
+            // merge). TEMP/TMP point into the private cwd. LOCALAPPDATA is
+            // REQUIRED for an AppContainer spawn: without it CreateProcessW
+            // fails with ERROR_ENVVAR_NOT_FOUND (203) — see S7 踩坑记录.
+            let tmp_dir = workdir.path().join("tmp");
+            std::fs::create_dir(&tmp_dir)?;
+            let mut env_vars: Vec<(String, String)> = vec![
+                (
+                    "SystemRoot".to_string(),
+                    std::env::var("SystemRoot")
+                        .unwrap_or_else(|_| r"C:\Windows".to_string()),
+                ),
+                (
+                    "LOCALAPPDATA".to_string(),
+                    std::env::var("LOCALAPPDATA").unwrap_or_default(),
+                ),
+                ("TEMP".to_string(), tmp_dir.display().to_string()),
+                ("TMP".to_string(), tmp_dir.display().to_string()),
+            ];
+            for (k, v) in &env_map {
+                env_vars.push((k.clone(), v.clone()));
+            }
+            let security = SpawnSecurity {
+                appcontainer_sid: sid,
+                env_block: env_block(&env_vars),
+            };
+
             // The process starts inside the working directory; an explicit
             // `cwd` (relative to it) is applied below when supported.
             let cwd_path = match &cwd_rel {
@@ -187,7 +227,14 @@ impl Sandbox {
                 stdout_file,
                 stderr_file,
             )?;
-            let child = spawn_bare(&exe, &args, &job, &mut set, cwd_path.as_deref())?;
+            let child = spawn_bare(
+                &exe,
+                &args,
+                &job,
+                &mut set,
+                cwd_path.as_deref(),
+                Some(&security),
+            )?;
             let outcome = monitor(&child, &job, wall_limit)?;
             let peak_bytes = job.peak_process_memory_used()?;
             let (out, err) = set.finish()?;
