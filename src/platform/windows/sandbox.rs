@@ -7,7 +7,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use crate::platform::windows::acl;
-use crate::platform::windows::job::{Job, JobLimits};
+use crate::platform::windows::job::{Job, JobLimits, physical_memory_bytes};
 use crate::platform::windows::monitor::monitor;
 use crate::platform::windows::spawn::{
     SpawnSecurity, env_block, mitigation_policies, spawn_bare,
@@ -15,7 +15,7 @@ use crate::platform::windows::spawn::{
 use crate::platform::windows::stdio::{StdinSource, StdioSet};
 use crate::platform::windows::token::AppContainer;
 use crate::platform::windows::verdict::{
-    AC, RE, SE, SIG_NONE, SIGKILL, TLE, Verdict, classify_with_residual,
+    SE, SIG_NONE, Verdict, classify_with_evidence,
 };
 use crate::platform::windows::workdir::WorkDir;
 use crate::platform::{RunSpec, parse_copy_in, validate};
@@ -156,6 +156,10 @@ impl Sandbox {
         let wall_limit = spec
             .effective_wall_time_limit_ms()
             .map(Duration::from_millis);
+        // Effective limits the job enforces (user limit or safety ceiling);
+        // the verdict compares measurements against these (S9 evidence).
+        let memory_limit_bytes = limits.memory_limit_bytes.unwrap_or_else(physical_memory_bytes);
+        let cpu_time_limit_ms = limits.cpu_time_limit_ms;
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
         let exe = spec.executable.clone();
@@ -246,23 +250,17 @@ impl Sandbox {
 
         match result {
             Ok((outcome, peak_bytes, out, err)) => {
-                let mut verdict: Verdict = classify_with_residual(
+                // Evidence-priority verdict (S9): sandbox kills and limit
+                // evidence outrank the raw exit code of a killed process.
+                let verdict: Verdict = classify_with_evidence(
                     &outcome.kill_reason,
                     outcome.exit_code,
                     outcome.residual_processes,
+                    cpu_time_limit_ms,
+                    outcome.cpu_time_ms,
+                    Some(memory_limit_bytes),
+                    peak_bytes,
                 );
-                // CPU-limit evidence: the job kills the process on CPU
-                // overrun; classify via the measured time (S9 moves this
-                // into the monitor with evidence priority).
-                if (verdict.status == AC || verdict.status == RE)
-                    && let Some(limit) = spec.time_limit_ms
-                    && outcome.cpu_time_ms > limit
-                {
-                    verdict = Verdict {
-                        status: TLE,
-                        signal: SIGKILL,
-                    };
-                }
                 Ok(Status {
                     time_used_ms: outcome.cpu_time_ms,
                     wall_time_used_ms: outcome.wall_time_ms,

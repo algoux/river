@@ -113,6 +113,8 @@ pub(crate) fn monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use crate::platform::windows::verdict::{SIGKILL, classify_with_evidence};
     use crate::platform::windows::job::JobLimits;
     use crate::platform::windows::spawn::spawn_bare;
     use crate::platform::windows::stdio::{StdinSource, StdioSet};
@@ -200,5 +202,123 @@ mod tests {
         // After the monitor returned, nothing may still be alive.
         assert_eq!(job.alive_process_count().unwrap(), 0);
         set.finish().unwrap();
+    }
+
+    /// Compile a tiny native probe with rustc (same pattern as the S8
+    /// mitigation probes in spawn.rs).
+    fn compile_probe(dir: &Path, code: &str) -> PathBuf {
+        let src = dir.join("probe.rs");
+        let exe = dir.join("probe.exe");
+        std::fs::write(&src, code).unwrap();
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        let out = std::process::Command::new(rustc)
+            .args(["-O", "-C", "panic=abort"])
+            .arg("-o")
+            .arg(&exe)
+            .arg(&src)
+            .output()
+            .expect("spawn rustc");
+        assert!(out.status.success(), "rustc failed: {}", String::from_utf8_lossy(&out.stderr));
+        exe
+    }
+
+    #[test]
+    fn cpu_limit_kill_is_tle_evidence() {
+        // The job's PROCESS_TIME limit terminates the busy process; the
+        // verdict must come from the CPU evidence, not the exit code.
+        let cpu_limit = 500;
+        let job = Job::new(&JobLimits {
+            memory_limit_bytes: Some(512 * 1024 * 1024),
+            cpu_time_limit_ms: Some(cpu_limit),
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+        })
+        .unwrap();
+        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let args: Vec<String> = ["/c", "for /l %i in (1,1,20000000) do @rem"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
+        let outcome = monitor(&child, &job, None).unwrap();
+        set.finish().unwrap();
+        assert!(
+            outcome.cpu_time_ms > u64::from(cpu_limit),
+            "cpu {}ms over limit {cpu_limit}ms",
+            outcome.cpu_time_ms
+        );
+        let v = classify_with_evidence(
+            &outcome.kill_reason,
+            outcome.exit_code,
+            outcome.residual_processes,
+            Some(u64::from(cpu_limit)),
+            outcome.cpu_time_ms,
+            None,
+            0,
+        );
+        assert_eq!(v.status, "TLE");
+        assert_eq!(v.signal, SIGKILL);
+    }
+
+    #[test]
+    fn malloc_bomb_is_mle_evidence() {
+        // A program that commits memory until the job's commit cap blocks
+        // the next allocation ends abnormally; the peak pinned at the cap is
+        // the MLE evidence — the exit code must not downgrade it to RE.
+        let mem_limit = 32 * 1024 * 1024;
+        let job = Job::new(&JobLimits {
+            memory_limit_bytes: Some(mem_limit),
+            cpu_time_limit_ms: None,
+            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+        })
+        .unwrap();
+        let work = tempfile_dir("river-s9-mle");
+        let probe = compile_probe(
+            &work,
+            "fn main() { \
+                 let mut bufs: Vec<Vec<u8>> = Vec::new(); \
+                 loop { \
+                     let mut b = vec![1u8; 4 << 20]; \
+                     b[0] = 2; \
+                     bufs.push(b); \
+                 } \
+             }",
+        );
+        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let child = spawn_bare(&probe, &[], &job, &mut set, None, None).unwrap();
+        // Wall watchdog as a backstop: whichever comes first (heap abort or
+        // watchdog kill), the evidence must classify MLE.
+        let outcome = monitor(&child, &job, Some(std::time::Duration::from_secs(15))).unwrap();
+        set.finish().unwrap();
+        let peak = job.peak_process_memory_used().unwrap();
+        assert!(
+            peak + mem_limit as u64 / 8 >= mem_limit as u64,
+            "peak {peak} should pin at the {mem_limit}-byte commit cap"
+        );
+        let v = classify_with_evidence(
+            &outcome.kill_reason,
+            outcome.exit_code,
+            outcome.residual_processes,
+            None,
+            outcome.cpu_time_ms,
+            Some(mem_limit as u64),
+            peak,
+        );
+        assert_eq!(v.status, "MLE");
+        assert_eq!(v.signal, SIGKILL);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    /// Small unique temp dir for probe compilation.
+    fn tempfile_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{tag}-{}",
+            std::process::id() as u64
+                ^ std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 }
