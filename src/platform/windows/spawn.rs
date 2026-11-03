@@ -589,9 +589,6 @@ mod tests {
             fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
             fn GetProcAddress(m: *mut core::ffi::c_void, name: *const u8) -> *mut core::ffi::c_void;
             fn GetLastError() -> u32;
-            fn CreateEventA(attrs: *mut core::ffi::c_void, manual: i32, init: i32, name: *const u8) -> isize;
-            fn WaitForSingleObject(h: isize, ms: u32) -> u32;
-            fn CloseHandle(h: isize) -> i32;
         }
         if mode == "query" {
             // Kernel-applied mitigation state of THIS process (not the
@@ -623,17 +620,6 @@ mod tests {
         }
         let get_cursor_pos: extern "system" fn(*mut (i32, i32)) -> i32 =
             std::mem::transmute(GetProcAddress(u, b"GetCursorPos\0".as_ptr()));
-        let set_hook: extern "system" fn(
-            i32,
-            *mut core::ffi::c_void,
-            *mut core::ffi::c_void,
-            u32,
-        ) -> *mut core::ffi::c_void = std::mem::transmute(GetProcAddress(
-            u,
-            b"SetWindowsHookExW\0".as_ptr(),
-        ));
-        let unhook: extern "system" fn(*mut core::ffi::c_void) -> i32 =
-            std::mem::transmute(GetProcAddress(u, b"UnhookWindowsHookEx\0".as_ptr()));
         if mode == "win32k" {
             let mut p = (0i32, 0i32);
             if get_cursor_pos(&mut p) == 0 {
@@ -643,150 +629,33 @@ mod tests {
             println!("win32k-ok");
             std::process::exit(0);
         }
-        // Extension-point probe ("hookinject"): a GLOBAL WH_CBT hook backed
-        // by probe_hook.dll. The policy blocks injecting that DLL into other
-        // processes — the SetWindowsHookExW API still succeeds, so we verify
-        // behaviorally: spawn a fresh console window (fires HCBT_CREATEWND in
-        // that process); the DLL's DllMain signals a named event if it really
-        // got injected. Signaled = injection happened (policy NOT effective).
-        let evt = CreateEventA(std::ptr::null_mut(), 1, 0, b"river_s8_probe_evt\0".as_ptr());
-        SetLastError(0);
-        let lib = LoadLibraryA(b"probe_hook.dll\0".as_ptr());
-        if lib.is_null() {
-            println!("dll-load-denied");
-            std::process::exit(GetLastError() as i32);
-        }
-        let proc = GetProcAddress(lib, b"probe_hook_proc\0".as_ptr());
-        let h = set_hook(5, proc, lib, 0);
-        if h.is_null() {
-            println!("hook-denied");
-            std::process::exit(GetLastError() as i32);
-        }
-        // Trigger: a new console window fires the CBT hook in its process.
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn CreateProcessW(app: *const u16, cmd: *mut u16, pa: *mut core::ffi::c_void, ta: *mut core::ffi::c_void, inherit: i32, flags: u32, env: *mut core::ffi::c_void, cwd: *const u16, si: *mut core::ffi::c_void, pi: *mut core::ffi::c_void) -> i32;
-        }
-        let mut cmdline: Vec<u16> = "notepad\0".encode_utf16().collect();
-        let mut si = [0u8; 104]; // STARTUPINFOW, cb first
-        si[0..2].copy_from_slice(&104u16.to_le_bytes());
-        let mut pi = [0u8; 24]; // PROCESS_INFORMATION
-        let _ok = CreateProcessW(
-            std::ptr::null(), cmdline.as_mut_ptr(), std::ptr::null_mut(), std::ptr::null_mut(),
-            0, 0 /* notepad makes its own window */, std::ptr::null_mut(), std::ptr::null(),
-            si.as_mut_ptr() as *mut _, pi.as_mut_ptr() as *mut _,
-        );
-        let wait = WaitForSingleObject(evt, 3000);
-        // Kill the trigger window and release its handles.
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn TerminateProcess(h: isize, code: u32) -> i32;
-        }
-        let child_proc = usize::from_le_bytes(pi[0..8].try_into().unwrap()) as isize;
-        if child_proc != 0 {
-            TerminateProcess(child_proc, 1);
-            CloseHandle(child_proc);
-            CloseHandle(usize::from_le_bytes(pi[8..16].try_into().unwrap()) as isize);
-        }
-        if !h.is_null() {
-            unhook(h);
-        }
-        CloseHandle(evt);
-        if wait == 0 /* WAIT_OBJECT_0 */ {
-            println!("hook-injected");
-            std::process::exit(8);
-        }
-        println!("hook-not-injected");
-        std::process::exit(0);
+        // NOTE: the hookinject mode was removed on purpose. Its trigger was
+        // `CreateProcessW("notepad")` + hook-DLL injection detection, but
+        // (a) packaged Win11 notepad survives our TerminateProcess (the
+        // handle covers only the execution-alias stub), leaking GUI windows
+        // onto the user's desktop, and (b) the injection signal proved
+        // unreliable on Win11 even with no policy. The ext-point policy is
+        // verified via the "query" mode (kernel-applied state) instead.
+        println!("unknown mode: {mode}");
+        std::process::exit(2);
     }
-}
-
-// probe_hook.dll: the injected-module side of the global hook. DllMain
-// signals the event on PROCESS_ATTACH — proof the module was injected.
-#[no_mangle]
-pub extern "system" fn probe_hook_proc(code: i32, wparam: isize, lparam: isize) -> isize {
-    let _ = (code, wparam, lparam);
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn DllMain(_hinst: isize, reason: u32, _reserved: isize) -> i32 {
-    const DLL_PROCESS_ATTACH: u32 = 1;
-    if reason == DLL_PROCESS_ATTACH {
-        unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> isize;
-                fn SetEvent(h: isize) -> i32;
-            }
-            let h = OpenEventA(0x00100000, 0, b"river_s8_probe_evt\0".as_ptr());
-            if h != 0 {
-                SetEvent(h);
-            }
-        }
-    }
-    1
 }
 "#,
         )
         .unwrap();
-        // Compile once with rustc (which cargo put in our environment): the
-        // probe exe and the hook DLL it registers.
+        // Compile once with rustc (which cargo put in our environment).
         {
             let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
-            let hook_rs = work.path().join("probe_hook.rs");
-            let hook_dll = work.path().join("probe_hook.dll");
-            std::fs::write(
-                &hook_rs,
-                r#"#[no_mangle]
-pub extern "system" fn probe_hook_proc(code: i32, wparam: isize, lparam: isize) -> isize {
-    let _ = (code, wparam, lparam);
-    0
-}
-
-#[no_mangle]
-pub extern "system" fn DllMain(_hinst: isize, reason: u32, _reserved: isize) -> i32 {
-    const DLL_PROCESS_ATTACH: u32 = 1;
-    if reason == DLL_PROCESS_ATTACH {
-        unsafe {
-            #[link(name = "kernel32")]
-            extern "system" {
-                fn OpenEventA(access: u32, inherit: i32, name: *const u8) -> isize;
-                fn SetEvent(h: isize) -> i32;
-            }
-            let h = OpenEventA(0x00100000, 0, b"river_s8_probe_evt\0".as_ptr());
-            if h != 0 {
-                SetEvent(h);
-            }
-        }
-    }
-    1
-}
-"#,
-            )
-            .unwrap();
-            for extra in [
-                // (source, output, extra args)
-                (hook_rs.clone(), hook_dll, vec!["--crate-type=cdylib".to_string()]),
-                (
-                    probe_rs.clone(),
-                    probe_exe.clone(),
-                    vec!["-O".to_string(), "--edition=2021".to_string()],
-                ),
-            ] {
-                let (src, out, mut extra_args) = extra;
-                extra_args.push(format!("-o{}", out.display()));
-                extra_args.push(src.display().to_string());
+            {
                 let job = Job::new(&limits())?;
                 let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
-                let child = spawn_bare(
-                    Path::new(&rustc),
-                    &extra_args,
-                    &job,
-                    &mut set,
-                    Some(work.path()),
-                    None,
-                )?;
+                let args = [
+                    "-O".to_string(),
+                    "--edition=2021".to_string(),
+                    format!("-o{}", probe_exe.display()),
+                    probe_rs.display().to_string(),
+                ];
+                let child = spawn_bare(Path::new(&rustc), &args, &job, &mut set, Some(work.path()), None)?;
                 child.resume()?;
                 let code = child.wait_exit()?;
                 let (out, err) = set.finish()?;
