@@ -149,10 +149,20 @@ def test_copy_in_nested_paths_are_created(sandbox, python_exe):
 
 
 def test_cwd_is_inside_the_private_sandbox(sandbox, python_exe):
+    import os
+    import sys
+
     r = sandbox.run(python_exe, ["-c", "import os; print(os.getcwd())"])
     assert r.status == "AC"
-    # The cwd is the private per-run directory, never the host cwd.
-    assert b"river-" in r.stdout
+    # The cwd is the private per-run directory, never the host cwd. Its
+    # *name* is backend-specific: Windows names the temp dir `river-*`,
+    # Linux exposes it at the fixed sandbox path `/cwd`.
+    out = r.stdout.strip()
+    assert out != os.getcwd().encode()
+    if sys.platform.startswith("linux"):
+        assert out == b"/cwd", out
+    else:
+        assert b"river-" in out
 
 
 def test_env_is_merged_into_the_whitelist(sandbox, python_exe):

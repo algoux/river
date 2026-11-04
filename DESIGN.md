@@ -19,15 +19,20 @@ river 是一个沙箱库（Python 扩展，Rust 实现），用于在受限环�
 
 | 能力 | Linux | macOS | Windows |
 |---|---|---|---|
-| 状态 | 待更新 | 待更新 | ✅ 已实现 |
-| `rootfs` | chroot / pivot_root | sandbox-exec profile | ❌ 传入即 `ValueError` |
-| `runtimes` 实现 | 只读 bind mount | 只读 profile 扩展 | AppContainer + 只读 ACL |
-| 网络隔离 | namespace | profile | AppContainer 无 capability 即断网 |
-| 资源限制 | cgroup | — | Job Object |
+| 状态 | ✅ 已实现（L5，rootfs 待 L6） | 待更新 | ✅ 已实现 |
+| `rootfs` | 阶段 L6（现在传入即 `ValueError`） | sandbox-exec profile | ❌ 传入即 `ValueError` |
+| `runtimes` 实现 | 只读 bind mount（+ 系统目录只读） | 只读 profile 扩展 | AppContainer + 只读 ACL |
+| 网络隔离 | namespace（空 netns） | profile | AppContainer 无 capability 即断网 |
+| 资源限制 | cgroup v2（memory/pids） | — | Job Object |
 
 Windows 不支持 `rootfs`：Windows 进程永远从真实 `System32` 加载系统 DLL，
 "另一份操作系统"的语义不成立（除非容器/虚拟化，明确排除）。运行时环境
 （Python、JDK 等）通过 `runtimes` 授权直读 + `env` 注入 PATH 组合出来。
+
+Linux 的对应取舍：动态链接器/libc/shell 是任何程序启动的前提，因此
+`/usr /lib /lib64 /bin /sbin /etc` 始终以只读方式并入沙箱——这是
+"System32 永远可读"规则的 Linux 对应物；`runtimes` 在此基础上提供运行时
+目录。技术细节与踩坑记录见 [docs/linux-backend.md](docs/linux-backend.md)。
 
 ## 2. API 契约
 
@@ -87,6 +92,7 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 | `status` | `AC` / `TLE` / `MLE` / `OLE` / `RE` / `SE` |
 | `signal` | **合成值**：正常 0，沙箱强杀为 9（模仿 Linux 惯例便于移植） |
 | `exit_code` | 原始退出码；异常终止时为 NTSTATUS 值 |
+| `oom_killed` | 是否被内核 OOM killer 收割（Linux：`memory.events` `oom_kill>0`；Windows 恒为 false） |
 | `stdout` / `stderr` | 截断后的输出 |
 | `stdout_truncated` / `stderr_truncated` | 各通道独立的截断标志 |
 
@@ -146,15 +152,32 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 调用方按这些特性使用 API：
 
 - **内存语义**：Windows 的内存限制约束 commit 而非 RSS；惰性提交意味着
-  `malloc` 大块不写入不触发 MLE。
+  `malloc` 大块不写入不触发 MLE。Linux 约束 cgroup 的 RSS + page cache：
+  读大文件会抬高 `memory_used_kb`，而 `malloc` 不写不计入。
 - **计时抖动**：Windows 计时受调度/Defender/缺页影响大于 Linux，建议调用方
   放宽 5-10% 或取两次较优。实测稳定态抖动远低于该窗口，但宿主机偶发卡顿会
-  抬高单次样本——取两次较优更稳妥。
-- **并发**：`Sandbox` 可被多个 Python 线程并发 `run()`。
-- **signal**：始终为合成值。
+  抬高单次样本——取两次较优更稳妥。Linux 抖动较小，但仍建议留 5% 余量。
+- **并发**：`Sandbox` 可被多个 Python 线程并发 `run()`（两个平台都成立）。
+- **signal**：始终为合成值。`exit_code` 的平台差异：Windows 异常终止透传
+  NTSTATUS（如 `0xC0000005`）；Linux 信号终止为 `128 + signo`（OOM 杀为
+  137，段错误为 139）。`oom_killed` 是 Linux 专属的直接证据（Windows 恒为
+  false，其内存限额让分配失败而非触发 OOM killer）。
+- **linux 资源执行**：CPU 限额每 10ms 轮询 `cpu.stat` 并主动杀（超调上界
+  约 10ms，另有 `RLIMIT_CPU` 兜底）；内存限额同时写 `memory.swap.max=0`，
+  否则 swap 会让慢速分配器一直停在 cap 之下逃过 OOM（实测：有 swap 时在
+  64MB 限额下存活满 20s 墙钟，`swap.max=0` 后 1.6s 被 OOM 杀）；单文件写入
+  受 `RLIMIT_FSIZE`（64MB）约束。Linux 以 seccomp allowlist 默认拒绝
+  （`EPERM`）非白名单系统调用。
+- **linux root 权限**：Linux 后端需要以 root 运行（namespace/挂载/cgroup
+  写入均需要 `CAP_SYS_ADMIN`），这是评测部署的既定形态。
+- **linux 残余子孙**：主进程（pid ns 内 PID 1）退出时内核会杀死全部子孙，
+  因此"甩锅给子进程"在机制上不成立；残余检测仍保留（cgroup.procs 非空 →
+  `SE`）以覆盖内核与观测之间的竞态窗口。
 
 ## 6. 参考实现
 
 - DMOJ/wbox：Windows 沙箱评测的历史方案（临时低权用户 + 防火墙 + Job +
   DLL 注入），river 的 AppContainer 方案是其现代化替代
-- criyle/go-judge：Linux 参照系；其 REST 请求/响应字段与本 API 大体同构
+- criyle/go-judge：Linux 参照系；其 REST 请求/响应字段与本 API 大体同构，
+  river 的 Linux 后端同样采用 namespace + pivot_root + cgroup
+- Linux 后端机制与踩坑记录：[docs/linux-backend.md](docs/linux-backend.md)

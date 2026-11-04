@@ -97,7 +97,11 @@ def test_cwd_is_inside_the_sandbox(sandbox, python_exe):
     r = sandbox.run(python_exe, ["-c", "import os; print(os.getcwd())"])
     assert r.status == "AC"
     # The cwd is the private per-run directory, never the host cwd.
-    assert b"river-" in r.stdout
+    # (Backend-specific name: `river-*` on Windows, `/cwd` on Linux.)
+    if __import__("sys").platform.startswith("linux"):
+        assert r.stdout.strip() == b"/cwd"
+    else:
+        assert b"river-" in r.stdout
 
 
 def test_env_is_merged_into_the_whitelist(sandbox, python_exe):

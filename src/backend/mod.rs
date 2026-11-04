@@ -27,7 +27,11 @@ pub(crate) fn capabilities() -> Capabilities {
     {
         windows::capabilities()
     }
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::capabilities()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     {
         Capabilities {
             platform: "unsupported",
@@ -37,6 +41,36 @@ pub(crate) fn capabilities() -> Capabilities {
             default_max_processes: 0,
             internal_wall_limit_secs: 0,
         }
+    }
+}
+
+/// A value in a `river.doctor()` report.
+pub(crate) enum DoctorValue {
+    Bool(bool),
+    Str(String),
+    List(Vec<String>),
+}
+
+/// Environment facts / self-check for the compiled-in backend.
+pub(crate) fn doctor() -> Vec<(&'static str, DoctorValue)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::doctor()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::doctor()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    {
+        vec![
+            ("platform", DoctorValue::Str("unsupported".into())),
+            ("ok", DoctorValue::Bool(false)),
+            (
+                "errors",
+                DoctorValue::List(vec!["backend not implemented".into()]),
+            ),
+        ]
     }
 }
 

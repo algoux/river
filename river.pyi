@@ -4,7 +4,7 @@ import os
 from collections.abc import Buffer, Mapping, Sequence
 from typing import Literal, TypeAlias
 
-__all__ = ["Sandbox", "Status", "capabilities"]
+__all__ = ["Sandbox", "Status", "capabilities", "doctor"]
 
 _StrOrPath: TypeAlias = str | os.PathLike[str]
 _CopyInSource: TypeAlias = Buffer | _StrOrPath
@@ -31,6 +31,7 @@ class Status:
     status: _Verdict
     signal: int  # 0 normally, 9 when killed by the sandbox (TLE/MLE/OLE)
     exit_code: int  # raw exit code; NTSTATUS on abnormal Windows termination
+    oom_killed: bool  # Linux only: kernel OOM killer reaped a sandbox task
     stdout: bytes  # truncated to stdout_limit_kb
     stderr: bytes  # truncated to stderr_limit_kb
     stdout_truncated: bool
@@ -53,11 +54,19 @@ class Sandbox:
     disable) them per Sandbox. Check `river.capabilities()` for the
     platform capability matrix instead of probing with try/except.
 
-    Platform support: **Windows only** for now. On other platforms `run()`
-    raises `NotImplementedError` (the Linux/macOS backends are not
-    implemented yet). `rootfs` is not supported on Windows either (processes
-    always resolve system DLLs from the real `System32`) — use `runtimes`
-    there instead.
+    Platform support: **Windows and Linux** are implemented (macOS is not
+    yet). `rootfs` is not supported on Windows (processes always resolve
+    system DLLs from the real `System32`) nor yet on Linux (stage L6) — use
+    `runtimes` there instead.
+
+    Linux specifics: the process runs as `nobody` inside mount/pid/net/ipc/
+    uts/cgroup namespaces under a seccomp allowlist with `no_new_privs`;
+    network access is always denied (empty network namespace); `executable`
+    is a host path — if it is not already visible through `runtimes`/the
+    system dirs it is bind-mounted read-only at `/cwd/.river/<name>`.
+    Construction fails closed when cgroups v2, `memory.peak`,
+    `memory.swap.max` or seccomp are unavailable (see `doctor()`); the
+    backend must run as root.
     """
 
     def __init__(
@@ -106,5 +115,22 @@ def capabilities() -> _Capabilities:
     - `default_max_processes`: default live-process cap per run
     - `internal_wall_limit_secs`: safety wall-clock ceiling for
       caller-unlimited runs
+    """
+    ...
+
+
+def doctor() -> dict[str, object]:
+    """Deployment self-check (kernel / cgroup / seccomp / filesystem facts).
+
+    Returns a dict with at least:
+
+    - `platform`: `"windows" | "linux" | "macos"`
+    - `ok`: whether every required mechanism is available
+    - `errors`: list of blocking problems (empty when `ok`)
+
+    Linux also reports `kernel`, `cgroup_root`, `cgroups_v2`, `controllers`,
+    `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
+    `seccomp_actions` and `workdir_root`. `Sandbox(...)` runs the same
+    checks and fails closed when `ok` is false.
     """
     ...

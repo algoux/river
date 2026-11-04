@@ -31,6 +31,11 @@ pub(crate) enum KillOrigin {
     None,
     /// Wall clock limit exceeded; the sandbox terminated the process tree.
     WallTimeout,
+    /// CPU time limit exceeded (measured against the enforced limit while
+    /// the process was still running); the sandbox terminated the tree.
+    /// Linux-only in practice — Windows relies on the wall watchdog plus
+    /// the post-exit CPU evidence check.
+    CpuLimit,
     /// A stdout/stderr channel produced more than its kill threshold; the
     /// sandbox reaped the job mid-run.
     OutputLimit,
@@ -49,6 +54,10 @@ pub(crate) struct RunEvidence {
     pub exit_code: u32,
     /// Processes still alive in the sandbox after the main process exited.
     pub residual_processes: u32,
+    /// The kernel OOM killer reaped a task in the sandbox cgroup during this
+    /// run (`memory.events` `oom_kill` > 0). Linux-only signal; always false
+    /// on Windows.
+    pub oom_killed: bool,
     pub cpu_time_limit_ms: Option<u64>,
     pub cpu_time_used_ms: u64,
     pub memory_limit_bytes: Option<u64>,
@@ -130,21 +139,27 @@ pub(crate) fn classify(evidence: &RunEvidence) -> Verdict {
     if evidence.kill == KillOrigin::OutputLimit {
         return Verdict::Ole;
     }
-    // 3. Memory: an abnormal end with the peak pinned at the limit is the
-    //    allocation-bomb signature — report MLE, not the exit code or the
-    //    watchdog kill that reaped it.
+    // 3. Memory: an OOM kill is direct kernel evidence, and an abnormal end
+    //    with the peak pinned at the limit is the allocation-bomb signature —
+    //    report MLE, not the exit code or the watchdog kill that reaped it.
     if ended_abnormally(evidence)
-        && peak_hits_limit(evidence.peak_memory_bytes, evidence.memory_limit_bytes)
+        && (evidence.oom_killed
+            || peak_hits_limit(evidence.peak_memory_bytes, evidence.memory_limit_bytes))
     {
         return Verdict::Mle;
     }
-    // 4. Time: the watchdog kill, or the measured CPU past the limit
-    //    (covers both a backend time-limit kill and a fast program that
-    //    still burned more CPU than allowed before exiting).
+    // 4. Time: the watchdog kill, an explicit CPU-limit kill, or the
+    //    measured CPU past the limit (covers both a backend time-limit kill
+    //    and a fast program that still burned more CPU than allowed before
+    //    exiting).
     let cpu_over = evidence
         .cpu_time_limit_ms
         .is_some_and(|limit| evidence.cpu_time_used_ms > limit);
-    if evidence.kill == KillOrigin::WallTimeout || cpu_over {
+    if matches!(
+        evidence.kill,
+        KillOrigin::WallTimeout | KillOrigin::CpuLimit
+    ) || cpu_over
+    {
         return Verdict::Tle;
     }
     // 5. Plain exit-code mapping.
@@ -289,6 +304,28 @@ mod tests {
         let mut e = ev(KillOrigin::WallTimeout, 1);
         e.memory_limit_bytes = Some(limit);
         e.peak_memory_bytes = limit;
+        assert_eq!(classify_ev(e), Verdict::Mle);
+    }
+
+    #[test]
+    fn cpu_limit_kill_is_tle_with_signal_9() {
+        let mut e = ev(KillOrigin::CpuLimit, 137);
+        e.cpu_time_limit_ms = Some(500);
+        e.cpu_time_used_ms = 500;
+        let v = classify_ev(e);
+        assert_eq!(v, Verdict::Tle);
+        assert_eq!(v.synthesized_signal(), 9);
+    }
+
+    #[test]
+    fn oom_kill_evidence_is_mle_even_below_the_peak_slack() {
+        // The kernel OOM-killed a task: that is direct evidence, no need to
+        // infer it from the peak.
+        let limit = 64 * 1024 * 1024;
+        let mut e = ev(KillOrigin::WallTimeout, 137);
+        e.oom_killed = true;
+        e.memory_limit_bytes = Some(limit);
+        e.peak_memory_bytes = limit / 4;
         assert_eq!(classify_ev(e), Verdict::Mle);
     }
 

@@ -12,10 +12,27 @@ pub mod stdio;
 pub mod token;
 pub mod workdir;
 
-use crate::backend::Capabilities;
+use crate::backend::{Capabilities, DoctorValue};
 use crate::contract::SafetyCeilings;
 
 pub use sandbox::Sandbox;
+
+/// Environment facts. The doctor is primarily a Linux deployment tool; the
+/// Windows backend reports the basics so `river.doctor()` stays callable.
+pub(crate) fn doctor() -> Vec<(&'static str, DoctorValue)> {
+    vec![
+        ("platform", DoctorValue::Str("windows".into())),
+        ("ok", DoctorValue::Bool(true)),
+        ("errors", DoctorValue::List(Vec::new())),
+        (
+            "note",
+            DoctorValue::Str(
+                "doctor() reports Linux backend facts; the Windows backend is not instrumented"
+                    .into(),
+            ),
+        ),
+    ]
+}
 
 /// Capability matrix of the Windows backend.
 pub(crate) fn capabilities() -> Capabilities {

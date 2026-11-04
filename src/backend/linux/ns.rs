@@ -1,0 +1,827 @@
+//! Process spawning (stage L3): two-level fork with namespaces and mounts.
+//!
+//! ```text
+//! judger (python) --fork--> A (supervisor, still root)
+//!                            ├─ setsid            (own process group = kill domain)
+//!                            ├─ unshare(NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS)
+//!                            ├─ build tmpfs root + bind mounts, pivot_root
+//!                            ├─ report "ok" on the ready pipe
+//!                            └─ fork B, close ready pipe, wait4(B), _exit(code)
+//!                                B: PDEATHSIG, fresh /proc, uid drop to nobody,
+//!                                   chdir, execvpe
+//! ```
+//!
+//! Why two levels: `unshare(CLONE_NEWPID)` only affects **children**, so the
+//! process that gets PID 1 in the new namespace is B. A stays outside that
+//! namespace and reaps B, which lets the judger keep a single child (A) to
+//! monitor — its `wait4` rusage aggregates the whole tree (A's waited
+//! descendants included), and killing A kills the process group.
+//!
+//! Fork-safety rules (docs/linux-plan.md §2.2), enforced by construction:
+//! - every path/string the child side needs is built **before** the fork
+//!   (`MountPlan`, `CString`s, NULL-terminated pointer arrays);
+//! - A and B do only raw syscalls between fork and exec — no allocation, no
+//!   std I/O, no panics;
+//! - all stdio threads are started **after** the fork, in the judger only.
+//!
+//! The child-side functions are `unsafe fn` by design and call raw libc
+//! entry points directly; wrapping every call in a second `unsafe {}` would
+//! add noise without adding a safety boundary.
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use std::ffi::{CStr, CString};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
+
+use super::mount;
+use super::stdio::StdioSet;
+
+/// System directories always exposed read-only inside the sandbox: the
+/// dynamic loader, libc and a shell must be reachable for ordinary programs
+/// to start at all. This mirrors the Windows backend's "System32 is always
+/// readable" rule (DESIGN §4).
+const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
+
+/// Nobody uid/gid (Debian/Ubuntu convention; also the kernel's overflow
+/// uid). The sandboxed program runs unprivileged even though the judger is
+/// root.
+pub(crate) const NOBODY_UID: libc::uid_t = 65534;
+pub(crate) const NOBODY_GID: libc::gid_t = 65534;
+
+/// A spawned child whose exec has been confirmed by the ready protocol.
+pub(crate) struct Child {
+    /// Supervisor pid (= its session/process-group id after `setsid`).
+    pub(crate) pid: libc::pid_t,
+    /// Judger-death watchdog pid (see `watchdog_loop`).
+    watchdog: libc::pid_t,
+}
+
+impl Child {
+    /// Normal end of a run: stop the watchdog, then reap it.
+    pub(crate) fn disarm(mut self) {
+        if self.watchdog > 0 {
+            unsafe { libc::kill(self.watchdog, libc::SIGKILL) };
+            let mut status = 0;
+            unsafe { libc::waitpid(self.watchdog, &mut status, 0) };
+        }
+        // The supervisor itself was already reaped by the monitor; make the
+        // watchdog a no-op from here on.
+        self.watchdog = 0;
+    }
+}
+
+impl Drop for Child {
+    fn drop(&mut self) {
+        // Error path in the caller: same as disarm, but never block.
+        if self.watchdog > 0 {
+            unsafe { libc::kill(self.watchdog, libc::SIGKILL) };
+            let mut status = 0;
+            unsafe { libc::waitpid(self.watchdog, &mut status, libc::WNOHANG) };
+        }
+    }
+}
+
+/// Everything the child side needs, built by the parent before the fork.
+struct MountPlan {
+    root: CString,
+    oldroot: CString,
+    proc_dir: CString,
+    dev_dir: CString,
+    cwd_dir: CString,
+    workdir: CString,
+    /// (host source, absolute path inside the sandbox) read-only directory
+    /// binds.
+    binds: Vec<(CString, CString)>,
+    /// Read-only **file** binds: (host source, parent dir inside the sandbox,
+    /// target path inside the sandbox). Used to inject an executable that is
+    /// not already visible through a directory bind.
+    file_binds: Vec<(CString, CString, CString)>,
+    /// The path to `execve` (inside the sandbox): the caller's path when it
+    /// is already visible, else the injected `/cwd/.river/<name>`.
+    exec_path: CString,
+    /// Program cwd candidates, in sandbox coordinates: preferred, fallback.
+    cwd_preferred: CString,
+    cwd_fallback: CString,
+}
+
+impl MountPlan {
+    fn build(
+        workdir: &Path,
+        runtimes: &[PathBuf],
+        executable: &Path,
+        cwd_rel: Option<&str>,
+    ) -> io::Result<Self> {
+        let cstr = |p: &Path| {
+            CString::new(p.as_os_str().to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 sandbox path")
+            })?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in sandbox path"))
+        };
+        let root_path = workdir.join("root");
+        let root = cstr(&root_path)?;
+        let oldroot = cstr(&root_path.join(".oldroot"))?;
+        let proc_dir = cstr(&root_path.join("proc"))?;
+        let dev_dir = cstr(&root_path.join("dev"))?;
+        let cwd_dir = cstr(&root_path.join("cwd"))?;
+        let workdir_c = cstr(workdir)?;
+
+        // Binds: system dirs first, then caller runtimes, deduped by the
+        // sandbox path. A runtime that is a prefix of another is fine —
+        // the deeper mount lands on top.
+        let mut binds: Vec<(CString, CString)> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut push_bind = |src: &Path, abs: &str| -> io::Result<()> {
+            if seen.iter().any(|s| s == abs) {
+                return Ok(());
+            }
+            let src_c = cstr(src)?;
+            let dst = format!("{}{}", root.to_str().unwrap(), abs);
+            binds.push((src_c, CString::new(dst).unwrap()));
+            seen.push(abs.to_string());
+            Ok(())
+        };
+        for dir in SYSTEM_DIRS {
+            let p = Path::new(dir);
+            if p.exists() {
+                push_bind(p, dir)?;
+            }
+        }
+        // Run the caller runtimes last so they can shadow a system path if a
+        // deployment deliberately supplies its own tree at the same path.
+        for rt in runtimes {
+            let abs = rt.to_str().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 runtime path")
+            })?;
+            if !abs.starts_with('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("runtime path must be absolute: {abs}"),
+                ));
+            }
+            if abs == "/" {
+                // Binding the host root would erase the whole isolation
+                // model; refuse it instead of silently trusting the caller.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "runtime \"/\" is refused: it would expose the whole host",
+                ));
+            }
+            push_bind(rt, abs)?;
+        }
+
+        // Executable injection: the contract says `executable` is a host
+        // path. If that path is already visible through a directory bind it
+        // is exec'd as-is; otherwise it is bind-mounted (read-only) at
+        // `/cwd/.river/<name>` and executed from there.
+        if executable.is_absolute() && !executable.exists() {
+            return Err(io::Error::from_raw_os_error(libc::ENOENT));
+        }
+        let visible =
+            !executable.is_absolute() || seen.iter().any(|abs| executable.starts_with(abs));
+        let (file_binds, exec_path) = if visible {
+            (Vec::new(), cstr(executable)?)
+        } else {
+            let name = executable
+                .file_name()
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+            let sandbox = format!(
+                "/cwd/.river/{}",
+                name.to_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 executable name")
+                })?
+            );
+            let host_dst = format!("{}{}", root.to_str().unwrap(), sandbox);
+            let dir = format!("{}{}", root.to_str().unwrap(), "/cwd/.river");
+            (
+                vec![(
+                    cstr(executable)?,
+                    CString::new(dir).unwrap(),
+                    CString::new(host_dst).unwrap(),
+                )],
+                CString::new(sandbox).unwrap(),
+            )
+        };
+
+        let preferred = match cwd_rel {
+            Some(rel) => format!("/cwd/{}", rel.trim_start_matches('/')),
+            None => "/cwd".to_string(),
+        };
+        Ok(MountPlan {
+            root,
+            oldroot,
+            proc_dir,
+            dev_dir,
+            cwd_dir,
+            workdir: workdir_c,
+            binds,
+            file_binds,
+            exec_path,
+            cwd_preferred: CString::new(preferred).unwrap(),
+            cwd_fallback: CString::new("/cwd").unwrap(),
+        })
+    }
+}
+
+/// Fork the supervisor and wait for the child exec to be confirmed.
+///
+/// `env_vars` is the complete environment (whitelist base + caller
+/// overrides — no host environment leaks through).
+pub(crate) fn spawn(
+    executable: &Path,
+    args: &[String],
+    workdir: &Path,
+    runtimes: &[PathBuf],
+    cwd_rel: Option<&str>,
+    env_vars: &[(String, String)],
+    cgroup_procs: Option<&CStr>,
+    limits: ChildLimits,
+    seccomp: Option<&crate::backend::linux::seccomp::Program>,
+    stdio: &mut StdioSet,
+) -> io::Result<Child> {
+    let plan = MountPlan::build(workdir, runtimes, executable, cwd_rel)?;
+
+    // argv[0] is the path the program is actually exec'd from (the injected
+    // `/cwd/.river/<name>` when the host path was not visible).
+    let mut argv_c = Vec::with_capacity(args.len() + 1);
+    argv_c.push(plan.exec_path.clone());
+    for a in args {
+        argv_c.push(CString::new(a.as_str())?);
+    }
+    let envp_c: Vec<CString> = env_vars
+        .iter()
+        .map(|(k, v)| CString::new(format!("{k}={v}")))
+        .collect::<Result<_, _>>()?;
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv_c.iter().map(|s| s.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+    let mut envp_ptrs: Vec<*const libc::c_char> = envp_c.iter().map(|s| s.as_ptr()).collect();
+    envp_ptrs.push(std::ptr::null());
+
+    let (ready_read, ready_write) = ready_pipe()?;
+    let (child_in, child_out, child_err) = stdio.child_fds();
+
+    let fork_rc = unsafe { libc::fork() };
+    if fork_rc < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    if fork_rc == 0 {
+        // ---- supervisor: async-signal-safe code only --------------------
+        unsafe {
+            supervise(
+                &plan,
+                (child_in, child_out, child_err),
+                ready_write.as_raw_fd(),
+                &argv_ptrs,
+                &envp_ptrs,
+                cgroup_procs,
+                limits,
+                seccomp,
+            );
+        }
+        // supervise never returns.
+    }
+
+    // ---- parent: start the watchdog alongside the supervisor -----------
+    // The watchdog detects the judger's death by polling its own parent pid
+    // (no inherited pipe: with concurrent runs, a pipe write end would be
+    // duplicated into *other* runs' children, so its EOF would never
+    // arrive). On judger death it SIGKILLs the supervisor's process group.
+    let watchdog = unsafe { libc::fork() };
+    if watchdog < 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::kill(fork_rc, libc::SIGKILL);
+            let mut st = 0;
+            libc::waitpid(fork_rc, &mut st, 0);
+        }
+        return Err(err);
+    }
+    if watchdog == 0 {
+        unsafe { watchdog_loop(fork_rc) };
+    }
+
+    // ---- parent ---------------------------------------------------------
+    stdio.after_fork();
+    // Confirm setup + exec: "ok\n" = both succeeded; any other bytes are the
+    // failing errno (setup failure in A, or exec failure in B).
+    drop(ready_write);
+    let mut reader = unsafe { std::fs::File::from_raw_fd(ready_read.into_raw_fd()) };
+    let mut report = Vec::new();
+    reader.read_to_end(&mut report)?;
+    drop(reader);
+    if !report.starts_with(b"ok\n") || report.len() > 3 {
+        let code = if report.starts_with(b"ok\n") {
+            // "ok\n" + errno: the supervisor's setup worked, the program's
+            // own setup (proc mount / uid drop / chdir / exec) failed.
+            String::from_utf8_lossy(&report[3..]).trim().parse::<i32>()
+        } else {
+            String::from_utf8_lossy(&report).trim().parse::<i32>()
+        }
+        .unwrap_or(libc::EIO);
+        let mut status = 0;
+        unsafe { libc::waitpid(fork_rc, &mut status, 0) };
+        // Stop the watchdog; it would kill whatever the supervisor left.
+        unsafe { libc::kill(watchdog, libc::SIGKILL) };
+        unsafe { libc::waitpid(watchdog, &mut status, 0) };
+        return Err(io::Error::from_raw_os_error(code));
+    }
+
+    Ok(Child {
+        pid: fork_rc,
+        watchdog,
+    })
+}
+
+fn ready_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
+        OwnedFd::from_raw_fd(fds[1])
+    }))
+}
+
+/// Per-run resource limits applied by the child just before exec.
+#[derive(Clone, Copy)]
+pub(crate) struct ChildLimits {
+    /// `RLIMIT_FSIZE`: a single file the program writes cannot exceed this
+    /// (a 10GB write dies on `SIGXFSZ` instead of filling the host disk).
+    pub(crate) fsize_bytes: u64,
+    /// `RLIMIT_NOFILE`: open descriptors.
+    pub(crate) nofile: u64,
+    /// `RLIMIT_CPU` hard backstop (seconds); the judger's CPU polling is the
+    /// primary enforcement.
+    pub(crate) cpu_secs: Option<u64>,
+}
+
+/// Zero every capability set (permitted/effective/inheritable). `setuid`
+/// already clears them, but the program must not depend on that implicit
+/// behaviour (and bounding/ambient sets must not be inherited either).
+unsafe fn clear_capabilities() {
+    // Kernel uapi layout (`include/uapi/linux/capability.h`); libc does not
+    // export these on every version.
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut header = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3
+        pid: 0,
+    };
+    let zero = CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    };
+    let data = [zero, zero];
+    libc::syscall(
+        libc::SYS_capset,
+        &mut header as *mut CapHeader,
+        data.as_ptr(),
+    );
+}
+
+/// Set the rlimits that bound a single file write, descriptor count, core
+/// dump and CPU backstop. Best effort: a refused limit must not abort the
+/// run (the cgroup limits remain authoritative).
+unsafe fn apply_rlimits(limits: &ChildLimits) {
+    let set = |resource: libc::__rlimit_resource_t, cur: libc::rlim_t, max: libc::rlim_t| {
+        let rl = libc::rlimit {
+            rlim_cur: cur,
+            rlim_max: max,
+        };
+        libc::setrlimit(resource, &rl);
+    };
+    set(libc::RLIMIT_CORE, 0, 0);
+    set(libc::RLIMIT_NOFILE, limits.nofile, limits.nofile);
+    set(libc::RLIMIT_FSIZE, limits.fsize_bytes, limits.fsize_bytes);
+    if let Some(secs) = limits.cpu_secs {
+        set(libc::RLIMIT_CPU, secs, secs.saturating_add(1));
+    }
+}
+
+/// The supervisor half of spawn. **Never returns.**
+///
+/// # Fork safety
+/// Raw libc calls only: no allocation, no std I/O, no panic paths. All
+/// paths and pointer arrays are pre-built by the parent.
+unsafe fn supervise(
+    plan: &MountPlan,
+    stdio_fds: (libc::c_int, libc::c_int, libc::c_int),
+    ready_write: libc::c_int,
+    argv_ptrs: &[*const libc::c_char],
+    envp_ptrs: &[*const libc::c_char],
+    cgroup_procs: Option<&CStr>,
+    limits: ChildLimits,
+    seccomp: Option<&crate::backend::linux::seccomp::Program>,
+) -> ! {
+    // stdio onto 0/1/2, then keep the ready pipe on fd 3 and close
+    // **everything else**. `close_range` is what makes concurrent runs safe:
+    // an inherited foreign write end (another run's stdio pipe) would keep
+    // an EOF from ever arriving in the judger.
+    let (fd_in, fd_out, fd_err) = stdio_fds;
+    libc::dup2(fd_in, libc::STDIN_FILENO);
+    libc::dup2(fd_out, libc::STDOUT_FILENO);
+    libc::dup2(fd_err, libc::STDERR_FILENO);
+    if ready_write != 3 {
+        libc::dup2(ready_write, 3);
+    }
+    // The ready pipe must not leak into the program: CLOEXEC means the
+    // program's exec closes it (the success EOF the judger waits for).
+    libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC);
+    if libc::close_range(4, libc::c_uint::MAX, 0) != 0 {
+        // Kernel older than 5.9: no safe generic sweep available here.
+        fail(3, errno());
+    }
+
+    // Own session: the process group id becomes the kill domain the judger
+    // targets (kill(-pid) reaps A and B together). Also drops any
+    // controlling terminal.
+    if libc::setsid() < 0 {
+        fail(3, errno());
+    }
+    // Judger death => supervisor death (the chain then kills B too).
+    libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+
+    // ---- cgroup membership ---------------------------------------------
+    // Written by the supervisor itself (not the judger): membership must be
+    // in place *before* B is forked so the program inherits it, and doing it
+    // from the judger would race this fork.
+    if let Some(procs) = cgroup_procs {
+        let fd = libc::open(procs.as_ptr(), libc::O_WRONLY);
+        if fd < 0 {
+            fail(3, errno());
+        }
+        let mut buf = [0u8; 16];
+        let mut n = buf.len();
+        let mut v = libc::getpid() as u64;
+        loop {
+            n -= 1;
+            buf[n] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        let wrote = libc::write(fd, buf[n..].as_ptr().cast(), buf.len() - n);
+        libc::close(fd);
+        if wrote != (buf.len() - n) as isize {
+            fail(3, errno());
+        }
+    }
+
+    // ---- namespaces -----------------------------------------------------
+    let flags = libc::CLONE_NEWNS
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWCGROUP;
+    if libc::unshare(flags) != 0 {
+        fail(3, errno());
+    }
+    // UTS namespace starts as a copy of the host: give it a neutral name so
+    // the host name does not leak to the program.
+    if libc::sethostname(c"river".as_ptr(), 5) != 0 {
+        fail(3, errno());
+    }
+    // Make the whole mount tree private: nothing propagates to the host.
+    if libc::mount(
+        std::ptr::null(),
+        c"/".as_ptr(),
+        std::ptr::null(),
+        libc::MS_REC | libc::MS_PRIVATE,
+        std::ptr::null(),
+    ) != 0
+    {
+        fail(3, errno());
+    }
+
+    // ---- tmpfs root + layout -------------------------------------------
+    let err = mount::mkdir_p(&plan.root);
+    if err != 0 {
+        fail(3, err);
+    }
+    let err = mount::mount_tmpfs(&plan.root, c"mode=755", libc::MS_NOSUID | libc::MS_NODEV);
+    if err != 0 {
+        fail(3, err);
+    }
+    let err = mount::mkdir_p(&plan.cwd_dir);
+    if err != 0 {
+        fail(3, err);
+    }
+    if libc::mount(
+        plan.workdir.as_ptr(),
+        plan.cwd_dir.as_ptr(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        std::ptr::null(),
+    ) != 0
+    {
+        fail(3, errno());
+    }
+    if mount::mkdir_p(&plan.proc_dir) != 0 || mount::mkdir_p(&plan.dev_dir) != 0 {
+        fail(3, errno());
+    }
+    for (src, dst) in &plan.binds {
+        let err = mount::mkdir_p(dst);
+        if err != 0 {
+            fail(3, err);
+        }
+        let err = mount::bind_ro(src, dst);
+        if err != 0 {
+            fail(3, err);
+        }
+    }
+    // Executable injection: create the empty target file, then bind.
+    for (src, dir, dst) in &plan.file_binds {
+        let err = mount::mkdir_p(dir);
+        if err != 0 {
+            fail(3, err);
+        }
+        let err = mount::create_file(dst, 0o755);
+        if err != 0 {
+            fail(3, err);
+        }
+        let err = mount::bind_ro(src, dst);
+        if err != 0 {
+            fail(3, err);
+        }
+    }
+    // Minimal /dev: tmpfs + the character devices every libc program
+    // expects. `nosuid` only — `nodev` here would make the nodes unusable.
+    let err = mount::mount_tmpfs(&plan.dev_dir, c"mode=755,size=1m", libc::MS_NOSUID);
+    if err != 0 {
+        fail(3, err);
+    }
+    for (name, major, minor, mode) in mount::DEV_NODES {
+        let err = mount::make_device(&plan.dev_dir, name, *major, *minor, *mode);
+        if err != 0 {
+            fail(3, err);
+        }
+    }
+
+    // ---- pivot into the new root ---------------------------------------
+    if mount::mkdir_p(&plan.oldroot) != 0 {
+        fail(3, errno());
+    }
+    if libc::syscall(
+        libc::SYS_pivot_root,
+        plan.root.as_ptr(),
+        plan.oldroot.as_ptr(),
+    ) != 0
+    {
+        fail(3, errno());
+    }
+    if libc::chdir(c"/".as_ptr()) != 0 {
+        fail(3, errno());
+    }
+    libc::umount2(c"/.oldroot".as_ptr(), libc::MNT_DETACH);
+    libc::rmdir(c"/.oldroot".as_ptr());
+
+    // Setup complete: the parent may now trust the namespace.
+    if libc::write(3, b"ok\n".as_ptr().cast(), 3) != 3 {
+        libc::_exit(127);
+    }
+
+    // ---- fork the program (PID 1 of the new pid namespace) -------------
+    let pid = libc::fork();
+    if pid < 0 {
+        // Report through the pipe before the parent sees EOF.
+        fail(3, errno());
+    }
+    if pid == 0 {
+        // Child B: fresh /proc (mounted from inside its own pid ns), then
+        // drop privileges, fence the attack surface and exec.
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+        if libc::mount(
+            c"proc".as_ptr(),
+            c"/proc".as_ptr(),
+            c"proc".as_ptr(),
+            0,
+            std::ptr::null(),
+        ) != 0
+        {
+            fail(3, errno());
+        }
+        if libc::setgroups(0, std::ptr::null()) != 0
+            || libc::setgid(NOBODY_GID) != 0
+            || libc::setuid(NOBODY_UID) != 0
+        {
+            fail(3, errno());
+        }
+        // setuid resets dumpable; set it afterwards so /proc/self/mem and
+        // ptrace of the program require privilege again.
+        libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        // Privilege escalation fence: setuid/fcap binaries inside the
+        // (read-only) runtime trees must not gain privileges; and an
+        // unprivileged seccomp filter requires this bit.
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            fail(3, errno());
+        }
+        clear_capabilities();
+        apply_rlimits(&limits);
+        if let Some(prog) = seccomp {
+            if crate::backend::linux::seccomp::apply(prog) != 0 {
+                fail(3, errno());
+            }
+        }
+        if libc::chdir(plan.cwd_preferred.as_ptr()) != 0
+            && libc::chdir(plan.cwd_fallback.as_ptr()) != 0
+        {
+            fail(3, errno());
+        }
+        libc::execvpe(argv_ptrs[0], argv_ptrs.as_ptr(), envp_ptrs.as_ptr());
+        fail(3, errno());
+    }
+
+    // ---- supervisor: close the ready pipe (B holds the surviving copy),
+    //      reap B and mirror its exit code --------------------------------
+    libc::close(3);
+    let mut status: libc::c_int = 0;
+    let mut rusage: libc::rusage = std::mem::zeroed();
+    loop {
+        let rc = libc::wait4(pid, &mut status, 0, &mut rusage);
+        if rc == pid {
+            break;
+        }
+        if rc < 0 && errno() == libc::EINTR {
+            continue;
+        }
+        libc::_exit(125);
+    }
+    if libc::WIFEXITED(status) {
+        libc::_exit(libc::WEXITSTATUS(status));
+    }
+    if libc::WIFSIGNALED(status) {
+        libc::_exit(libc::WTERMSIG(status) + 128);
+    }
+    libc::_exit(125);
+}
+
+/// Report the failure errno through the ready pipe and exit.
+/// Allocation-free (itoa by hand onto the stack).
+unsafe fn fail(ready_write: libc::c_int, err: libc::c_int) -> ! {
+    let mut buf = [0u8; 16];
+    let mut n = buf.len();
+    let mut v = err;
+    loop {
+        n -= 1;
+        buf[n] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    let _ = libc::write(ready_write, buf[n..].as_ptr().cast(), buf.len() - n);
+    libc::_exit(127);
+}
+
+unsafe fn errno() -> libc::c_int {
+    *libc::__errno_location()
+}
+
+/// Judger-death watchdog: polls its own parent pid; when the judger dies the
+/// kernel reparents the watchdog (getppid() changes), which is the trigger to
+/// SIGKILL the supervisor's process group.
+///
+/// Why not PDEATHSIG for the program: the program is PID 1 of its own pid
+/// namespace, and a PDEATHSIG-delivered SIGKILL is **not** delivered to a
+/// namespace init (empirically verified on Linux 6.x — the process
+/// survives). An explicit `kill(-pgid)` from a process in an ancestor
+/// namespace *is* delivered, so the watchdog does that instead.
+///
+/// Why not a pipe held by the judger: with concurrent runs, every fork
+/// inherits the other runs' pipe write ends, so a pipe EOF would never
+/// arrive. Polling `getppid()` has no such inheritance problem.
+unsafe fn watchdog_loop(supervisor_pid: libc::pid_t) -> ! {
+    // Drop every inherited fd: the watchdog needs none, and keeping them
+    // would delay EOF for the run's own stdio pipes.
+    libc::close_range(3, libc::c_uint::MAX, 0);
+    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    let judger = libc::getppid();
+    let tick = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 20_000_000,
+    };
+    loop {
+        if libc::getppid() != judger {
+            libc::kill(-supervisor_pid, libc::SIGKILL);
+            libc::_exit(0);
+        }
+        libc::nanosleep(&tick, std::ptr::null_mut());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::linux::stdio::{StdinSource, StdioSet};
+
+    fn set() -> StdioSet {
+        StdioSet::new(StdinSource::Null, None, None, None, None).unwrap()
+    }
+
+    fn env() -> Vec<(String, String)> {
+        vec![(
+            "PATH".to_string(),
+            "/usr/local/bin:/usr/bin:/bin".to_string(),
+        )]
+    }
+
+    /// Exec failure (missing binary) surfaces as an io::Error with the
+    /// child's errno — not as a silent spawn (the ready protocol works).
+    #[test]
+    fn exec_failure_surfaces_as_error() {
+        let mut stdio = set();
+        let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        let err = spawn(
+            Path::new("/nonexistent/river-probe-xyz"),
+            &[],
+            workdir.path(),
+            &[],
+            None,
+            &env(),
+            None,
+            ChildLimits {
+                fsize_bytes: 64 << 20,
+                nofile: 1024,
+                cpu_secs: None,
+            },
+            None,
+            &mut stdio,
+        )
+        .err()
+        .expect("spawn of a missing binary must fail");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+    }
+
+    /// A spawned shell runs isolated and clean: exit 0, no output, reaped
+    /// without a kill origin.
+    #[test]
+    fn spawn_and_reap_a_clean_child() {
+        let mut stdio = set();
+        let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "exit 0".to_string()],
+            workdir.path(),
+            &[],
+            None,
+            &env(),
+            None,
+            ChildLimits {
+                fsize_bytes: 64 << 20,
+                nofile: 1024,
+                cpu_secs: None,
+            },
+            None,
+            &mut stdio,
+        )
+        .expect("spawn");
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(child.pid, &mut status, 0) };
+        assert_eq!(got, child.pid);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+    }
+
+    /// A nonzero exit propagates through the supervisor (the exit path).
+    #[test]
+    fn nonzero_exit_propagates() {
+        let mut stdio = set();
+        let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        let child = spawn(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "exit 3".to_string()],
+            workdir.path(),
+            &[],
+            None,
+            &env(),
+            None,
+            ChildLimits {
+                fsize_bytes: 64 << 20,
+                nofile: 1024,
+                cpu_secs: None,
+            },
+            None,
+            &mut stdio,
+        )
+        .expect("spawn");
+        let mut status = 0;
+        unsafe { libc::waitpid(child.pid, &mut status, 0) };
+        assert_eq!(libc::WEXITSTATUS(status), 3);
+    }
+}

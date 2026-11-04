@@ -10,6 +10,10 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = "0.30.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+seccompiler = "0.5"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",

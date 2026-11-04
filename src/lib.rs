@@ -41,10 +41,33 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     Ok(dict.unbind())
 }
 
+/// Kernel / cgroup / seccomp / filesystem facts for deployment diagnosis.
+///
+/// Returns a dict with `platform`, `ok`, `errors` (list of blocking
+/// problems), and platform-specific keys (Linux: `kernel`, `cgroup_root`,
+/// `cgroups_v2`, `controllers`, `memory_peak`, `memory_swap_max`,
+/// `cgroup_kill`, `seccomp`, `seccomp_actions`, `workdir_root`).
+///
+/// `Sandbox(...)` runs the same checks and fails closed when `ok` is false.
+#[pyfunction]
+fn doctor(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let dict = PyDict::new(py);
+    for (name, value) in backend::doctor() {
+        match value {
+            backend::DoctorValue::Bool(v) => dict.set_item(name, v)?,
+            backend::DoctorValue::Str(v) => dict.set_item(name, v)?,
+            backend::DoctorValue::List(v) => dict.set_item(name, v)?,
+        }
+    }
+    Ok(dict.unbind())
+}
+
 #[pymodule]
 mod river {
     #[pymodule_export]
     use super::capabilities;
+    #[pymodule_export]
+    use super::doctor;
 
     #[cfg(target_os = "linux")]
     #[pymodule_export]

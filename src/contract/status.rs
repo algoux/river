@@ -37,6 +37,10 @@ pub struct Status {
     pub status: String,
     pub signal: i32,
     pub exit_code: i32,
+    /// The kernel OOM killer reaped a task in the sandbox cgroup during the
+    /// run (`memory.events` `oom_kill` > 0). Linux-only; always false on
+    /// Windows (where the memory cap makes allocations fail instead).
+    pub oom_killed: bool,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
@@ -103,6 +107,13 @@ impl Status {
     #[getter]
     fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    /// Whether the kernel OOM killer reaped a sandbox task during the run.
+    /// Linux-only (`memory.events` `oom_kill` > 0); always false on Windows.
+    #[getter]
+    fn oom_killed(&self) -> bool {
+        self.oom_killed
     }
 
     /// Captured stdout, truncated to `stdout_limit_kb`.

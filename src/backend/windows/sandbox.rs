@@ -309,6 +309,9 @@ impl Sandbox {
                     kill: outcome.kill,
                     exit_code: outcome.exit_code,
                     residual_processes: outcome.residual_processes,
+                    // Windows memory caps make allocations fail (commit
+                    // semantics); there is no kernel OOM-kill counter.
+                    oom_killed: false,
                     cpu_time_limit_ms,
                     cpu_time_used_ms: outcome.cpu_time_ms,
                     memory_limit_bytes: Some(memory_limit_bytes),

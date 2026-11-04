@@ -19,12 +19,20 @@ Checklist mapping:
 """
 
 import os
+import sys
 
 import pytest
 
 import river
 
-pytestmark = pytest.mark.attack
+pytestmark = [
+    pytest.mark.attack,
+    pytest.mark.skipif(
+        not sys.platform.startswith("win"),
+        reason="Windows-specific attack probes (registry/win32k/AppContainer); "
+        "see tests/test_attack_linux.py for the Linux checklist",
+    ),
+]
 
 
 def _probe(sandbox, python_exe, code, *, args=None, **kwargs):
