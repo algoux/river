@@ -105,10 +105,16 @@ judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以
   `CLONE_NEWNS/NEWUSER/NEWPID/NEWNET/NEWIPC/NEWUTS/NEWCGROUP` 时放行；否则
   `clone(CLONE_NEWUSER)` 会拿到新 userns 里的 `CAP_SYS_ADMIN`，重新打开
   allowlist 刻意关闭的内核面（旧实现无条件放行，实测能进真实的新 userns）。
-  **`clone3` 仍放行**：glibc ≥2.34 的 `pthread_create` 用它且遇到 `EPERM` 不
-  回落（只有 `ENOSYS` 回落），而 seccompiler 只有过滤器级 errno。残余风险由
-  `doctor()` 的 `userns_allowed`/`warnings` 报告；部署侧可置
-  `kernel.unprivileged_userns_clone=0`。
+- **`clone3` 强制 `ENOSYS`（叠加预过滤器）**：seccomp 无法解引用
+  `clone3` 的 `struct clone_args` 指针，参数掩码不可用；而 glibc ≥2.34 的
+  `pthread_create` 遇到 `EPERM` 不回落（只有 `ENOSYS` 回落到 `clone`）。解法
+  是在 allowlist 之上再叠一个小过滤器，把 `clone3` 无条件判 `ENOSYS`——线程
+  创建照常（glibc 回落），`clone3(CLONE_NEWUSER)` 通道关闭。实测：修复前沙箱
+  内 `clone3(CLONE_NEWUSER)` 成功、子进程在新 userns 内 `CapEff` 全 1（宿主
+  的 AppArmor userns 限制也拦不住）；修复后返回 `ENOSYS(38)`。直接调用
+  `clone3` 且不回退的程序（罕见，如容器运行时）会得到 `ENOSYS`——已知代
+  价。`doctor()` 仍报告 `userns_allowed`/`apparmor_userns_restrict` 供部署
+  诊断（针对宿主上其他进程的 userns 创建，不是沙箱内的）。
 - `bpf`/`perf_event_open`/`userfaultfd`/`mknod*`/模块加载/`reboot`/`kexec*`/
   `swapon*`/`clock_settime`/`sethostname`
 

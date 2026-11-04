@@ -512,6 +512,64 @@ def test_user_namespace_creation_is_denied(sandbox, python_exe, tmp_path):
     assert "plain-ok" in out, out
 
 
+def test_clone3_user_namespace_is_denied(sandbox, tmp_path):
+    # The `clone` mask cannot cover `clone3` (seccomp cannot dereference the
+    # `struct clone_args` pointer), and clone3 used to be allowed
+    # unconditionally: clone3(CLONE_NEWUSER) created a real user namespace
+    # whose creator regained CAP_SYS_ADMIN over it (verified live, even with
+    # the host's AppArmor userns restriction on). The stacked prefilter now
+    # forces clone3 to ENOSYS — glibc's pthread_create falls back to `clone`
+    # on ENOSYS, so threads must keep working.
+    import shutil
+    import subprocess
+
+    if shutil.which("gcc") is None:
+        pytest.skip("gcc not installed: cannot build the clone3 probe")
+    src = tmp_path / "clone3_probe.c"
+    exe = tmp_path / "clone3_probe"
+    src.write_text(
+        "#define _GNU_SOURCE\n"
+        "#include <errno.h>\n"
+        "#include <sched.h>\n"
+        "#include <stdio.h>\n"
+        "#include <string.h>\n"
+        "#include <sys/syscall.h>\n"
+        "#include <sys/wait.h>\n"
+        "#include <unistd.h>\n"
+        "struct clone_args {\n"
+        "  unsigned long flags, pidfd, child_tid, parent_tid, exit_signal,\n"
+        "                stack, stack_size, tls, set_tid, set_tid_size, cgroup;\n"
+        "};\n"
+        "int main(void) {\n"
+        "  struct clone_args ca;\n"
+        "  memset(&ca, 0, sizeof(ca));\n"
+        "  ca.flags = CLONE_NEWUSER;\n"
+        "  ca.exit_signal = SIGCHLD;\n"
+        "  errno = 0;\n"
+        "  long r = syscall(SYS_clone3, &ca, sizeof(ca));\n"
+        "  if (r < 0) printf(\"clone3-denied errno=%d\\n\", errno);\n"
+        "  else if (r == 0) { printf(\"clone3-CHILD-IN-USERNS\\n\"); _exit(0); }\n"
+        "  else { int st; waitpid(r, &st, 0); printf(\"clone3-ALLOWED\\n\"); }\n"
+        "  // glibc thread creation must still work (ENOSYS fallback to clone).\n"
+        "  pid_t t = syscall(SYS_clone, SIGCHLD, 0, 0, 0);\n"
+        "  if (t < 0) printf(\"thread-denied errno=%d\\n\", errno);\n"
+        "  else if (t == 0) _exit(0);\n"
+        "  else { int st; waitpid(t, &st, 0); printf(\"thread-ok\\n\"); }\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    build = subprocess.run(
+        ["gcc", "-O0", "-o", str(exe), str(src)], capture_output=True, text=True
+    )
+    assert build.returncode == 0, build.stderr
+    r = sandbox.run(str(exe), [], time_limit_ms=10000)
+    out = r.stdout.decode()
+    assert r.status == "AC", r.stderr[:400]
+    assert "clone3-denied" in out and "errno=38" in out, out
+    assert "clone3-CHILD" not in out and "clone3-ALLOWED" not in out, out
+    assert "thread-ok" in out, out
+
+
 def test_seccomp_denies_keyctl_and_io_uring(sandbox, python_exe):
     # Raw syscalls that namespaces do not isolate must fail with EPERM.
     code = (

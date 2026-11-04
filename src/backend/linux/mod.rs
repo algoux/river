@@ -27,6 +27,9 @@ pub(crate) fn capabilities() -> Capabilities {
         rootfs: true,
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
+        // No fixed ceiling: each run gets its own cgroup; the practical
+        // limit is host capacity.
+        max_concurrent_runs: u32::MAX,
     }
 }
 
@@ -40,7 +43,7 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
     let seccomp_actions = std::fs::read_to_string("/proc/sys/kernel/seccomp/actions_avail")
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let seccomp_ok = seccomp::program().is_ok() && !seccomp_actions.is_empty();
+    let seccomp_ok = seccomp::filters().is_ok() && !seccomp_actions.is_empty();
 
     // The cgroup probe runs inside the `river` subtree: controller files
     // like `memory.peak` are absent at the systemd root even when the kernel
@@ -60,14 +63,16 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // User namespaces: `clone` is filtered (no CLONE_NEW* flags), but
-    // `clone3` cannot be argument-inspected without breaking glibc's
-    // pthread_create (EPERM is not an ENOSYS fallback). Warn unless the
-    // host explicitly disables unprivileged creation. The AppArmor sysctl is
-    // reported as a fact but is *not* treated as a guarantee: on Ubuntu
-    // 24.04 with apparmor_restrict_unprivileged_userns=1 the sandboxed
-    // process still created a userns (verified), so only the kernel knob
-    // being 0 is trusted.
+    // User namespaces: both `clone` (argument mask) and `clone3` (forced to
+    // ENOSYS by the stacked prefilter) are closed inside the sandbox, so no
+    // warning is owed for the sandbox itself. The facts below are kept for
+    // deployment diagnosis: unprivileged userns creation *by other host
+    // processes* is still possible when the kernel knob allows it, and the
+    // AppArmor sysctl is reported as a fact but is *not* treated as a
+    // guarantee (on Ubuntu 24.04 with
+    // apparmor_restrict_unprivileged_userns=1 the sandboxed process still
+    // created a userns through clone3 before the prefilter existed —
+    // verified).
     let userns_sysctl = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
         .ok()
         .map(|s| s.trim() == "1");
@@ -76,14 +81,7 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
             .ok()
             .map(|s| s.trim() == "1");
     let userns_allowed = userns_sysctl != Some(false);
-    let mut warnings = Vec::new();
-    if userns_allowed {
-        warnings.push(
-            "clone3 can still create an unprivileged user namespace (glibc pthread_create \
-             needs clone3); set kernel.unprivileged_userns_clone=0 if this matters"
-                .to_string(),
-        );
-    }
+    let warnings = Vec::new();
 
     let mut out: Vec<(&'static str, DoctorValue)> = vec![
         ("platform", DoctorValue::Str("linux".into())),

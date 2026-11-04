@@ -289,9 +289,9 @@ impl Sandbox {
         let runtimes = self.runtimes.clone();
         let rootfs = self.rootfs.clone();
 
-        // Compile (once per process) the seccomp allowlist; a failure must
-        // not silently disable the filter.
-        let seccomp = match seccomp::program() {
+        // Compile (once per process) the seccomp filter set (allowlist +
+        // clone3 prefilter); a failure must not silently disable it.
+        let seccomp = match seccomp::filters() {
             Ok(program) => Some(program),
             Err(e) => return Ok(Status::infra_se(e)),
         };

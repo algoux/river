@@ -497,7 +497,7 @@ pub(crate) fn spawn(
     env_vars: &[(String, String)],
     cgroup_procs: Option<&CStr>,
     limits: ChildLimits,
-    seccomp: Option<&crate::backend::linux::seccomp::Program>,
+    seccomp: Option<&crate::backend::linux::seccomp::Filters>,
     stdio: &mut StdioSet,
 ) -> io::Result<Child> {
     let (plan, loop_guard) = MountPlan::build(workdir, rootfs, runtimes, executable, cwd_rel)?;
@@ -701,7 +701,7 @@ unsafe fn supervise(
     envp_ptrs: &[*const libc::c_char],
     cgroup_procs: Option<&CStr>,
     limits: ChildLimits,
-    seccomp: Option<&crate::backend::linux::seccomp::Program>,
+    seccomp: Option<&crate::backend::linux::seccomp::Filters>,
 ) -> ! {
     // stdio onto 0/1/2, then keep the ready pipe on fd 3 and close
     // **everything else**. `close_range` is what makes concurrent runs safe:

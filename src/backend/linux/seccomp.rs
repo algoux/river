@@ -3,9 +3,21 @@
 //! The sandboxed program runs under a **default-deny** filter whose mismatch
 //! action is `EPERM` (not `KILL`): ordinary programs keep running, denied
 //! operations fail with a normal errno. The allowlist is compiled once per
-//! judger process ([`program`]) and applied by the child just before
-//! `execve`; the compiled BPF program is passed across the fork, so the
+//! judger process ([`filters`]) and applied by the child just before
+//! `execve`; the compiled BPF programs are passed across the fork, so the
 //! child itself never allocates.
+//!
+//! **`clone3` prefilter**: seccomp cannot dereference the `struct clone_args`
+//! pointer `clone3` receives, so its `CLONE_NEW*` flags cannot be masked the
+//! way `clone`'s are — and an unconditional allow lets
+//! `clone3(CLONE_NEWUSER)` create a user namespace whose creator regains
+//! `CAP_SYS_ADMIN` over it (verified live: `CapEff` all-ones inside the ns,
+//! and the host's AppArmor userns restriction did not stop it). A tiny
+//! second filter is therefore stacked **on top of** the allowlist that makes
+//! `clone3` fail with `ENOSYS` unconditionally: glibc's `pthread_create`
+//! falls back to `clone` on `ENOSYS` (but not on `EPERM`), so ordinary
+//! threads keep working while the namespace-creation route closes. Programs
+//! calling `clone3` directly (rare; container runtimes) get `ENOSYS`.
 //!
 //! What the allowlist closes on top of namespaces (the
 //! "not isolated by namespaces" set):
@@ -30,15 +42,24 @@ use std::collections::BTreeMap;
 /// Compiled filter for the current process's architecture.
 pub(crate) type Program = seccompiler::BpfProgram;
 
-/// Compile the allowlist once per process (the filter is immutable and
-/// applies to the whole process tree, so one program is reused by every run).
-pub(crate) fn program() -> Result<&'static Program, String> {
-    static PROGRAM: std::sync::OnceLock<Result<Program, String>> = std::sync::OnceLock::new();
-    PROGRAM.get_or_init(build).as_ref().map_err(|e| e.clone())
+/// The stacked filter set applied to every sandboxed program: the big
+/// default-deny allowlist plus the `clone3`→`ENOSYS` prefilter.
+pub(crate) struct Filters {
+    /// Default-deny allowlist (`EPERM` on mismatch).
+    pub(crate) allowlist: Program,
+    /// Forces `clone3` to `ENOSYS` (see the module docs).
+    pub(crate) clone3_prefilter: Program,
+}
+
+/// Compile the filter set once per process (the filters are immutable and
+/// apply to the whole process tree, so one set is reused by every run).
+pub(crate) fn filters() -> Result<&'static Filters, String> {
+    static FILTERS: std::sync::OnceLock<Result<Filters, String>> = std::sync::OnceLock::new();
+    FILTERS.get_or_init(build).as_ref().map_err(|e| e.clone())
 }
 
 #[cfg(target_arch = "x86_64")]
-fn build() -> Result<Program, String> {
+fn build() -> Result<Filters, String> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
         SeccompRule, TargetArch,
@@ -62,11 +83,11 @@ fn build() -> Result<Program, String> {
     // closed (`unshare` is denied outright, but clone was allowed
     // unconditionally — verified: the child landed in a distinct userns).
     //
-    // `clone3` is intentionally still allowed: glibc >= 2.34 uses it for
-    // pthread_create and does **not** fall back when it returns EPERM (only
-    // ENOSYS), and seccompiler has a single filter-wide errno. That leaves
-    // the clone3 userns path open; `doctor()` reports it as a warning and
-    // deployments can disable unprivileged user namespaces host-side.
+    // `clone3` cannot be masked this way (seccomp cannot dereference the
+    // `struct clone_args` pointer), so it is forced to `ENOSYS` by the
+    // stacked prefilter instead — see the module docs. glibc >= 2.34 uses
+    // clone3 for pthread_create but falls back to `clone` on ENOSYS, so
+    // threads keep working.
     let namespace_flags = (libc::CLONE_NEWNS
         | libc::CLONE_NEWUSER
         | libc::CLONE_NEWPID
@@ -92,25 +113,56 @@ fn build() -> Result<Program, String> {
         TargetArch::x86_64,
     )
     .map_err(|e| format!("seccomp filter: {e:?}"))?;
-    let program: Program = filter
+    let allowlist: Program = filter
         .try_into()
         .map_err(|e| format!("seccomp compile: {e:?}"))?;
-    Ok(program)
+
+    // The clone3 prefilter: `clone3` → ENOSYS, everything else allowed.
+    // Stacked filters execute most-recent-first and a syscall only proceeds
+    // when *every* filter allows it, so installing this after the allowlist
+    // makes clone3 fail with ENOSYS no matter what the allowlist says.
+    let mut deny_clone3: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    deny_clone3.insert(
+        libc::SYS_clone3 as i64,
+        vec![SeccompRule::new(vec![always]).map_err(|e| format!("seccomp rule: {e:?}"))?],
+    );
+    let pre = SeccompFilter::new(
+        deny_clone3,
+        // not in the map → allow (the allowlist still gets its say)
+        SeccompAction::Allow,
+        // matched (clone3) → ENOSYS: glibc pthread_create falls back to clone
+        SeccompAction::Errno(libc::ENOSYS as u32),
+        TargetArch::x86_64,
+    )
+    .map_err(|e| format!("seccomp prefilter: {e:?}"))?;
+    let clone3_prefilter: Program = pre
+        .try_into()
+        .map_err(|e| format!("seccomp prefilter compile: {e:?}"))?;
+
+    Ok(Filters {
+        allowlist,
+        clone3_prefilter,
+    })
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn build() -> Result<Program, String> {
+fn build() -> Result<Filters, String> {
     // Fail closed: an unimplemented allowlist must not silently mean "no
     // seccomp". The backend rejects construction instead.
     Err("river: the seccomp allowlist is implemented for x86_64 only".to_string())
 }
 
-/// Apply a compiled filter to the calling process (and its future children).
+/// Apply the compiled filter set to the calling process (and its future
+/// children). The `clone3` prefilter is installed *after* the allowlist so
+/// it runs first (filters execute most-recent-first; a syscall only
+/// proceeds when every filter allows it).
 ///
 /// Returns 0 on success, -1 on failure (errno set) — called between fork and
 /// exec, so no allocation, no formatting.
-pub(crate) fn apply(program: &Program) -> libc::c_int {
-    match seccompiler::apply_filter(program) {
+pub(crate) fn apply(filters: &Filters) -> libc::c_int {
+    match seccompiler::apply_filter(&filters.allowlist)
+        .and_then(|_| seccompiler::apply_filter(&filters.clone3_prefilter))
+    {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -123,10 +175,10 @@ pub(crate) fn apply(program: &Program) -> libc::c_int {
 #[cfg(target_arch = "x86_64")]
 const ALLOW: &[libc::c_long] = &[
     // --- process / signals ------------------------------------------------
-    // NOTE: `clone` is not in this list; it is added with an argument
-    // condition in `build()` (no CLONE_NEW* flags). `clone3` stays here —
-    // see the rationale in `build()`.
-    libc::SYS_clone3,
+    // NOTE: neither `clone` nor `clone3` is in this list: `clone` is added
+    // with an argument condition in `build()` (no CLONE_NEW* flags), and
+    // `clone3` is forced to ENOSYS by the stacked prefilter (see the module
+    // docs for the glibc fallback rationale).
     libc::SYS_fork,
     libc::SYS_vfork,
     libc::SYS_execve,
@@ -381,12 +433,15 @@ const ALLOW: &[libc::c_long] = &[
 mod tests {
     use super::*;
 
-    /// The filter compiles for the running architecture (removing a needed
+    /// Both filters compile for the running architecture (removing a needed
     /// rule would make the Python smoke test die with SIGSYS instead).
     #[test]
-    fn filter_compiles() {
-        match program() {
-            Ok(program) => assert!(!program.is_empty(), "empty BPF program"),
+    fn filters_compile() {
+        match filters() {
+            Ok(f) => {
+                assert!(!f.allowlist.is_empty(), "empty BPF program");
+                assert!(!f.clone3_prefilter.is_empty(), "empty prefilter");
+            }
             Err(e) => {
                 // Non-x86_64 targets fail closed by design.
                 assert!(!cfg!(target_arch = "x86_64"), "{e}");
