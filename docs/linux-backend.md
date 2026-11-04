@@ -57,9 +57,13 @@ mount -o remount,ro,nosuid,nodev <root>     # 冻结 rootfs 视图
 **系统目录为什么总是只读并入**：动态链接器、libc、shell 是任何二进制启动的
 前提。这是 Windows 后端"System32 永远可读"规则的 Linux 对应物（DESIGN §4）。
 
-**copy_in 只读**：文件 root 属主 + mode 0444；程序以 nobody(65534) 运行。
-目录（cwd 树）递归 chown 给 nobody，否则程序连文件都建不了。`copy_in` 值
-为宿主机目录时递归投放（常规文件与子目录；符号链接跳过）。
+**copy_in 只读（内容不可改）**：文件 root 属主 + mode 0444，程序以 nobody(65534)
+运行。只有 **workdir 根与 `tmp/`** chown 给 nobody（否则程序连文件都建不了）；
+`copy_in` 目录保持 root 属主 0755——可读、可进入、不可写。属主才能 `chmod`，
+因此程序既不能改写输入也不能清掉写保护（旧实现把整棵树 chown 给 nobody，属主
+chmod 后即可改写，已修）。程序仍拥有 cwd 根，所以可以删除/重命名自己 cwd 里的
+条目：内容不变、无外泄，语义上接受。`copy_in` 值为宿主机目录时递归投放（常规
+文件与子目录；符号链接跳过）。
 
 **copy_out 回收**：运行结束（monitor 返回后、workdir Drop 前）由 root
 judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以植入指向宿主任意

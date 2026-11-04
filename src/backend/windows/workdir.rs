@@ -44,6 +44,13 @@ pub(crate) struct WorkDir {
     path: PathBuf,
 }
 
+/// One top-level `copy_in` entry. `is_dir` selects an inheritable ACL (one
+/// DACL write protects the whole tree) over a per-file one.
+pub(crate) struct Provisioned {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
 impl WorkDir {
     /// Create a fresh working directory under the system temp dir.
     pub(crate) fn create() -> io::Result<Self> {
@@ -62,12 +69,24 @@ impl WorkDir {
     /// - host paths are **copied** (never moved: a move would carry the
     ///   source ACL along, while a copy inherits the destination's);
     ///   a host *directory* is provisioned recursively;
-    /// - the copies are marked read-only, so the program cannot modify its
-    ///   own input (see DESIGN.md §3.3).
+    /// - the copies receive a protected, read-only DACL from the caller
+    ///   (`sandbox.rs`), so the program cannot modify its own input (see
+    ///   DESIGN.md §3.3). No `FILE_ATTRIBUTE_READONLY` is set: the attribute
+    ///   is bypassable with `chmod`, and a read-only file also blocks the
+    ///   judger's own workdir cleanup (it cannot be deleted without clearing
+    ///   the attribute first, which the protected ACL forbids).
     ///
     /// Symlinks / junctions inside a directory source are skipped (a
     /// trusted-source convenience must never become a link farm).
-    pub(crate) fn provision(&self, files: &HashMap<String, CopyInSource>) -> io::Result<()> {
+    ///
+    /// Returns one entry per top-level key. A directory entry is protected
+    /// with an **inheritable** read-only ACE (its whole tree inherits it in
+    /// one DACL write); a file entry is protected individually.
+    pub(crate) fn provision(
+        &self,
+        files: &HashMap<String, CopyInSource>,
+    ) -> io::Result<Vec<Provisioned>> {
+        let mut created = Vec::new();
         for (rel, source) in files {
             let target = self.path.join(rel);
             match source {
@@ -76,23 +95,33 @@ impl WorkDir {
                         fs::create_dir_all(parent)?;
                     }
                     fs::write(&target, bytes)?;
-                    mark_read_only(&target)?;
+                    created.push(Provisioned {
+                        path: target,
+                        is_dir: false,
+                    });
                 }
                 CopyInSource::Path(src) => {
                     let md = fs::metadata(src)?;
                     if md.is_dir() {
                         provision_dir(src, &target)?;
+                        created.push(Provisioned {
+                            path: target,
+                            is_dir: true,
+                        });
                     } else {
                         if let Some(parent) = target.parent() {
                             fs::create_dir_all(parent)?;
                         }
                         fs::copy(src, &target)?;
-                        mark_read_only(&target)?;
+                        created.push(Provisioned {
+                            path: target,
+                            is_dir: false,
+                        });
                     }
                 }
             }
         }
-        Ok(())
+        Ok(created)
     }
 
     /// Collect `copy_out` products from the working directory into their
@@ -181,7 +210,6 @@ fn provision_dir(src: &Path, dst: &Path) -> io::Result<()> {
             provision_dir(&entry.path(), &target)?;
         } else {
             fs::copy(entry.path(), &target)?;
-            mark_read_only(&target)?;
         }
     }
     Ok(())
@@ -303,13 +331,6 @@ fn pid_is_alive(pid: u32) -> bool {
     // SAFETY: handle valid.
     unsafe { CloseHandle(handle) };
     state == WAIT_TIMEOUT // still running
-}
-
-/// Mark a file read-only for the sandboxed program.
-fn mark_read_only(path: &Path) -> io::Result<()> {
-    let mut attrs = get_attributes(path)?;
-    attrs |= windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY;
-    set_attributes(path, attrs)
 }
 
 fn get_attributes(path: &Path) -> io::Result<u32> {
@@ -513,19 +534,19 @@ mod tests {
             "nested/host.txt".to_string(),
             CopyInSource::Path(host.clone()),
         );
-        dir.provision(&files).unwrap();
+        let provisioned = dir.provision(&files).unwrap();
+        assert_eq!(provisioned.len(), 2);
+        assert!(provisioned.iter().all(|entry| !entry.is_dir));
 
         assert_eq!(fs::read(dir.path().join("inline.txt")).unwrap(), b"inline");
         assert_eq!(
             fs::read(dir.path().join("nested/host.txt")).unwrap(),
             b"from-host"
         );
-        // Provisioned files are marked read-only for the program.
-        let attrs = get_attributes(&dir.path().join("inline.txt")).unwrap();
-        assert_eq!(
-            attrs & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY,
-            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_READONLY
-        );
+        // Immutability is enforced by the protected read-only DACL that
+        // `sandbox.rs` applies (a READONLY attribute is bypassable with
+        // chmod and would block the judger's own cleanup); the Python suite
+        // asserts the effective deny.
         fs::remove_file(&host).ok();
     }
 
@@ -713,3 +734,4 @@ mod tests {
         fs::remove_dir_all(&victim).ok();
     }
 }
+

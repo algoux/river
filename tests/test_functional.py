@@ -66,21 +66,84 @@ def test_copy_in_host_file_is_copied(sandbox, python_exe, tmp_path):
     assert r.stdout == b"from-host"
 
 
-def test_copy_in_is_read_only_for_the_program(sandbox, python_exe):
+def test_copy_in_is_immutable_for_the_program(sandbox, python_exe):
     # The program may read its input but must not modify it (DESIGN §3.3).
+    # Clearing the read-only bit first is the regression: on Windows the
+    # FILE_ATTRIBUTE_READONLY was clearable because the inherited cwd ACE
+    # grants FILE_WRITE_ATTRIBUTES; on Linux the file used to be chowned to
+    # the sandbox uid, so its owner could chmod it back to writable.
+    code = (
+        "import os, sys\n"
+        "p = sys.argv[1]\n"
+        "print('CONTENT', open(p).read())\n"
+        "try:\n"
+        "    os.chmod(p, 0o666)\n"
+        "    print('CHMOD_OK')\n"
+        "except OSError:\n"
+        "    print('CHMOD_DENIED')\n"
+        "try:\n"
+        "    open(p, 'w').write('changed')\n"
+        "    print('WRITE_OK')\n"
+        "except OSError:\n"
+        "    print('WRITE_DENIED')\n"
+        "print('FINAL', open(p).read())\n"
+    )
     r = sandbox.run(
         python_exe,
-        ["-c", ("import sys\n"
-                "try:\n"
-                "    open(sys.argv[1], 'w').write('x')\n"
-                "    print('MUTABLE')\n"
-                "except OSError:\n"
-                "    print('READONLY')\n"),
-         "in.txt"],
+        ["-c", code, "in.txt"],
         copy_in={"in.txt": b"immutable"},
     )
-    assert r.status == "AC"
-    assert r.stdout.strip() == b"READONLY"
+    assert r.status == "AC", r.stderr
+    out = r.stdout.decode()
+    assert "CHMOD_DENIED" in out, out
+    assert "WRITE_DENIED" in out, out
+    assert "FINAL immutable" in out, out
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
+    reason="Windows directory copy_in uses an inheritable protected DACL",
+)
+def test_directory_copy_in_is_immutable_and_cleaned_up(sandbox, python_exe, tmp_path):
+    """A directory `copy_in` is protected as a tree and still cleaned up.
+
+    The protected ACL is inheritable (one DACL write for the whole tree), and
+    it keeps `FILE_DELETE_CHILD` for the judger so cleanup can remove the
+    entries — a regression here leaks one workdir per run.
+    """
+    import glob
+    import tempfile
+
+    src = tmp_path / "inputdir"
+    (src / "sub").mkdir(parents=True)
+    (src / "sub" / "data.txt").write_bytes(b"immutable")
+
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "river-*")))
+    code = (
+        "import os, sys\n"
+        "p = sys.argv[1]\n"
+        "print('CONTENT', open(p).read())\n"
+        "try:\n"
+        "    os.chmod(p, 0o666)\n"
+        "    open(p, 'w').write('changed')\n"
+        "    print('MUTABLE')\n"
+        "except OSError:\n"
+        "    print('DENIED')\n"
+    )
+    r = sandbox.run(
+        python_exe,
+        ["-c", code, "d/sub/data.txt"],
+        copy_in={"d": str(src)},
+    )
+    assert r.status == "AC", r.stderr
+    assert b"DENIED" in r.stdout, r.stdout
+
+    leaked = {
+        p
+        for p in set(glob.glob(os.path.join(tempfile.gettempdir(), "river-*"))) - before
+        if os.path.isdir(p)
+    }
+    assert not leaked, f"workdir leaked after a directory copy_in: {leaked}"
 
 
 def test_copy_in_nested_paths_are_created(sandbox, python_exe):

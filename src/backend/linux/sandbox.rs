@@ -299,10 +299,12 @@ impl Sandbox {
             // TMPDIR target: `/cwd/tmp` from the program's point of view.
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
-            // The program is nobody; the bind-mounted workdir must belong to
-            // it or nothing is writable (directories 0700, copy_in files
-            // 0440 — both chowned to the sandbox uid).
+            // The program is nobody: it must own the cwd root (and only the
+            // `tmp/` subdir) to create files there. `copy_in` entries stay
+            // root-owned 0444/0755 — readable, never modifiable (DESIGN
+            // §3.3: an owned 0440 file could be chmod'ed and overwritten).
             workdir.grant_to(ns::NOBODY_UID, ns::NOBODY_GID)?;
+            WorkDir::grant_dir_to(&tmp_dir, ns::NOBODY_UID, ns::NOBODY_GID)?;
 
             // Whitelisted environment, in **sandbox coordinates** (the
             // program never sees host paths). Base + caller overrides.

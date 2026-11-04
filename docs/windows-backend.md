@@ -59,7 +59,7 @@ EXTENSION_POINT_DISABLE      禁 DLL 注入式 hook 扩展点
 |---|---|---|
 | per-run 私有 cwd | 读/写/执行 | 临时目录 + ACE 授予 AppContainer SID |
 | `runtimes` 各目录 | 读/执行 | 宿主目录 ACL 加只读 ACE（零拷贝，Defender 只扫一次） |
-| `copy_in` 文件 | 只读 | 落盘到 cwd 后显式重置 ACL（不走 MoveFile：移动保留源 ACL，拷贝继承目标目录 ACL） |
+| `copy_in` 文件 | 内容只读 | 落盘后设置保护性只读 DACL（用户 SID 与包 SID 仅 RX；目录用可继承 ACE）。**不能**只靠 `FILE_ATTRIBUTE_READONLY`：继承的 cwd ACE 含 `FILE_WRITE_ATTRIBUTES`，程序 `chmod` 后可改写（实测）。保护性 DACL 同时关闭继承，删除/改名所需的 DELETE 位也不再授予。
 | System32 及系统 DLL | 读/执行（系统默认） | AppContainer 天然可读——程序需要加载系统 DLL |
 
 环境变量基底 = `SystemRoot` + `TEMP`/`TMP`（指向私有 cwd 下的 tmp 子目录），

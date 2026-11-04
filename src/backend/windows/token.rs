@@ -29,8 +29,11 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-
-use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree};
+use windows_sys::Win32::Security::{
+    CopySid, GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 // windows-sys does not expose the userenv profile APIs; declare the three
 // functions we need directly (kernel32's LocalFree comes from windows-sys).
@@ -236,6 +239,69 @@ pub(crate) fn wide_of(path: &Path) -> Vec<u16> {
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// The judger's own user SID, as owned bytes.
+///
+/// Used to build a **protected** DACL for `copy_in` inputs: the sandboxed
+/// process runs with the same user SID *and* the AppContainer package SID,
+/// so a deny ACE for the package SID alone is not enough — the inherited
+/// user ACE would still grant write (the AppContainer access check accepts
+/// both). Granting both identities read-only and protecting the DACL from
+/// inheritance is what actually makes the input immutable.
+pub(crate) fn current_user_sid() -> io::Result<Vec<u8>> {
+    // Cached: the SID is per-process stable and the copy_in path asks once
+    // per provisioned entry (a 200-file input would otherwise query the
+    // token 200 times).
+    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+    if let Some(sid) = CACHE.get() {
+        return Ok(sid.clone());
+    }
+    let sid = query_user_sid()?;
+    let _ = CACHE.set(sid.clone());
+    Ok(sid)
+}
+
+fn query_user_sid() -> io::Result<Vec<u8>> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // SAFETY: the handle is closed below; GetCurrentProcess is pseudo.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = (|| {
+        let mut len: u32 = 0;
+        // First call sizes the buffer (fails with INSUFFICIENT_BUFFER).
+        unsafe {
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
+        };
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buffer is `len` bytes; the call writes at most `len`.
+        if unsafe {
+            GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as *mut _, len, &mut len)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call succeeded and filled a TOKEN_USER.
+        let user = unsafe { &*(buf.as_ptr() as *const TOKEN_USER) };
+        // SAFETY: User.Sid points into `buf`, still alive.
+        let sid_len = unsafe { GetLengthSid(user.User.Sid) } as usize;
+        if sid_len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut sid = vec![0u8; sid_len];
+        // SAFETY: destination is `sid_len` bytes; source SID is valid.
+        if unsafe { CopySid(sid_len as u32, sid.as_mut_ptr() as *mut _, user.User.Sid) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(sid)
+    })();
+    // SAFETY: handle was opened above and is closed exactly once.
+    unsafe { CloseHandle(token) };
+    result
 }
 
 /// Read a NUL-terminated wide string into `String` (tests only).

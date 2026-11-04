@@ -238,9 +238,6 @@ impl Sandbox {
             // Per-run working directory: the only writable place the program
             // sees. `WorkDir` removes itself on drop (also on error paths).
             let workdir = WorkDir::create()?;
-            if let Some(files) = &copy_in {
-                workdir.provision(files)?;
-            }
 
             // AppContainer identity + ACL grants. The child adopts the
             // AppContainer at spawn time; its visible filesystem is exactly
@@ -248,6 +245,16 @@ impl Sandbox {
             let appcontainer = AppContainer::create_or_open()?;
             let sid = appcontainer.sid();
             acl::grant_rw(workdir.path(), sid)?;
+            // `copy_in` first inherits the cwd's read/write ACE, then gets an
+            // explicit deny-write ACE: the READONLY attribute alone was
+            // bypassable with SetFileAttributes/chmod (verified).
+            let provisioned = match &copy_in {
+                Some(files) => workdir.provision(files)?,
+                None => Vec::new(),
+            };
+            for entry in &provisioned {
+                acl::protect_read_only(&entry.path, sid, entry.is_dir)?;
+            }
             for rt in &runtimes {
                 acl::grant_ro(rt, sid)?;
             }

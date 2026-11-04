@@ -88,8 +88,9 @@ impl WorkDir {
     /// Provision `copy_in` entries into the working directory. Keys are
     /// sandbox-relative paths (validated upstream by `contract::validate`);
     /// parent directories are created as needed. Every file ends up mode
-    /// 0440 (chowned to the sandbox uid later by `grant_to`: readable by the
-    /// untrusted program, never writable).
+    /// 0444 and stays root-owned (see [`Self::grant_to`]): readable by the
+    /// untrusted program, never modifiable — `chmod` by the program fails
+    /// because it is not the owner.
     ///
     /// A `CopyInSource::Path` value pointing at a host **directory** is
     /// provisioned recursively (regular files and subdirectories; symlinks
@@ -163,37 +164,31 @@ impl WorkDir {
         Ok(out)
     }
 
-    /// Hand the working directory to the unprivileged program: the tree is
-    /// bind-mounted into the sandbox as `/cwd`, so its owner must be the
-    /// sandbox uid or the program cannot create files there. Directories are
-    /// chowned recursively and mode 0700; `copy_in` **files** are chowned
-    /// too and set mode 0440 — read-only and no longer world-readable
-    /// (DESIGN §3.3). `.owner` stays root-owned: it is the sweep's liveness
-    /// probe, not part of the program's surface.
+    /// Hand the working directory to the unprivileged program.
+    ///
+    /// Only the **workdir root** is chowned (and `tmp/` separately, see
+    /// [`Self::grant_dir_to`]): the program owns its private cwd and can
+    /// create files there. `copy_in` entries stay **root-owned** — files
+    /// 0444, directories 0755 — so the program can read and traverse them
+    /// but can never modify or chmod them (an owned 0440 file could be
+    /// `chmod`ed by its owner and overwritten; verified). `.owner` also
+    /// stays root-owned: it is the sweep's liveness probe.
+    ///
+    /// Known Unix limit: the program owns the parent directory, so it may
+    /// still *delete or rename* a `copy_in` entry (unlink permission comes
+    /// from the directory). Deleting one's own input cannot change its
+    /// content and does not leak anything, so this is accepted and
+    /// documented rather than paid for with per-file read-only mounts.
     pub(crate) fn grant_to(&self, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-        use std::os::unix::ffi::OsStrExt;
-        let mut stack = vec![self.path.clone()];
-        while let Some(dir) = stack.pop() {
-            // Root included: created 0700 root-owned; after the chown the
-            // program owns it and other uids stay locked out.
-            chown(&dir, uid, gid)?;
-            chmod(&dir, 0o700)?;
-            for entry in fs::read_dir(&dir)? {
-                let entry = entry?;
-                let ft = entry.file_type()?;
-                if ft.is_dir() {
-                    stack.push(entry.path());
-                } else if ft.is_file()
-                    && entry.file_name() != ".owner"
-                {
-                    // `.owner` stays root-owned: it is the sweep's liveness
-                    // probe, not part of the program's surface.
-                    chown(&entry.path(), uid, gid)?;
-                    chmod(&entry.path(), 0o440)?;
-                }
-            }
-        }
-        Ok(())
+        chown(&self.path, uid, gid)?;
+        chmod(&self.path, 0o700)
+    }
+
+    /// Hand one writable subdirectory (the `tmp/` inside the cwd) to the
+    /// sandbox uid. `copy_in` directories are deliberately *not* passed here.
+    pub(crate) fn grant_dir_to(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+        chown(dir, uid, gid)?;
+        chmod(dir, 0o700)
     }
 }
 
@@ -295,13 +290,11 @@ fn copy_one(
     Ok(())
 }
 
-/// Best-effort read-only (u+r, g-rwx, o-rwx). Must not fail provisioning: a
-/// program that could write its copy_in files is an attack-suite failure,
-/// so any chmod error here is loud. The file is chowned to the sandbox uid
-/// later by `grant_to`, which is when 0440 becomes "readable by the program
-/// only".
+/// Best-effort read-only: world-readable, never writable (0444). The file
+/// stays **root-owned** (see [`WorkDir::grant_to`]): the sandbox uid is not
+/// its owner, so `chmod` fails and the content is immutable.
 fn make_read_only(path: &Path) -> io::Result<()> {
-    chmod(path, 0o440)
+    chmod(path, 0o444)
 }
 
 /// Create the workdir mode 0700: before the run starts nothing on the host

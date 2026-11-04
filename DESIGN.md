@@ -128,8 +128,11 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
    bytes 起喂线程。
 2. **输出三机制分离**：`*_limit` 是击杀阈值、`*_file` 是完整留档、`r.stdout`
    是截断采样。
-3. **copy_in 一律只读**：硬链接优化只有在拒绝写 ACE 下才安全，否则被测进程
-   可篡改宿主源文件。不做"可写白名单"。
+3. **copy_in 内容不可改**：Windows 用保护性只读 DACL（用户 SID 与包 SID 仅
+   RX，目录用可继承 ACE），Linux 用 root 属主 0444/0755——两条路径都让"清掉
+   只读位再改写"失效（实测旧实现可绕过）。程序仍拥有 cwd 根，因此可以删除/
+   重命名自己 cwd 里的条目：这只影响它自己读到的输入，不能篡改内容或外泄。
+   不做"可写白名单"。
 4. **copy_in 不走 MoveFile**：移动保留源 ACL，拷贝继承目标目录 ACL；落盘后
    显式重置 ACL。
 5. **不做交互题**：实时双向管道不塞进 run 参数。

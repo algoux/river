@@ -30,10 +30,11 @@ use windows_sys::Win32::Security::Authorization::{
     SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
-    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, PSECURITY_DESCRIPTOR, PSID,
+    ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, PROTECTED_DACL_SECURITY_INFORMATION,
+    PSECURITY_DESCRIPTOR, PSID,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_DELETE_CHILD, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
 };
 
 /// Serializes DACL read-modify-write cycles (see module docs).
@@ -58,6 +59,9 @@ const CWD_GRANT_RIGHTS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENE
 /// Read + execute only: no write, no delete.
 const RUNTIMES_GRANT_RIGHTS: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
 
+/// Rights granted on a protected `copy_in` entry: read + execute only.
+const INPUT_READ_RIGHTS: u32 = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+
 const CONTAINER_AND_OBJECT_INHERIT: u32 = 0x3; // CONTAINER|OBJECT INHERIT_ACE
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
 
@@ -77,10 +81,107 @@ pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
     // same path would otherwise race on the DACL (lost ACE).
     let _guard = GRANT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    if ace_already_present(path, sid, rights)? {
+    if ace_present(path, sid, rights, ACCESS_ALLOWED_ACE_TYPE)? {
         return Ok(());
     }
+    apply_entry(
+        path,
+        sid,
+        rights,
+        GRANT_ACCESS,
+        CONTAINER_AND_OBJECT_INHERIT,
+    )
+}
 
+/// Replace a `copy_in` entry's DACL with a **protected**, read-only one.
+///
+/// The sandboxed token carries the judger's user SID *and* the AppContainer
+/// package SID, and the AppContainer access check accepts either. An
+/// inherited user ACE granting write therefore still allowed modifying the
+/// input — a package-SID deny ACE alone did **not** stop `chmod`+write
+/// (verified). The fix is to drop inheritance and grant exactly read/execute
+/// to both identities: no write, no `WRITE_ATTRIBUTES` (the chmod vector),
+/// no `WRITE_DAC`.
+///
+/// Deletion/rename are already impossible: the program has no DELETE on the
+/// entry and `CWD_GRANT_RIGHTS` deliberately excludes `FILE_DELETE_CHILD`.
+pub(crate) fn protect_read_only(path: &Path, app_sid: PSID, inheritable: bool) -> io::Result<()> {
+    let _guard = GRANT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let user_sid = crate::backend::windows::token::current_user_sid()?;
+    // Directories pass their read-only ACL down to the whole provisioned
+    // tree (one DACL write instead of one per file: a 200-file input cost
+    // ~100 ms with per-file writes).
+    let inheritance = if inheritable {
+        CONTAINER_AND_OBJECT_INHERIT
+    } else {
+        0
+    };
+    // A protected directory needs `FILE_DELETE_CHILD` for the judger,
+    // otherwise its own cleanup cannot remove the (read-only) entries inside
+    // it and every run leaks a workdir. The sandboxed identity is the same
+    // user SID, so the program may also delete entries inside the input
+    // tree — accepted semantics: the *content* stays immutable, deletion of
+    // its own input leaks nothing (same rule as the Linux backend).
+    let user_rights = if inheritable {
+        INPUT_READ_RIGHTS | FILE_DELETE_CHILD
+    } else {
+        INPUT_READ_RIGHTS
+    };
+    let entries = [
+        grant_entry(app_sid, INPUT_READ_RIGHTS, inheritance),
+        grant_entry(user_sid.as_ptr() as PSID, user_rights, inheritance),
+    ];
+
+    let wide = crate::backend::windows::token::wide_of(path);
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    // SAFETY: entries are valid; a null old ACL asks for a fresh one;
+    // out-pointer is valid.
+    let err = unsafe {
+        SetEntriesInAclW(
+            entries.len() as u32,
+            entries.as_ptr(),
+            std::ptr::null(),
+            &mut new_dacl,
+        )
+    };
+    if err != 0 {
+        return Err(win32_error(err));
+    }
+    // SAFETY: wide string is NUL-terminated; new_dacl is valid.
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null(),
+        )
+    };
+    // SAFETY: allocated by SetEntriesInAclW above.
+    unsafe { LocalFree(new_dacl as HLOCAL) };
+    if err != 0 {
+        return Err(win32_error(err));
+    }
+    Ok(())
+}
+
+fn grant_entry(sid: PSID, rights: u32, inheritance: u32) -> EXPLICIT_ACCESS_W {
+    let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
+    // SAFETY: trustee is zeroed; sid is valid for the duration of the call.
+    unsafe { BuildTrusteeWithSidW(&mut trustee, sid as _) };
+    EXPLICIT_ACCESS_W {
+        grfAccessPermissions: rights,
+        grfAccessMode: GRANT_ACCESS,
+        grfInheritance: inheritance,
+        Trustee: trustee,
+    }
+}
+
+/// Merge one explicit ACE into `path`'s DACL. The caller holds `GRANT_LOCK`.
+fn apply_entry(path: &Path, sid: PSID, rights: u32, mode: i32, inheritance: u32) -> io::Result<()> {
     let wide = crate::backend::windows::token::wide_of(path);
     let (dacl, sd) = read_dacl(&wide)?;
 
@@ -91,8 +192,8 @@ pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
 
     let entry = EXPLICIT_ACCESS_W {
         grfAccessPermissions: rights,
-        grfAccessMode: GRANT_ACCESS,
-        grfInheritance: CONTAINER_AND_OBJECT_INHERIT,
+        grfAccessMode: mode,
+        grfInheritance: inheritance,
         Trustee: trustee,
     };
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
@@ -174,9 +275,9 @@ fn read_dacl(wide: &[u16]) -> io::Result<(*mut ACL, PSECURITY_DESCRIPTOR)> {
     Ok((dacl, sd))
 }
 
-/// True when `path`'s DACL already carries an ACCESS_ALLOWED ACE with exactly
-/// `rights` for `sid` (the idempotency check).
-fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> {
+/// True when `path`'s DACL already carries an ACE of `ace_type` with exactly
+/// `rights` for `sid` (the idempotency check, for allow and deny entries).
+fn ace_present(path: &Path, sid: PSID, rights: u32, ace_type: u8) -> io::Result<bool> {
     let wide = crate::backend::windows::token::wide_of(path);
     let (dacl, sd) = read_dacl(&wide)?;
 
@@ -190,8 +291,8 @@ fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> 
             if ok == 0 || ace.is_null() {
                 continue;
             }
-            // SAFETY: GetAce returned a pointer to an ACCESS_ALLOWED_ACE.
-            let (ace_type, mask, ace_sid) = unsafe {
+            // SAFETY: GetAce returned a pointer to an ACE with this layout.
+            let (entry_type, mask, ace_sid) = unsafe {
                 let body = ace as *const AccessAllowedAce;
                 (
                     (*body).ace_type,
@@ -199,7 +300,7 @@ fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> 
                     &(*body).sid_start as *const u32 as PSID,
                 )
             };
-            if ace_type == ACCESS_ALLOWED_ACE_TYPE && mask == rights {
+            if entry_type == ace_type && mask == rights {
                 // SAFETY: both SIDs are valid and well-formed.
                 if unsafe { EqualSid(ace_sid, sid as _) } != 0 {
                     found = true;
@@ -271,7 +372,31 @@ mod tests {
     }
 
     fn has_exactly(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> {
-        ace_already_present(path, sid, rights)
+        ace_present(path, sid, rights, ACCESS_ALLOWED_ACE_TYPE)
+    }
+
+    /// A protected `copy_in` ACL: read/execute for the package SID and for
+    /// the judger's user SID, and nothing else (in particular no write and no
+    /// `WRITE_ATTRIBUTES`, which was the chmod bypass).
+    #[test]
+    fn protect_read_only_is_a_protected_read_dacl() {
+        let ac = AppContainer::create_or_open().unwrap();
+        let dir = std::env::temp_dir().join(format!("river-acl-input-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("input.txt");
+        std::fs::write(&file, b"immutable").unwrap();
+
+        protect_read_only(&file, ac.sid(), false).unwrap();
+
+        assert!(
+            ace_present(&file, ac.sid(), INPUT_READ_RIGHTS, ACCESS_ALLOWED_ACE_TYPE).unwrap(),
+            "package SID lost read access"
+        );
+        // Only the two explicit read ACEs remain: inheritance is off.
+        assert_eq!(ace_count(&file).unwrap(), 2);
+        assert!(!ace_present(&file, ac.sid(), CWD_GRANT_RIGHTS, ACCESS_ALLOWED_ACE_TYPE).unwrap());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// The DACL update is a read-modify-write; concurrent grants on the

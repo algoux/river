@@ -66,7 +66,11 @@ the sandbox killed the process).
 
 - `rootfs` is not supported on Windows — use `runtimes`.
 - Network access cannot be allowed (always denied).
-- `copy_in` files are read-only for the program.
+- `copy_in` files are immutable in content for the program (a protected
+  read-only DACL: the inherited write ACE would otherwise let the program
+  clear the read-only attribute and rewrite its input). The program may still
+  delete/rename an entry inside its own cwd — that changes nothing it reads
+  and cannot leak; see DESIGN §3.3.
 - Memory limits apply to *commit*, not RSS — a large `malloc` that is never
   written does not trigger `MLE`.
 - The memory limit is enforced both per process and for the whole process
@@ -163,10 +167,13 @@ returns the same facts for deployment diagnosis.
 - Children are allowed (bounded by `pids.max`); a program that hands work to
   a child which would outlive it cannot: the pid namespace kills descendants
   when the main process exits.
-- The workdir is 0700 and `copy_in` files are 0440, both owned by the sandbox
-  uid: unrelated host processes are locked out, but another process running
-  as the *same* uid (`nobody`) shares owner rights — per-run uids would be
-  needed for full cross-run isolation.
+- The workdir is 0700 owned by the sandbox uid; `copy_in` entries are
+  root-owned 0444/0755, so the program can read but never chmod or overwrite
+  them. The program still owns the workdir root, so it can delete/rename an
+  entry in its own cwd (content cannot be changed). Unrelated host processes
+  are locked out, but another process running as the *same* uid (`nobody`)
+  shares the workdir's owner rights — per-run uids would be needed for full
+  cross-run isolation.
 
 ## Testing
 
