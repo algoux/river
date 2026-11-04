@@ -139,14 +139,26 @@ pub(crate) fn parse_copy_out(map: &HashMap<String, String>) -> PyResult<Vec<Copy
         .collect())
 }
 
-/// Validate one sandbox-relative path key (shared by `copy_in` and
-/// `copy_out`): relative, no `..` components, no drive colon, non-empty.
+/// Validate one sandbox-relative path key (shared by `copy_in`, `copy_out`
+/// and `cwd`): only plain relative components are accepted. Anything else —
+/// empty, absolute, rooted, prefix-bearing, `..`/`.` components, drive
+/// colons — is rejected.
+///
+/// Why `has_root()` and not just `is_absolute()`: on Windows a path like
+/// `"/foo"` or `"\foo"` is *rooted but not absolute* (`is_absolute() ==
+/// false`, the drive prefix is missing), yet `Path::join("/foo")` **replaces
+/// the base down to the drive root**, so `"C:\workdir".join("/Users/x")`
+/// resolves to `C:\Users\x` — a host path far outside the sandbox working
+/// directory (verified exploit: `copy_out` / `copy_in` keys and `cwd` all
+/// escaped the workdir this way). Requiring every component to be
+/// `Component::Normal(_)` closes the whole class: RootDir, Prefix, CurDir
+/// and ParentDir are all rejected, on every platform.
 fn validate_rel_key(kind: &str, key: &str) -> PyResult<()> {
     let path = Path::new(key);
     if key.is_empty()
-        || path.is_absolute()
+        || path.has_root()
         || key.contains(':')
-        || path.components().any(|c| matches!(c, Component::ParentDir))
+        || !path.components().all(|c| matches!(c, Component::Normal(_)))
     {
         return Err(PyValueError::new_err(format!(
             "invalid {kind} key {key:?}: must be a relative path inside the sandbox working directory"
@@ -167,6 +179,13 @@ pub(crate) fn validate(spec: &RunSpec) -> PyResult<()> {
     }
     for entry in spec.copy_out.iter().flatten() {
         validate_rel_key("copy_out", &entry.src_rel)?;
+    }
+    // `cwd` shares the coordinate system (a path relative to the sandbox
+    // working directory) and the same validation: it used to be unchecked,
+    // so `cwd=r"..\.."` or an absolute path silently moved the program
+    // outside the private workdir.
+    if let Some(cwd) = &spec.cwd {
+        validate_rel_key("cwd", cwd)?;
     }
     Ok(())
 }
@@ -213,5 +232,40 @@ mod tests {
         let c = SafetyCeilings::default();
         assert_eq!(c.wall_limit, Duration::from_secs(24 * 3600));
         assert_eq!(c.max_processes, 64);
+    }
+
+    /// Rooted-but-not-absolute paths must be rejected everywhere a
+    /// sandbox-relative key is accepted: `Path::join` replaces the base down
+    /// to the drive root for them, which escaped the working directory.
+    #[test]
+    fn rooted_paths_are_rejected() {
+        for key in ["/foo", "\\foo", "/a/b", "C:foo", "a:/b"] {
+            assert!(
+                validate_rel_key("k", key).is_err(),
+                "{key:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn cwd_shares_the_rel_key_validation() {
+        let mut s = spec();
+        s.cwd = Some("..\\..".to_string());
+        assert!(validate(&s).is_err());
+        s.cwd = Some("/etc".to_string());
+        assert!(validate(&s).is_err());
+        s.cwd = Some("C:\\Windows".to_string());
+        assert!(validate(&s).is_err());
+        s.cwd = Some("sub/dir".to_string());
+        assert!(validate(&s).is_ok());
+    }
+
+    #[test]
+    fn dot_curdir_components_are_rejected() {
+        // A *leading* `./` is preserved as a CurDir component; interior
+        // `./` is normalized away by `Path::components` and is harmless.
+        assert!(validate_rel_key("k", "./x").is_err());
+        assert!(validate_rel_key("k", "a/./b").is_ok());
+        assert!(validate_rel_key("k", "plain/file.txt").is_ok());
     }
 }

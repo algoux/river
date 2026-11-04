@@ -272,11 +272,20 @@ impl Sandbox {
             let profile = SpawnProfile::sandboxed(sid, env_block(&env_vars));
 
             // The process starts inside the working directory; an explicit
-            // `cwd` (relative to it) is applied below when supported.
+            // `cwd` (already validated as workdir-relative by the contract)
+            // must exist — failing loudly beats silently relocating the run
+            // to the workdir root.
             let cwd_path = match &cwd_rel {
                 Some(rel) => {
                     let p = workdir.path().join(rel);
-                    if p.is_dir() { Some(p) } else { None }
+                    if p.is_dir() {
+                        Some(p)
+                    } else {
+                        return Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            format!("cwd {rel:?} does not exist in the sandbox working directory"),
+                        ));
+                    }
                 }
                 None => Some(workdir.path().to_path_buf()),
             };
