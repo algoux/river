@@ -121,19 +121,23 @@ def test_registry_write_is_denied(sandbox, python_exe):
     assert r.stdout.strip() == b"DENIED"
 
 
-def test_registry_read_outside_the_profile_is_denied(sandbox, python_exe):
+def test_registry_read_exposure_is_pinned(sandbox, python_exe):
+    # Reads of HKLM/HKCU are *visible* to an AppContainer — a documented
+    # info exposure (DESIGN/README known limitations). Pin that behavior as
+    # a contract so a future regression either way is noticed: the probe
+    # queries a value that definitely EXISTS (the previous version queried
+    # a nonexistent value, which raises OSError whether or not the key
+    # opened — a tautological assertion that proved nothing).
     code = (
-        "try:\n"
-        "    import winreg\n"
-        "    k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r'SOFTWARE\\Microsoft')\n"
-        "    winreg.QueryValueEx(k, 'something')\n"
-        "    print('LEAK')\n"
-        "except OSError:\n"
-        "    print('DENIED')\n"
+        "import winreg\n"
+        "k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,\n"
+        "                  r'SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion')\n"
+        "name, _ = winreg.QueryValueEx(k, 'ProductName')\n"
+        "print('READ-VISIBLE' if name else 'EMPTY')\n"
     )
     r = _probe(sandbox, python_exe, code)
     assert r.status == "AC", r.stderr
-    assert r.stdout.strip() == b"DENIED"
+    assert r.stdout.strip() == b"READ-VISIBLE"
 
 
 def test_outbound_network_is_denied(sandbox, python_exe):
