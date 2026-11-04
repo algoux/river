@@ -133,7 +133,9 @@ pub(crate) fn classify(evidence: &RunEvidence) -> Verdict {
     // 3. Memory: an abnormal end with the peak pinned at the limit is the
     //    allocation-bomb signature — report MLE, not the exit code or the
     //    watchdog kill that reaped it.
-    if ended_abnormally(evidence) && peak_hits_limit(evidence.peak_memory_bytes, evidence.memory_limit_bytes) {
+    if ended_abnormally(evidence)
+        && peak_hits_limit(evidence.peak_memory_bytes, evidence.memory_limit_bytes)
+    {
         return Verdict::Mle;
     }
     // 4. Time: the watchdog kill, or the measured CPU past the limit

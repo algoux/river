@@ -73,6 +73,9 @@ the sandbox killed the process).
 
 ## Testing
 
+**Every commit must pass `cargo fmt` first** (run `cargo fmt` before `git
+commit`; unformatted code must not be committed).
+
 ```shell
 uv sync --extra test
 uv run maturin develop

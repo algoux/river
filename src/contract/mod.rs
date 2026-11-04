@@ -54,11 +54,10 @@ impl RunSpec {
     /// Effective wall clock limit: explicit value, else `2 * time_limit + 1000ms`
     /// when a CPU time limit is set, else `None` (unlimited).
     pub(crate) fn effective_wall_time_limit_ms(&self) -> Option<u64> {
-        self.wall_time_limit_ms
-            .or_else(|| {
-                self.time_limit_ms
-                    .map(|t| t.saturating_mul(2).saturating_add(1000))
-            })
+        self.wall_time_limit_ms.or_else(|| {
+            self.time_limit_ms
+                .map(|t| t.saturating_mul(2).saturating_add(1000))
+        })
     }
 }
 

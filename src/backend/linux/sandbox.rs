@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use crate::contract::{RunSpec, parse_copy_in, validate};
 use crate::contract::status::Status;
+use crate::contract::{RunSpec, parse_copy_in, validate};
 
 /// Linux sandbox — **not implemented yet**.
 ///

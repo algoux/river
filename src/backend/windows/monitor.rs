@@ -11,13 +11,13 @@ use std::io;
 use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT, HANDLE};
+use windows_sys::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
 
 use crate::backend::windows::job::Job;
 use crate::backend::windows::spawn::SpawnedChild;
-use crate::contract::verdict::KillOrigin;
 use crate::contract::SafetyCeilings;
+use crate::contract::verdict::KillOrigin;
 
 /// Exit code used when the sandbox kills the process tree.
 pub(crate) const KILL_EXIT_CODE: u32 = 1;
@@ -132,13 +132,13 @@ pub(crate) fn monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-    use crate::backend::windows::ntstatus::{is_ntstatus, ntstatus_name};
-    use crate::contract::verdict::{RunEvidence, Verdict, classify};
     use crate::backend::windows::job::JobLimits;
+    use crate::backend::windows::ntstatus::{is_ntstatus, ntstatus_name};
     use crate::backend::windows::spawn::spawn_bare;
     use crate::backend::windows::stdio::{StdinSource, StdioSet};
+    use crate::contract::verdict::{RunEvidence, Verdict, classify};
     use std::path::Path;
+    use std::path::PathBuf;
 
     fn run_monitored(
         exe: &str,
@@ -193,12 +193,7 @@ mod tests {
     /// CPU share varies wildly and the assertion becomes flaky.
     #[test]
     fn cpu_time_is_measured_through_the_job_accounting() {
-        let o = run_monitored(
-            "cmd",
-            &["/c", "for /l %i in (1,1,20000000) do @rem"],
-            None,
-        )
-        .unwrap();
+        let o = run_monitored("cmd", &["/c", "for /l %i in (1,1,20000000) do @rem"], None).unwrap();
         assert_eq!(o.kill, KillOrigin::None);
         assert!(
             o.cpu_time_ms > 50,
@@ -304,7 +299,11 @@ mod tests {
             .arg(&src)
             .output()
             .expect("spawn rustc");
-        assert!(out.status.success(), "rustc failed: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "rustc failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         exe
     }
 
@@ -404,19 +403,15 @@ mod tests {
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
-        let mut set = StdioSet::new(
-            StdinSource::Null,
-            Some(out_limit),
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let mut set = StdioSet::new(StdinSource::Null, Some(out_limit), None, None, None).unwrap();
         let ev = set.overflow_event_handle();
-        let args: Vec<String> = ["/c", "for /l %i in (1,1,100000) do @echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let args: Vec<String> = [
+            "/c",
+            "for /l %i in (1,1,100000) do @echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
         let outcome = monitor(&child, &job, None, Some(ev)).unwrap();
         let (out, _err) = set.finish().unwrap();

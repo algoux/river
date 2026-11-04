@@ -10,12 +10,11 @@ use std::path::Path;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Security::SECURITY_CAPABILITIES;
 use windows_sys::Win32::System::Threading::{
-    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
-    DeleteProcThreadAttributeList,
 };
 
 /// Mitigation-policy encodings from the official UpdateProcThreadAttribute
@@ -157,10 +156,7 @@ pub(crate) struct SpawnProfile {
 impl SpawnProfile {
     /// The production profile: AppContainer identity + kernel attack-surface
     /// policies + whitelisted environment.
-    pub(crate) fn sandboxed(
-        appcontainer_sid: *mut core::ffi::c_void,
-        env_block: Vec<u16>,
-    ) -> Self {
+    pub(crate) fn sandboxed(appcontainer_sid: *mut core::ffi::c_void, env_block: Vec<u16>) -> Self {
         SpawnProfile {
             appcontainer_sid,
             env_block,
@@ -686,8 +682,16 @@ mod tests {
         let denied = PathBuf::from(r"C:\river-ac-denied.txt");
         let _ = std::fs::remove_file(&denied);
         let (code, _, err) = run(&["/c", "echo x> C:\\river-ac-denied.txt"]).unwrap();
-        assert_ne!(code, 0, "write to C:\\ must fail: {:?}", String::from_utf8_lossy(&err.data));
-        assert!(!denied.exists(), "the denied file must not have been created");
+        assert_ne!(
+            code,
+            0,
+            "write to C:\\ must fail: {:?}",
+            String::from_utf8_lossy(&err.data)
+        );
+        assert!(
+            !denied.exists(),
+            "the denied file must not have been created"
+        );
 
         // Environment isolation: the child sees the whitelisted block plus a
         // marker variable, not the judger's environment. (TEMP/TMP themselves
@@ -807,7 +811,14 @@ mod tests {
                     format!("-o{}", probe_exe.display()),
                     probe_rs.display().to_string(),
                 ];
-                let child = spawn_bare(Path::new(&rustc), &args, &job, &mut set, Some(work.path()), None)?;
+                let child = spawn_bare(
+                    Path::new(&rustc),
+                    &args,
+                    &job,
+                    &mut set,
+                    Some(work.path()),
+                    None,
+                )?;
                 child.resume()?;
                 let code = child.wait_exit()?;
                 let (out, err) = set.finish()?;
@@ -818,7 +829,7 @@ mod tests {
         let run = |args: &[&str],
                    cwd: Option<&std::path::Path>,
                    security: Option<&SpawnProfile>|
-          -> io::Result<(
+         -> io::Result<(
             u32,
             crate::backend::windows::stdio::Output,
             crate::backend::windows::stdio::Output,
@@ -872,10 +883,7 @@ mod tests {
                 std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
             )])
         };
-        let ext_only = SpawnProfile::test_only(
-            mitigation_policies_ext_only(),
-            system_root_env(),
-        );
+        let ext_only = SpawnProfile::test_only(mitigation_policies_ext_only(), system_root_env());
         let (code, out, _) = run(&["query"], Some(work.path()), Some(&ext_only))?;
         assert_eq!(
             code, 0,
@@ -908,17 +916,12 @@ mod tests {
         // exact failure surface varies: ERROR_ACCESS_DISABLED_BY_POLICY from
         // a denied syscall, or the user32 load failing outright).
         let (code, out, _) = run(&["win32k"], Some(work.path()), Some(&security))?;
+        assert!(code != 0, "win32k syscall must be policy-denied: {out:?}");
         assert!(
-            code != 0,
-            "win32k syscall must be policy-denied: {out:?}"
-        );
-        assert!(
-            out.data.starts_with(b"load-denied")
-                || code == ERROR_ACCESS_DISABLED_BY_POLICY,
+            out.data.starts_with(b"load-denied") || code == ERROR_ACCESS_DISABLED_BY_POLICY,
             "expected a win32k denial: exit={code:#x} {out:?}"
         );
 
         Ok(())
     }
 }
-

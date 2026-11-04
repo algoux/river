@@ -175,7 +175,9 @@ fn derive_sid(name: &str) -> io::Result<Option<PSID>> {
 /// Create the profile (mutating API — serialized by
 /// `PROFILE_CREATE_LOCK`), then remember that this process owns it.
 fn create_profile(name: &str) -> io::Result<AppContainer> {
-    let _guard = PROFILE_CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = PROFILE_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let wide_name = to_wide(name);
     let mut sid: PSID = std::ptr::null_mut();
@@ -232,9 +234,7 @@ fn profile_known_created(name: &str) -> bool {
 }
 
 fn mark_profile_created(name: &str) {
-    let mut guard = created_profiles()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let mut guard = created_profiles().lock().unwrap_or_else(|e| e.into_inner());
     if !guard.iter().any(|n| n == name) {
         guard.push(name.to_string());
     }
@@ -252,14 +252,16 @@ pub(crate) fn wide_of(path: &Path) -> Vec<u16> {
 ///
 /// # Safety
 /// `ptr` must point to a NUL-terminated UTF-16 string.
-unsafe fn wide_ptr_to_string(ptr: *const u16) -> String { unsafe {
-    let mut len = 0usize;
-    // SAFETY: caller guarantees NUL termination.
-    while *ptr.add(len) != 0 {
-        len += 1;
+unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
+    unsafe {
+        let mut len = 0usize;
+        // SAFETY: caller guarantees NUL termination.
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
     }
-    String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
-}}
+}
 
 fn profile_path_for(name: &str) -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")?;

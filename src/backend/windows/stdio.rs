@@ -200,12 +200,14 @@ impl StdioSet {
         // Manual-reset overflow event: both readers may fire it; manual reset
         // keeps the signal latched until the monitor observes it.
         // SAFETY: out-pointer valid; handle wrapped on success.
-        let ev_raw = unsafe { windows_sys::Win32::System::Threading::CreateEventW(
-            std::ptr::null(),
-            1, // manual reset
-            0,
-            std::ptr::null(),
-        ) };
+        let ev_raw = unsafe {
+            windows_sys::Win32::System::Threading::CreateEventW(
+                std::ptr::null(),
+                1, // manual reset
+                0,
+                std::ptr::null(),
+            )
+        };
         if ev_raw.is_null() {
             return Err(io::Error::last_os_error());
         }

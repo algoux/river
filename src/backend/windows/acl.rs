@@ -26,8 +26,8 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_W,
+    BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::{
     ACL, DACL_SECURITY_INFORMATION, EqualSid, GetAce, PSECURITY_DESCRIPTOR, PSID,
@@ -98,7 +98,11 @@ pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
     // SAFETY: entry and old DACL are valid; out-pointer is valid.
     let err = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut new_dacl) };
-    let merge_err = if err != 0 { Some(win32_error(err)) } else { None };
+    let merge_err = if err != 0 {
+        Some(win32_error(err))
+    } else {
+        None
+    };
 
     let err = if merge_err.is_none() {
         // SAFETY: wide string is NUL-terminated; new_dacl is valid.
@@ -116,7 +120,11 @@ pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
     } else {
         0
     };
-    let write_err = if err != 0 { Some(win32_error(err)) } else { None };
+    let write_err = if err != 0 {
+        Some(win32_error(err))
+    } else {
+        None
+    };
 
     // SAFETY: both were allocated by the calls above (new_dacl by
     // SetEntriesInAclW, sd by GetNamedSecurityInfoW) and freed with LocalFree.
@@ -185,7 +193,11 @@ fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> 
             // SAFETY: GetAce returned a pointer to an ACCESS_ALLOWED_ACE.
             let (ace_type, mask, ace_sid) = unsafe {
                 let body = ace as *const AccessAllowedAce;
-                ((*body).ace_type, (*body).mask, &(*body).sid_start as *const u32 as PSID)
+                (
+                    (*body).ace_type,
+                    (*body).mask,
+                    &(*body).sid_start as *const u32 as PSID,
+                )
             };
             if ace_type == ACCESS_ALLOWED_ACE_TYPE && mask == rights {
                 // SAFETY: both SIDs are valid and well-formed.
@@ -248,7 +260,11 @@ mod tests {
     fn ace_count(path: &Path) -> io::Result<u16> {
         let wide = crate::backend::windows::token::wide_of(path);
         let (dacl, sd) = read_dacl(&wide)?;
-        let count = if dacl.is_null() { 0 } else { unsafe { (*dacl).AceCount } };
+        let count = if dacl.is_null() {
+            0
+        } else {
+            unsafe { (*dacl).AceCount }
+        };
         // SAFETY: allocated by GetNamedSecurityInfoW.
         unsafe { LocalFree(sd as HLOCAL) };
         Ok(count)
@@ -293,7 +309,11 @@ mod tests {
         // Re-granting after the storm must not add anything.
         let count = ace_count(&dir).unwrap();
         grant_ro(&dir, ac.sid()).unwrap();
-        assert_eq!(ace_count(&dir).unwrap(), count, "concurrent grants duplicated ACEs");
+        assert_eq!(
+            ace_count(&dir).unwrap(),
+            count,
+            "concurrent grants duplicated ACEs"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

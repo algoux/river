@@ -18,8 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use windows_sys::Win32::Storage::FileSystem::{
-    DeleteFileW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW,
-    INVALID_FILE_ATTRIBUTES, RemoveDirectoryW,
+    DeleteFileW, FILE_ATTRIBUTE_REPARSE_POINT, GetFileAttributesW, INVALID_FILE_ATTRIBUTES,
+    RemoveDirectoryW,
 };
 
 use crate::contract::CopyInSource;
@@ -123,7 +123,9 @@ pub(crate) fn sweep_stale_workdirs() {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Some(pid) = owner_pid_of(name) else { continue };
+        let Some(pid) = owner_pid_of(name) else {
+            continue;
+        };
         if pid_is_alive(pid) {
             continue;
         }
@@ -146,7 +148,7 @@ fn owner_pid_of(dir_name: &str) -> Option<u32> {
 fn pid_is_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, WAIT_TIMEOUT};
     use windows_sys::Win32::System::Threading::{
-        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+        OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
     };
     // SAFETY: querying another process by pid; handle closed on success.
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };

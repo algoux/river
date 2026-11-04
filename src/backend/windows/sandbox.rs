@@ -9,7 +9,9 @@ use pyo3::types::PyAny;
 use crate::backend::windows::acl;
 use crate::backend::windows::job::{Job, JobLimits, physical_memory_bytes};
 use crate::backend::windows::monitor::monitor;
-use crate::backend::windows::spawn::{SpawnProfile, env_block, spawn_bare, with_silent_crash_dialog};
+use crate::backend::windows::spawn::{
+    SpawnProfile, env_block, spawn_bare, with_silent_crash_dialog,
+};
 use crate::backend::windows::stdio::{StdinSource, StdioSet};
 use crate::backend::windows::token::AppContainer;
 use crate::backend::windows::workdir::{WorkDir, sweep_stale_workdirs};
@@ -198,7 +200,9 @@ impl Sandbox {
             .unwrap_or(self.ceilings.wall_limit);
         // Effective limits the job enforces (user limit or safety ceiling);
         // the verdict compares measurements against these (S9 evidence).
-        let memory_limit_bytes = limits.memory_limit_bytes.unwrap_or_else(physical_memory_bytes);
+        let memory_limit_bytes = limits
+            .memory_limit_bytes
+            .unwrap_or_else(physical_memory_bytes);
         let cpu_time_limit_ms = limits.cpu_time_limit_ms;
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
@@ -238,8 +242,7 @@ impl Sandbox {
             let mut env_vars: Vec<(String, String)> = vec![
                 (
                     "SystemRoot".to_string(),
-                    std::env::var("SystemRoot")
-                        .unwrap_or_else(|_| r"C:\Windows".to_string()),
+                    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
                 ),
                 (
                     "LOCALAPPDATA".to_string(),
