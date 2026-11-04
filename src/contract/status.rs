@@ -42,6 +42,10 @@ pub struct Status {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+    /// The `stdout_file` / `stderr_file` archive stopped early (the internal
+    /// file-sink safety ceiling was reached and bytes were dropped).
+    pub stdout_file_truncated: bool,
+    pub stderr_file_truncated: bool,
 }
 
 impl Status {
@@ -133,6 +137,18 @@ impl Status {
     #[getter]
     fn stderr_truncated(&self) -> bool {
         self.stderr_truncated
+    }
+
+    /// Whether the `stdout_file` archive stopped early (sink ceiling).
+    #[getter]
+    fn stdout_file_truncated(&self) -> bool {
+        self.stdout_file_truncated
+    }
+
+    /// Whether the `stderr_file` archive stopped early (sink ceiling).
+    #[getter]
+    fn stderr_file_truncated(&self) -> bool {
+        self.stderr_file_truncated
     }
 
     fn __repr__(&self) -> String {

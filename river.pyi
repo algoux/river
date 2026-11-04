@@ -29,10 +29,12 @@ class Status:
     signal: int  # 0 normally, 9 when killed by the sandbox (TLE/MLE/OLE)
     exit_code: int  # raw exit code; NTSTATUS on abnormal Windows termination
     oom_killed: bool  # Linux only: kernel OOM killer reaped a sandbox task
-    stdout: bytes  # truncated to stdout_limit_kb
-    stderr: bytes  # truncated to stderr_limit_kb
+    stdout: bytes  # truncated to stdout_limit_kb (or the internal capture ceiling)
+    stderr: bytes  # truncated to stderr_limit_kb (or the internal capture ceiling)
     stdout_truncated: bool
     stderr_truncated: bool
+    stdout_file_truncated: bool  # stdout_file archive stopped at the sink ceiling
+    stderr_file_truncated: bool  # stderr_file archive stopped at the sink ceiling
 
 
 class Sandbox:
@@ -46,10 +48,12 @@ class Sandbox:
       - everything else on the host is invisible to the sandboxed process.
 
     Internal safety ceilings (mechanism guarantees that stay in place when
-    a run passes `None` limits) default to a 24h wall clock and 64 live
-    processes; `max_wall_secs` / `max_processes` may tighten (never
-    disable) them per Sandbox. Check `river.capabilities()` for the
-    platform capability matrix instead of probing with try/except.
+    a run passes `None` limits) default to a 24h wall clock, 64 live
+    processes, a 64 MiB per-channel memory-capture ceiling and a 1 GiB
+    per-channel file-sink ceiling; `max_wall_secs` / `max_processes` may
+    tighten (never disable) the first two per Sandbox. Check
+    `river.capabilities()` for the platform capability matrix instead of
+    probing with try/except.
 
     Platform support: **Windows and Linux** are implemented (macOS is not
     yet). `rootfs` is supported on Linux only: it replaces the sandbox root

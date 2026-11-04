@@ -140,6 +140,15 @@ mod tests {
     use std::path::Path;
     use std::path::PathBuf;
 
+    /// Generous test ceilings (the monitor tests exercise time/output kills,
+    /// not the capture safety nets).
+    fn test_ceilings() -> crate::contract::StdioCeilings {
+        crate::contract::StdioCeilings {
+            capture_limit_bytes: 1024 * 1024,
+            sink_limit_bytes: 8 * 1024 * 1024,
+        }
+    }
+
     fn run_monitored(
         exe: &str,
         args: &[&str],
@@ -150,7 +159,7 @@ mod tests {
             cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })?;
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings())?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None, None)?;
         let outcome = monitor(&child, &job, wall_limit, None)?;
@@ -267,7 +276,8 @@ mod tests {
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set =
+            StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings()).unwrap();
         let args: Vec<String> = ["/c", "start /b ping -n 30 127.0.0.1 & exit 0"]
             .iter()
             .map(|s| s.to_string())
@@ -318,7 +328,8 @@ mod tests {
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set =
+            StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings()).unwrap();
         let args: Vec<String> = ["/c", "for /l %i in (1,1,20000000) do @rem"]
             .iter()
             .map(|s| s.to_string())
@@ -366,7 +377,8 @@ mod tests {
                  } \
              }",
         );
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set =
+            StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings()).unwrap();
         let child = spawn_bare(&probe, &[], &job, &mut set, None, None).unwrap();
         // Wall watchdog as a backstop: whichever comes first (heap abort or
         // watchdog kill), the evidence must classify MLE.
@@ -405,7 +417,15 @@ mod tests {
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, Some(out_limit), None, None, None).unwrap();
+        let mut set = StdioSet::new(
+            StdinSource::Null,
+            Some(out_limit),
+            None,
+            None,
+            None,
+            test_ceilings(),
+        )
+        .unwrap();
         let ev = set.overflow_event_handle();
         let args: Vec<String> = [
             "/c",

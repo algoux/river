@@ -56,9 +56,12 @@ impl OverflowFlags {
 
 /// One captured channel after the run finished.
 pub(crate) struct ChannelResult {
-    /// Truncated sample: at most `limit` bytes (unbounded without a limit).
+    /// Truncated sample: at most `limit` bytes, or the internal capture
+    /// ceiling when no user limit was set.
     pub(crate) data: Vec<u8>,
     pub(crate) truncated: bool,
+    /// The `*_file` archive stopped early (sink ceiling reached).
+    pub(crate) sink_truncated: bool,
 }
 
 /// One output channel: parent-held read end + archive writer + kill limit.
@@ -66,6 +69,10 @@ struct ChannelPipe {
     read_end: OwnedFd,
     /// Kill threshold in bytes; `None` = no caller-imposed limit.
     limit: Option<u64>,
+    /// Memory-capture ceiling (user limit, or the internal safety ceiling).
+    capture_ceiling: u64,
+    /// File-archive ceiling (internal safety net against filling the disk).
+    sink_ceiling: u64,
     /// Optional full-stream archive (host path, `*_file` parameter).
     archive: Option<File>,
 }
@@ -99,6 +106,7 @@ impl StdioSet {
         stderr_limit_bytes: Option<u64>,
         stdout_file: Option<PathBuf>,
         stderr_file: Option<PathBuf>,
+        ceilings: crate::contract::StdioCeilings,
     ) -> io::Result<Self> {
         // Every parent-held end is CLOEXEC; the child's ends survive only as
         // dup2'd copies on 0/1/2 (dup2 clears CLOEXEC on the target fd).
@@ -115,11 +123,15 @@ impl StdioSet {
                 ChannelPipe {
                     read_end: stdout_read,
                     limit: stdout_limit_bytes,
+                    capture_ceiling: stdout_limit_bytes.unwrap_or(ceilings.capture_limit_bytes),
+                    sink_ceiling: ceilings.sink_limit_bytes,
                     archive: open_archive(stdout_file)?,
                 },
                 ChannelPipe {
                     read_end: stderr_read,
                     limit: stderr_limit_bytes,
+                    capture_ceiling: stderr_limit_bytes.unwrap_or(ceilings.capture_limit_bytes),
+                    sink_ceiling: ceilings.sink_limit_bytes,
                     archive: open_archive(stderr_file)?,
                 },
             ],
@@ -267,8 +279,10 @@ fn ignore_epipe(e: io::Error) -> io::Result<()> {
     }
 }
 
-/// Drain one output channel to EOF: archive everything, keep at most
-/// `limit` bytes as the sample, fire the overflow flag past the limit.
+/// Drain one output channel to EOF: archive up to the sink ceiling, keep at
+/// most `capture_ceiling` bytes as the sample, fire the overflow flag only
+/// past an explicit *user* limit (the internal ceilings are safety nets,
+/// not kill thresholds).
 fn drain_channel(
     ch: ChannelPipe,
     index: usize,
@@ -277,37 +291,53 @@ fn drain_channel(
     let ChannelPipe {
         read_end,
         limit,
+        capture_ceiling,
+        sink_ceiling,
         mut archive,
     } = ch;
     let mut reader = File::from(read_end);
-    let cap = limit.map(|l| l as usize);
-    let mut sample: Vec<u8> = Vec::with_capacity(cap.unwrap_or(4096).min(1 << 20));
+    let mut sample: Vec<u8> = Vec::with_capacity((capture_ceiling as usize).min(1 << 20));
     let mut total: u64 = 0;
+    let mut sink_bytes: u64 = 0;
+    let mut sink_truncated = false;
     let mut buf = [0u8; 8192];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
+        // Archive up to the sink ceiling ("full archive" is the caller
+        // semantic; the ceiling is the safety net so an output fountain
+        // cannot fill the host disk before the run is reaped).
         if let Some(archive) = archive.as_mut() {
-            archive.write_all(&buf[..n])?;
-        }
-        let remaining = cap.map_or(n, |cap| cap.saturating_sub(sample.len()));
-        sample.extend_from_slice(&buf[..remaining.min(n)]);
-        total += n as u64;
-        if let Some(limit) = limit {
-            if total > limit {
-                overflow.fire(index);
+            if sink_bytes < sink_ceiling {
+                let room = ((sink_ceiling - sink_bytes) as usize).min(n);
+                archive.write_all(&buf[..room])?;
+                sink_bytes += room as u64;
+                if room < n {
+                    sink_truncated = true;
+                }
+            } else {
+                sink_truncated = true;
             }
+        }
+        let remaining = (capture_ceiling.saturating_sub(sample.len() as u64) as usize).min(n);
+        sample.extend_from_slice(&buf[..remaining]);
+        total += n as u64;
+        if let Some(limit) = limit
+            && total > limit
+        {
+            overflow.fire(index);
         }
     }
     if let Some(archive) = archive.as_mut() {
         archive.flush()?;
     }
-    let truncated = limit.is_some_and(|limit| total > limit);
+    let truncated = total > capture_ceiling;
     Ok(ChannelResult {
         data: sample,
         truncated,
+        sink_truncated,
     })
 }
 
@@ -347,6 +377,8 @@ mod tests {
         let ch = ChannelPipe {
             read_end,
             limit: Some(1024),
+            capture_ceiling: 1024,
+            sink_ceiling: 1 << 20,
             archive: None,
         };
         let overflow = OverflowFlags::default();
@@ -368,6 +400,8 @@ mod tests {
         let ch = ChannelPipe {
             read_end,
             limit: Some(1024),
+            capture_ceiling: 1024,
+            sink_ceiling: 1 << 20,
             archive: None,
         };
         let overflow = OverflowFlags::default();
@@ -375,5 +409,63 @@ mod tests {
         assert_eq!(r.data.len(), 1024);
         assert!(!r.truncated);
         assert!(!overflow.any());
+    }
+
+    /// No user limit: the internal capture ceiling still caps the sample and
+    /// marks it truncated, and no overflow (kill) fires — "unlimited" is a
+    /// caller-side semantic, never a missing mechanism.
+    #[test]
+    fn capture_ceiling_caps_unlimited_run() {
+        let (read_end, write_end) = pipe_cloexec().unwrap();
+        {
+            let mut w = File::from(write_end);
+            w.write_all(&vec![b'x'; 5000]).unwrap();
+        }
+        let ch = ChannelPipe {
+            read_end,
+            limit: None,
+            capture_ceiling: 1024,
+            sink_ceiling: 1 << 20,
+            archive: None,
+        };
+        let overflow = OverflowFlags::default();
+        let r = drain_channel(ch, 0, &overflow).unwrap();
+        assert_eq!(r.data.len(), 1024);
+        assert!(r.truncated);
+        assert!(!overflow.any());
+    }
+
+    /// The archive stops at the sink ceiling and reports `sink_truncated`
+    /// (the archive file itself receives exactly `sink_ceiling` bytes).
+    #[test]
+    fn archive_stops_at_sink_ceiling() {
+        let (read_end, write_end) = pipe_cloexec().unwrap();
+        {
+            let mut w = File::from(write_end);
+            w.write_all(&vec![b'x'; 5000]).unwrap();
+        }
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "river-sink-test-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let archive = File::create(&path).unwrap();
+        let ch = ChannelPipe {
+            read_end,
+            limit: None,
+            capture_ceiling: 1 << 20,
+            sink_ceiling: 1024,
+            archive: Some(archive),
+        };
+        let r = drain_channel(ch, 0, &OverflowFlags::default()).unwrap();
+        assert!(r.sink_truncated);
+        assert!(!r.truncated); // sample ceiling not reached
+        let written = std::fs::metadata(&path).unwrap().len();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(written, 1024);
     }
 }

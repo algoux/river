@@ -35,16 +35,30 @@ pub(crate) struct Output {
     pub data: Vec<u8>,
     /// Total bytes the channel produced (may exceed `data.len()`).
     pub total: u64,
-    /// Whether bytes beyond the capture limit were dropped.
-    /// NOTE: with `limit == None` capture is currently unbounded; the
-    /// internal safety ceiling will cap this later.
+    /// Whether bytes beyond the capture limit were dropped. With
+    /// `limit == None` the internal safety ceiling applies (capture stops at
+    /// `capture_limit_bytes`); with a user limit the semantics are unchanged.
     pub truncated: bool,
+    /// Bytes written to the optional file sink (stops at the sink ceiling).
+    pub sink_bytes: u64,
+    /// Whether sink output was dropped (sink ceiling reached).
+    pub sink_truncated: bool,
     /// Error from the optional file sink, if any (capture continues past it).
     pub sink_error: Option<io::Error>,
 }
 
+/// Internal safety ceilings for stdio capture (never disableable; see
+/// `contract::StdioCeilings` / `SafetyCeilings`). Re-exported so callers can
+/// pass them without reaching into `contract` directly.
+pub(crate) use crate::contract::StdioCeilings;
+
 struct ReaderSpec {
+    /// User kill threshold (`*_limit_kb`); `None` = no kill threshold.
     limit: Option<u64>,
+    /// Memory-capture ceiling (user limit, or the internal safety ceiling).
+    capture_ceiling: u64,
+    /// File-sink ceiling.
+    sink_ceiling: u64,
     sink: Option<PathBuf>,
     /// Raw handle (as `usize`: raw pointers are not `Send`) of the
     /// output-overflow event (see `StdioSet`); set when the channel's total
@@ -114,6 +128,8 @@ fn reader_thread(mut read: File, spec: ReaderSpec) -> Output {
         data: Vec::new(),
         total: 0,
         truncated: false,
+        sink_bytes: 0,
+        sink_truncated: false,
         sink_error: None,
     };
     let mut sink = spec.sink.as_ref().and_then(|p| match File::create(p) {
@@ -130,35 +146,52 @@ fn reader_thread(mut read: File, spec: ReaderSpec) -> Output {
             Ok(n) => {
                 let chunk = &buf[..n];
                 out.total += n as u64;
+                // File sink: archive up to the ceiling (user semantic: "full
+                // archive"; the ceiling is the internal safety net so an
+                // output fountain cannot fill the host disk before the run
+                // is reaped).
                 if let Some(f) = sink.as_mut()
                     && out.sink_error.is_none()
-                    && let Err(e) = f.write_all(chunk)
                 {
-                    out.sink_error = Some(e);
-                }
-                match spec.limit {
-                    None => out.data.extend_from_slice(chunk),
-                    Some(limit) => {
-                        let room = (limit - out.data.len() as u64).min(n as u64) as usize;
-                        if room > 0 {
-                            out.data.extend_from_slice(&chunk[..room]);
-                        }
-                        // Kill threshold: total output strictly past the
-                        // limit wakes the monitor, which terminates the job
-                        // and classifies OLE. Exactly `limit` bytes is still
-                        // legal (AC), and only then is the capture marked
-                        // truncated (bytes were actually dropped).
-                        if out.total > limit {
-                            out.truncated = true;
-                            if let Some(ev) = spec.overflow_event {
-                                // SAFETY: the event handle is owned by the
-                                // `StdioSet`, which outlives this thread (it
-                                // is dropped by `finish`, after this thread
-                                // joins).
-                                unsafe { SetEvent(ev as HANDLE) };
+                    if out.sink_bytes < spec.sink_ceiling {
+                        let room = (spec.sink_ceiling - out.sink_bytes).min(n as u64) as usize;
+                        if let Err(e) = f.write_all(&chunk[..room]) {
+                            out.sink_error = Some(e);
+                        } else {
+                            out.sink_bytes += room as u64;
+                            if room < n {
+                                out.sink_truncated = true;
                             }
                         }
+                    } else {
+                        out.sink_truncated = true;
                     }
+                }
+                // Memory capture: user limit when set, else the internal
+                // safety ceiling ("unlimited" is a caller-side semantic,
+                // never a missing mechanism).
+                let cap = spec.limit.unwrap_or(spec.capture_ceiling);
+                let room = (cap - out.data.len() as u64).min(n as u64) as usize;
+                if room > 0 {
+                    out.data.extend_from_slice(&chunk[..room]);
+                }
+                // Kill threshold: only an explicit user limit kills. Total
+                // output strictly past the limit wakes the monitor, which
+                // terminates the job and classifies OLE. Exactly `limit`
+                // bytes is still legal (AC), and only then is the capture
+                // marked truncated (bytes were actually dropped).
+                if out.total > cap {
+                    out.truncated = true;
+                }
+                if let Some(limit) = spec.limit
+                    && out.total > limit
+                    && let Some(ev) = spec.overflow_event
+                {
+                    // SAFETY: the event handle is owned by the
+                    // `StdioSet`, which outlives this thread (it
+                    // is dropped by `finish`, after this thread
+                    // joins).
+                    unsafe { SetEvent(ev as HANDLE) };
                 }
             }
             // A pipe that is closed mid-read behaves like EOF.
@@ -178,6 +211,7 @@ impl StdioSet {
         stderr_limit: Option<u64>,
         stdout_file: Option<PathBuf>,
         stderr_file: Option<PathBuf>,
+        ceilings: StdioCeilings,
     ) -> io::Result<Self> {
         // stdin
         let (child_stdin, feeder) = match stdin {
@@ -221,6 +255,8 @@ impl StdioSet {
                 out_read,
                 ReaderSpec {
                     limit: stdout_limit,
+                    capture_ceiling: stdout_limit.unwrap_or(ceilings.capture_limit_bytes),
+                    sink_ceiling: ceilings.sink_limit_bytes,
                     sink: stdout_file,
                     overflow_event: Some(ev),
                 },
@@ -234,6 +270,8 @@ impl StdioSet {
                 err_read,
                 ReaderSpec {
                     limit: stderr_limit,
+                    capture_ceiling: stderr_limit.unwrap_or(ceilings.capture_limit_bytes),
+                    sink_ceiling: ceilings.sink_limit_bytes,
                     sink: stderr_file,
                     overflow_event: Some(ev),
                 },
@@ -290,6 +328,15 @@ mod tests {
     use super::*;
     use std::process::{Command, Stdio};
 
+    /// Generous test ceilings: these tests exercise the *user-limit* paths;
+    /// the ceilings themselves are only safety nets (1 MiB / 8 MiB).
+    fn test_ceilings() -> StdioCeilings {
+        StdioCeilings {
+            capture_limit_bytes: 1024 * 1024,
+            sink_limit_bytes: 8 * 1024 * 1024,
+        }
+    }
+
     /// Run `cmd` with our stdio and collect outputs. Child-facing ends are
     /// moved into the child; judger-side threads are joined by `finish`.
     fn spawn_with(
@@ -299,7 +346,14 @@ mod tests {
         stderr_limit: Option<u64>,
         stdout_file: Option<PathBuf>,
     ) -> io::Result<(Output, Output)> {
-        let mut set = StdioSet::new(stdin, stdout_limit, stderr_limit, stdout_file, None)?;
+        let mut set = StdioSet::new(
+            stdin,
+            stdout_limit,
+            stderr_limit,
+            stdout_file,
+            None,
+            test_ceilings(),
+        )?;
         let child_stdin = std::mem::replace(&mut set.child_stdin, File::open("NUL")?);
         let child_stdout = std::mem::replace(&mut set.child_stdout, File::open("NUL")?);
         let child_stderr = std::mem::replace(&mut set.child_stderr, File::open("NUL")?);
@@ -331,7 +385,8 @@ mod tests {
 
     #[test]
     fn eof_when_child_ends_dropped() {
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set =
+            StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings()).unwrap();
         // Simulate an instantly-exiting child: drop the pipe write ends by
         // replacing them (and the stdin end) with inert NUL handles.
         drop(std::mem::replace(
@@ -426,6 +481,46 @@ mod tests {
         std::fs::remove_file(&path).ok();
         // findstr preserves the input's line endings (LF here)
         assert_eq!(out.data, b"hello\n");
+    }
+
+    /// No user limit: the internal capture ceiling still caps the memory
+    /// sample (and marks it truncated) — "unlimited" is a caller-side
+    /// semantic, never a missing mechanism.
+    #[test]
+    fn capture_ceiling_caps_unlimited_run() {
+        let mut set = StdioSet::new(
+            StdinSource::Null,
+            None,
+            None,
+            None,
+            None,
+            StdioCeilings {
+                capture_limit_bytes: 100,
+                sink_limit_bytes: 1024 * 1024,
+            },
+        )
+        .unwrap();
+        // Move all three child-facing ends into the child: a parent-held
+        // stderr/stdin write end would keep the reader threads from seeing
+        // EOF (this test must not leak one).
+        let child_stdin = std::mem::replace(&mut set.child_stdin, File::open("NUL").unwrap());
+        let child_stdout = std::mem::replace(&mut set.child_stdout, File::open("NUL").unwrap());
+        let child_stderr = std::mem::replace(&mut set.child_stderr, File::open("NUL").unwrap());
+        let mut child = Command::new("cmd")
+            .args([
+                "/c",
+                "for /l %i in (1,1,200) do @echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])
+            .stdin(Stdio::from(child_stdin))
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::from(child_stderr))
+            .spawn()
+            .unwrap();
+        child.wait().unwrap();
+        let (out, _) = set.finish().unwrap();
+        assert_eq!(out.data.len(), 100);
+        assert!(out.truncated);
+        assert!(out.total > 100);
     }
 
     #[test]

@@ -1029,7 +1029,18 @@ mod tests {
     use crate::backend::linux::stdio::{StdinSource, StdioSet};
 
     fn set() -> StdioSet {
-        StdioSet::new(StdinSource::Null, None, None, None, None).unwrap()
+        StdioSet::new(
+            StdinSource::Null,
+            None,
+            None,
+            None,
+            None,
+            crate::contract::StdioCeilings {
+                capture_limit_bytes: 1024 * 1024,
+                sink_limit_bytes: 8 * 1024 * 1024,
+            },
+        )
+        .unwrap()
     }
 
     fn env() -> Vec<(String, String)> {

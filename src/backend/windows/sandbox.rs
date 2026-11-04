@@ -12,7 +12,7 @@ use crate::backend::windows::monitor::monitor;
 use crate::backend::windows::spawn::{
     SpawnProfile, env_block, spawn_bare, with_silent_crash_dialog,
 };
-use crate::backend::windows::stdio::{StdinSource, StdioSet};
+use crate::backend::windows::stdio::{StdinSource, StdioCeilings, StdioSet};
 use crate::backend::windows::token::AppContainer;
 use crate::backend::windows::workdir::{WorkDir, sweep_stale_workdirs};
 use crate::contract::status::Status;
@@ -228,6 +228,10 @@ impl Sandbox {
         let cwd_rel = spec.cwd.clone();
         let env_map = spec.env.clone().unwrap_or_default();
         let runtimes = self.runtimes.clone();
+        let stdio_ceilings = StdioCeilings {
+            capture_limit_bytes: self.ceilings.capture_limit_bytes,
+            sink_limit_bytes: self.ceilings.file_sink_limit_bytes,
+        };
 
         // Blocking pipeline with the GIL released.
         let result = py.detach(move || -> io::Result<_> {
@@ -296,6 +300,7 @@ impl Sandbox {
                 stderr_limit,
                 stdout_file,
                 stderr_file,
+                stdio_ceilings,
             )?;
             // The child inherits the judger's error mode: suppress the
             // Windows "serious problem" crash dialog for sandboxed
@@ -363,6 +368,8 @@ impl Sandbox {
                 status.stderr = err.data;
                 status.stdout_truncated = out.truncated;
                 status.stderr_truncated = err.truncated;
+                status.stdout_file_truncated = out.sink_truncated;
+                status.stderr_file_truncated = err.sink_truncated;
                 Ok(status)
             }
             Err(e) => {

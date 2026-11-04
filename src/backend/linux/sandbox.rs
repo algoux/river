@@ -322,6 +322,7 @@ impl Sandbox {
                 stderr_limit,
                 stdout_file,
                 stderr_file,
+                self.ceilings.into(),
             )?;
             // Per-run cgroup: limits must exist before the program runs.
             // pids.max covers the supervisor too (+1), so the program's own
@@ -430,6 +431,8 @@ impl Sandbox {
                 status.stderr = err.data;
                 status.stdout_truncated = out.truncated;
                 status.stderr_truncated = err.truncated;
+                status.stdout_file_truncated = out.sink_truncated;
+                status.stderr_file_truncated = err.sink_truncated;
                 Ok(status)
             }
             Err(e) => {

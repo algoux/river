@@ -468,8 +468,24 @@ pub(crate) fn spawn_bare(
 mod tests {
     use super::*;
     use crate::backend::windows::job::{JobLimits, brief_pause};
-    use crate::backend::windows::stdio::StdinSource;
+    use crate::backend::windows::stdio::{StdinSource, StdioCeilings, StdioSet};
     use std::time::Instant;
+
+    /// Generous test ceilings: spawn tests exercise process mechanics, not
+    /// the stdio safety nets (1 MiB capture / 8 MiB sink).
+    fn new_stdio(stdin: StdinSource) -> io::Result<StdioSet> {
+        StdioSet::new(
+            stdin,
+            None,
+            None,
+            None,
+            None,
+            StdioCeilings {
+                capture_limit_bytes: 1024 * 1024,
+                sink_limit_bytes: 8 * 1024 * 1024,
+            },
+        )
+    }
 
     fn limits() -> JobLimits {
         JobLimits {
@@ -520,7 +536,7 @@ mod tests {
         crate::backend::windows::stdio::Output,
     )> {
         let job = Job::new(limits)?;
-        let mut set = StdioSet::new(stdin, None, None, None, None)?;
+        let mut set = new_stdio(stdin)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None, None)?;
         child.resume()?;
@@ -560,7 +576,7 @@ mod tests {
             max_processes: 2,
         };
         let job = Job::new(&tight).unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set = new_stdio(StdinSource::Null).unwrap();
         let args: Vec<String> = ["/c", "for /l %i in (1,1,50) do @start /b cmd /c exit"]
             .iter()
             .map(|s| s.to_string())
@@ -578,7 +594,7 @@ mod tests {
     #[test]
     fn terminate_kills_the_tree() {
         let job = Job::new(&limits()).unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set = new_stdio(StdinSource::Null).unwrap();
         let args: Vec<String> = ["/n", "10", "127.0.0.1"]
             .iter()
             .map(|s| s.to_string())
@@ -597,7 +613,7 @@ mod tests {
     #[test]
     fn peak_memory_is_tracked() {
         let job = Job::new(&limits()).unwrap();
-        let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
+        let mut set = new_stdio(StdinSource::Null).unwrap();
         let args: Vec<String> = ["/c", "echo hi"].iter().map(|s| s.to_string()).collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
         child.resume().unwrap();
@@ -653,7 +669,7 @@ mod tests {
             crate::backend::windows::stdio::Output,
         )> {
             let job = Job::new(&limits())?;
-            let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+            let mut set = new_stdio(StdinSource::Null)?;
             let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             let child = spawn_bare(
                 &comspec,
@@ -804,7 +820,7 @@ mod tests {
             let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
             {
                 let job = Job::new(&limits())?;
-                let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+                let mut set = new_stdio(StdinSource::Null)?;
                 let args = [
                     "-O".to_string(),
                     "--edition=2021".to_string(),
@@ -835,7 +851,7 @@ mod tests {
             crate::backend::windows::stdio::Output,
         )> {
             let job = Job::new(&limits())?;
-            let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
+            let mut set = new_stdio(StdinSource::Null)?;
             let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
             let child = spawn_bare(&probe_exe, &argvec, &job, &mut set, cwd, security)?;
             child.resume()?;

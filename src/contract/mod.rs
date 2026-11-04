@@ -93,6 +93,14 @@ pub(crate) struct SafetyCeilings {
     /// Cap on simultaneously alive processes per run (main process
     /// included). Default: 64.
     pub max_processes: u32,
+    /// Per-channel memory-capture ceiling applied when the caller passes no
+    /// `stdout_limit_kb` / `stderr_limit_kb` (the sample is capped and marked
+    /// truncated; no kill). Default: 64 MiB.
+    pub capture_limit_bytes: u64,
+    /// Per-channel file-sink ceiling (`stdout_file` / `stderr_file` archive)
+    /// so an output fountain cannot fill the host disk before the run is
+    /// reaped. Default: 1 GiB.
+    pub file_sink_limit_bytes: u64,
 }
 
 impl Default for SafetyCeilings {
@@ -100,6 +108,30 @@ impl Default for SafetyCeilings {
         SafetyCeilings {
             wall_limit: Duration::from_secs(24 * 3600),
             max_processes: 64,
+            capture_limit_bytes: 64 * 1024 * 1024,
+            file_sink_limit_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// Internal safety ceilings for stdio capture, derived from
+/// [`SafetyCeilings`]. They apply when the caller passes no explicit
+/// `stdout_limit_kb` / `stderr_limit_kb` ("unlimited" is a caller-side
+/// semantic, never a missing mechanism).
+#[derive(Clone, Copy)]
+pub(crate) struct StdioCeilings {
+    /// Memory-capture ceiling per channel when no user `*_limit_kb` is set
+    /// (the sample is capped and marked truncated; no kill).
+    pub capture_limit_bytes: u64,
+    /// File-sink ceiling per channel (`stdout_file` / `stderr_file` archive).
+    pub sink_limit_bytes: u64,
+}
+
+impl From<SafetyCeilings> for StdioCeilings {
+    fn from(c: SafetyCeilings) -> Self {
+        StdioCeilings {
+            capture_limit_bytes: c.capture_limit_bytes,
+            sink_limit_bytes: c.file_sink_limit_bytes,
         }
     }
 }
@@ -232,14 +264,26 @@ mod tests {
         let c = SafetyCeilings::default();
         assert_eq!(c.wall_limit, Duration::from_secs(24 * 3600));
         assert_eq!(c.max_processes, 64);
+        assert_eq!(c.capture_limit_bytes, 64 * 1024 * 1024);
+        assert_eq!(c.file_sink_limit_bytes, 1024 * 1024 * 1024);
     }
 
     /// Rooted-but-not-absolute paths must be rejected everywhere a
     /// sandbox-relative key is accepted: `Path::join` replaces the base down
     /// to the drive root for them, which escaped the working directory.
+    ///
+    /// Backslash roots only exist on Windows (`"\foo"` is a plain filename on
+    /// Unix); the platform-neutral cases are always exercised.
     #[test]
     fn rooted_paths_are_rejected() {
-        for key in ["/foo", "\\foo", "/a/b", "C:foo", "a:/b"] {
+        for key in ["/foo", "/a/b", "C:foo", "a:/b"] {
+            assert!(
+                validate_rel_key("k", key).is_err(),
+                "{key:?} must be rejected"
+            );
+        }
+        #[cfg(windows)]
+        for key in ["\\foo", "\\\\foo"] {
             assert!(
                 validate_rel_key("k", key).is_err(),
                 "{key:?} must be rejected"
@@ -250,12 +294,15 @@ mod tests {
     #[test]
     fn cwd_shares_the_rel_key_validation() {
         let mut s = spec();
-        s.cwd = Some("..\\..".to_string());
-        assert!(validate(&s).is_err());
-        s.cwd = Some("/etc".to_string());
-        assert!(validate(&s).is_err());
-        s.cwd = Some("C:\\Windows".to_string());
-        assert!(validate(&s).is_err());
+        for bad in ["..", "a/..", "/etc", "C:\\Windows"] {
+            s.cwd = Some(bad.to_string());
+            assert!(validate(&s).is_err(), "cwd {bad:?} must be rejected");
+        }
+        #[cfg(windows)]
+        {
+            s.cwd = Some("..\\..".to_string());
+            assert!(validate(&s).is_err());
+        }
         s.cwd = Some("sub/dir".to_string());
         assert!(validate(&s).is_ok());
     }
