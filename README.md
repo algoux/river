@@ -69,6 +69,13 @@ the sandbox killed the process).
 - `copy_in` files are read-only for the program.
 - Memory limits apply to *commit*, not RSS — a large `malloc` that is never
   written does not trigger `MLE`.
+- The memory limit is enforced both per process and for the whole process
+  tree (`JobMemoryLimit`): a multi-process program's total commit counts
+  against the same `memory_limit_kb` budget (same semantics as the Linux
+  cgroup).
+- `stdout_limit_kb=None` does not mean unbounded: the returned sample is
+  capped at the internal 64 MiB/channel ceiling (`*_truncated` set), and
+  `*_file` archives stop at 1 GiB/channel (`*_file_truncated` set).
 - Child processes are allowed by design; the guarantees are the 64-process cap
   and residual detection (`SE`).
 - Timing jitter is larger than on Linux; allow 5-10% when using limits as
@@ -156,6 +163,10 @@ returns the same facts for deployment diagnosis.
 - Children are allowed (bounded by `pids.max`); a program that hands work to
   a child which would outlive it cannot: the pid namespace kills descendants
   when the main process exits.
+- The workdir is 0700 and `copy_in` files are 0440, both owned by the sandbox
+  uid: unrelated host processes are locked out, but another process running
+  as the *same* uid (`nobody`) shares owner rights — per-run uids would be
+  needed for full cross-run isolation.
 
 ## Testing
 

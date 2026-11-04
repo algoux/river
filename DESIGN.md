@@ -88,14 +88,17 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 | `copy_in` | 键为沙箱相对路径 | 程序对文件默认**只读**；值可为宿主机目录（递归投放，跳过链接） |
 | `copy_out` | 键为沙箱相对路径，值为宿主机路径 | 运行结束后回收产物（目录递归）；**永不跟随符号链接/junction**；源缺失则跳过 |
 | `copy_out_limit_kb` | — | 回收总字节配额：超限停止回收（超限文件不收、无半截文件）并判 `OLE` |
-| `stdout_limit_kb` / `stderr_limit_kb` | — | 击杀阈值：超过即杀并判 OLE |
-| `stdout_file` / `stderr_file` | 宿主机路径 | 完整输出留档（截至被杀为止）；与 `r.stdout`（截断 bytes）并存 |
+| `stdout_limit_kb` / `stderr_limit_kb` | — | 击杀阈值：超过即杀并判 OLE；`None` 时仍受内部采样上限（64 MiB/通道）约束 |
+| `stdout_file` / `stderr_file` | 宿主机路径 | 完整输出留档（截至被杀为止）；内部留档上限 1 GiB/通道，超出即停止并置 `*_file_truncated`；与 `r.stdout`（截断 bytes）并存 |
 
 **限制语义与机制的区分**：`None` 表示*调用方不设限*，但后端始终存在内部安全
-上限（wall clock ≤ 24h、内存 ≤ 物理内存）——"无限"不能意味着防护机制不存在。
+上限（wall clock ≤ 24h、内存 ≤ 物理内存、单通道采样 ≤ 64 MiB、单通道留档
+≤ 1 GiB）——"无限"不能意味着防护机制不存在。
 
-参数校验：`stdin` 与 `stdin_file` 互斥；`copy_in` 键必须是沙箱内相对路径
-（拒绝绝对路径、盘符、`..` 逃逸）；`copy_in` 值必须是 bytes 或宿主机路径。
+参数校验：`stdin` 与 `stdin_file` 互斥；`copy_in`/`copy_out` 键与 `cwd` 必须
+是沙箱内相对路径（只允许普通路径分量：拒绝绝对路径、有根路径、盘符、`.`/`..`
+分量——在 Windows 上 `"/foo"` 是有根但非绝对路径，`Path::join` 会把它解析到
+盘符根，曾是宿主文件外泄/写入缺口）；`copy_in` 值必须是 bytes 或宿主机路径。
 校验失败抛 Python 异常，不走 `SE`。
 
 ### 2.3 Status 字段
@@ -109,7 +112,8 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 | `exit_code` | 原始退出码；异常终止时为 NTSTATUS 值 |
 | `oom_killed` | 是否被内核 OOM killer 收割（Linux：`memory.events` `oom_kill>0`；Windows 恒为 false） |
 | `stdout` / `stderr` | 截断后的输出 |
-| `stdout_truncated` / `stderr_truncated` | 各通道独立的截断标志 |
+| `stdout_truncated` / `stderr_truncated` | 各通道独立的内存采样截断标志 |
+| `stdout_file_truncated` / `stderr_file_truncated` | `*_file` 留档因内部上限（1 GiB/通道）提前停止的标志 |
 
 判定含义：`AC` 正常退出；`TLE` CPU/墙钟超限；`MLE` 内存超限；`OLE` 输出超限；
 `RE` 非零退出/异常终止；`SE` 沙箱自身错误或检测到残余子孙。
