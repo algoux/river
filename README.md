@@ -76,8 +76,9 @@ the sandbox killed the process).
   clear the read-only attribute and rewrite its input). The program may still
   delete/rename an entry inside its own cwd — that changes nothing it reads
   and cannot leak; see DESIGN §3.3.
-- AppContainer profiles come from a fixed slot pool (at most 16 per
-  session, `river.sandbox.<session>.<slot>`). Each run leases a slot
+- AppContainer profiles come from a fixed slot pool (at most 60 per
+  session, `river.sandbox.<session>.<slot>`; see
+  `capabilities()["max_concurrent_runs"]`). Each run leases a slot
   exclusively and its `%LOCALAPPDATA%\Packages\<profile>\AC` folder is wiped
   before and after the run, so no file survives between runs. A run blocks
   while every slot is leased (concurrency is capped at the pool size, which

@@ -53,7 +53,8 @@ Linux 的两种文件系统模式（机制细节见
 river.capabilities()
 # {'platform': 'windows', 'rootfs': False,
 #  'default_max_processes': 64,
-#  'internal_wall_limit_secs': 86400}
+#  'internal_wall_limit_secs': 86400,
+#  'max_concurrent_runs': 16}
 ```
 
 调用方（OJ 调度层）据此程序化适配平台差异，无需 try/except 探测。

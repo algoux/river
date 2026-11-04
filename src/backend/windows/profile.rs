@@ -23,7 +23,8 @@
 //!   most `slots` package SIDs per session, and each gets its `runtimes`
 //!   grants once;
 //! - concurrent runs are capped at `slots` (default: CPU parallelism clamped
-//!   to 4..=16), which matches what a judge actually needs.
+//!   to 4..=60); the ceiling is exposed through `river.capabilities()` as
+//!   `max_concurrent_runs`.
 
 use std::io;
 use std::path::PathBuf;
@@ -39,10 +40,15 @@ use windows_sys::Win32::System::Threading::{
 use super::token::{AppContainer, wide_of_text};
 use super::workdir::wipe_dir_contents;
 
-/// Upper bound on pool slots (also keeps `WaitForMultipleObjects` well below
-/// its 64-handle limit).
-const MAX_SLOTS: usize = 16;
+/// Upper bound on pool slots. The wait is batched (see `acquire`) to stay
+/// under `WaitForMultipleObjects`' hard 64-handle-per-call limit, with
+/// headroom for the process/overflow handles waited on elsewhere.
+const MAX_SLOTS: usize = 60;
 const MIN_SLOTS: usize = 4;
+
+/// Handles per `WaitForMultipleObjects` call in `acquire` (the API hard
+/// limit is 64; keep one slot of headroom).
+const WAIT_BATCH: usize = 63;
 
 struct Slot {
     name: String,
@@ -109,7 +115,7 @@ fn session_id() -> u32 {
     sid
 }
 
-fn slot_count() -> usize {
+pub(crate) fn slot_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(MIN_SLOTS)
@@ -187,34 +193,54 @@ impl Drop for SlotGuard {
 
 /// Lease a slot for one run, creating its profile and wiping its package
 /// directory first. Blocks while all slots are busy.
+///
+/// The slot mutexes are waited on in batches of [`WAIT_BATCH`]: a single
+/// `WaitForMultipleObjects` call cannot take more than 64 handles, so a pool
+/// larger than that must be chunked. With an INFINITE wait each batch call
+/// blocks until one of *its* mutexes frees, so in practice the first batch
+/// always satisfies the lease — the loop exists so a future timed variant
+/// could scan on. Leases are biased toward low slot indexes; runs are
+/// interchangeable, so no fairness guarantee is needed.
 pub(crate) fn acquire() -> io::Result<SlotGuard> {
     let pool = pool()?;
     let handles: Vec<HANDLE> = pool.slots.iter().map(|slot| slot.mutex).collect();
-    // SAFETY: handles are valid; wait for any one of them to be signaled.
-    let rc = unsafe {
-        WaitForMultipleObjects(
-            handles.len() as u32,
-            handles.as_ptr(),
-            0, // bWaitAll = FALSE
-            INFINITE,
-        )
-    };
-    if rc == WAIT_FAILED {
-        return Err(io::Error::last_os_error());
+    let count = pool.slots.len();
+    let mut index = None;
+    for start in (0..count).step_by(WAIT_BATCH) {
+        let end = (start + WAIT_BATCH).min(count);
+        let batch = &handles[start..end];
+        // SAFETY: handles are valid; wait for any one of them to be signaled.
+        let rc = unsafe {
+            WaitForMultipleObjects(
+                batch.len() as u32,
+                batch.as_ptr(),
+                0, // bWaitAll = FALSE
+                INFINITE,
+            )
+        };
+        if rc == WAIT_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        // A slot whose previous owner was killed comes back as
+        // WAIT_ABANDONED_0+i: the mutex is ours now (its state may be
+        // inconsistent, but the only state is the package folder, which is
+        // wiped below).
+        let batch_len = (end - start) as u32;
+        if (WAIT_OBJECT_0..WAIT_OBJECT_0 + batch_len).contains(&rc) {
+            index = Some(start + (rc - WAIT_OBJECT_0) as usize);
+            break;
+        } else if (WAIT_ABANDONED_0..WAIT_ABANDONED_0 + batch_len).contains(&rc) {
+            index = Some(start + (rc - WAIT_ABANDONED_0) as usize);
+            break;
+        } else {
+            return Err(io::Error::other(
+                "WaitForMultipleObjects: unexpected result",
+            ));
+        }
     }
-    // A slot whose previous owner was killed comes back as WAIT_ABANDONED_0+i:
-    // the mutex is ours now (its state may be inconsistent, but the only
-    // state is the package folder, which is wiped below).
-    let count = pool.slots.len() as u32;
-    let index = if (WAIT_OBJECT_0..WAIT_OBJECT_0 + count).contains(&rc) {
-        (rc - WAIT_OBJECT_0) as usize
-    } else if (WAIT_ABANDONED_0..WAIT_ABANDONED_0 + count).contains(&rc) {
-        (rc - WAIT_ABANDONED_0) as usize
-    } else {
-        return Err(io::Error::other(
-            "WaitForMultipleObjects: unexpected result",
-        ));
-    };
+    // Every batch contains at least one slot and INFINITE waits never time
+    // out, so a full pass cannot end without a winner.
+    let index = index.expect("batched slot wait fell through");
 
     let slot = &pool.slots[index];
     let lease = (|| -> io::Result<()> {

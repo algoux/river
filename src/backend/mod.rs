@@ -10,6 +10,10 @@ pub(crate) struct Capabilities {
     pub rootfs: bool,
     pub default_max_processes: u32,
     pub internal_wall_limit_secs: u64,
+    /// Hard ceiling on simultaneously running `run()` calls per session
+    /// (`u32::MAX` = no fixed ceiling). Windows: the AppContainer profile
+    /// slot pool size; Linux: unbounded (each run gets its own cgroup).
+    pub max_concurrent_runs: u32,
 }
 
 #[cfg(target_os = "linux")]
@@ -40,6 +44,7 @@ pub(crate) fn capabilities() -> Capabilities {
             rootfs: false,
             default_max_processes: 0,
             internal_wall_limit_secs: 0,
+            max_concurrent_runs: 0,
         }
     }
 }

@@ -80,5 +80,7 @@ pub(crate) fn capabilities() -> Capabilities {
         rootfs: false, // Windows processes always load system DLLs from the real System32
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
+        // The AppContainer profile slot pool is the concurrency ceiling.
+        max_concurrent_runs: profile::slot_count() as u32,
     }
 }

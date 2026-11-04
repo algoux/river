@@ -26,6 +26,9 @@ use pyo3::types::PyDict;
 /// - `default_max_processes`: default live-process cap per run
 /// - `internal_wall_limit_secs`: the safety wall-clock ceiling for
 ///   caller-unlimited runs
+/// - `max_concurrent_runs`: hard ceiling on simultaneously running `run()`
+///   calls per session (`4294967295` = no fixed ceiling; Windows reports
+///   its AppContainer profile slot pool size here)
 #[pyfunction]
 fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let caps = backend::capabilities();
@@ -34,6 +37,7 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     dict.set_item("rootfs", caps.rootfs)?;
     dict.set_item("default_max_processes", caps.default_max_processes)?;
     dict.set_item("internal_wall_limit_secs", caps.internal_wall_limit_secs)?;
+    dict.set_item("max_concurrent_runs", caps.max_concurrent_runs)?;
     Ok(dict.unbind())
 }
 

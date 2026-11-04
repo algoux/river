@@ -19,6 +19,8 @@ pub(crate) fn capabilities() -> Capabilities {
         rootfs: false,
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
+        // Placeholder: no implementation, so no meaningful ceiling to report.
+        max_concurrent_runs: u32::MAX,
     }
 }
 
