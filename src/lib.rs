@@ -23,8 +23,6 @@ use pyo3::types::PyDict;
 /// Keys (frozen contract):
 /// - `platform`: `"windows" | "linux" | "macos"`
 /// - `rootfs`: whether `Sandbox(rootfs=...)` is supported
-/// - `network_isolation`: whether network access is denied inside the sandbox
-/// - `concurrent_runs`: whether one `Sandbox` may be used from several threads
 /// - `default_max_processes`: default live-process cap per run
 /// - `internal_wall_limit_secs`: the safety wall-clock ceiling for
 ///   caller-unlimited runs
@@ -34,8 +32,6 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("platform", caps.platform)?;
     dict.set_item("rootfs", caps.rootfs)?;
-    dict.set_item("network_isolation", caps.network_isolation)?;
-    dict.set_item("concurrent_runs", caps.concurrent_runs)?;
     dict.set_item("default_max_processes", caps.default_max_processes)?;
     dict.set_item("internal_wall_limit_secs", caps.internal_wall_limit_secs)?;
     Ok(dict.unbind())

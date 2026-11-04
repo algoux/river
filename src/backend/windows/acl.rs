@@ -14,7 +14,7 @@
 //! and not duplicated, so re-granting a `runtimes` directory on every run
 //! never grows its DACL.
 //!
-//! Concurrency (S12): the DACL update is a **read-modify-write** and is not
+//! Concurrency: the DACL update is a **read-modify-write** and is not
 //! atomic — two threads granting the same directory concurrently can lose
 //! one of the ACEs (last writer wins). All grants are therefore serialized
 //! through a process-global lock: the operation is a couple of microseconds,
@@ -274,7 +274,7 @@ mod tests {
         ace_already_present(path, sid, rights)
     }
 
-    /// S12: the DACL update is a read-modify-write; concurrent grants on the
+    /// The DACL update is a read-modify-write; concurrent grants on the
     /// same directory must not lose the ACE (the old unsynchronized version
     /// raced and could drop the grant entirely).
     #[test]

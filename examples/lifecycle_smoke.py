@@ -1,4 +1,4 @@
-"""S11 smoke: exception paths + __exit__ hardening.
+"""Lifecycle smoke: exception paths + __exit__ hardening.
 
 1. Killing the judger process tree mid-run leaves no orphan sandboxed
    processes (KILL_ON_JOB_CLOSE reaps them) while the per-run directory
@@ -12,7 +12,7 @@ not the pid of the interpreter (and thus not the pid our Rust code uses for
 the per-run dir name). We therefore diff-glob the temp dir to find the
 per-run dir and read its owner pid from the name.
 
-Run: uv run python examples/s11_smoke.py
+Run: uv run python examples/lifecycle_smoke.py
 """
 
 import glob
@@ -120,7 +120,7 @@ with sb:
     os.rmdir(foreign)
 
     os.remove(src)
-    print("S11 smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
+    print("lifecycle smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
     sys.exit(0 if all(results) else 1)
 
 

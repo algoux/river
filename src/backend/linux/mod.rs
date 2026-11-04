@@ -1,7 +1,7 @@
 //! Linux backend: mount/pid/net/ipc/uts/cgroup namespaces (identity &
-//! filesystem, network isolation) + cgroups v2 (resources & process tree) +
-//! seccomp allowlist + a judger-death watchdog. See docs/linux-backend.md
-//! for the mechanism details and decision log.
+//! filesystem, unconditional network denial) + cgroups v2 (resources &
+//! process tree) + seccomp allowlist + a judger-death watchdog. See
+//! docs/linux-backend.md for the mechanism details and decision log.
 
 pub mod cgroup;
 pub mod monitor;
@@ -22,11 +22,9 @@ pub(crate) fn capabilities() -> Capabilities {
     let ceilings = SafetyCeilings::default();
     Capabilities {
         platform: "linux",
-        // First stage runs the per-run tmpfs root (DESIGN §1); a caller
-        // supplied rootfs image is stage L6 (docs/linux-plan.md §4).
+        // The per-run tmpfs root is the sandbox filesystem (DESIGN §1); a
+        // caller-supplied rootfs image is not implemented yet.
         rootfs: false,
-        network_isolation: true, // network namespace: no interfaces => no network
-        concurrent_runs: true,   // Sandbox is frozen; every run keeps its state in locals
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
     }

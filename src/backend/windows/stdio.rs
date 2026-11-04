@@ -36,7 +36,7 @@ pub(crate) struct Output {
     /// Total bytes the channel produced (may exceed `data.len()`).
     pub total: u64,
     /// Whether bytes beyond the capture limit were dropped.
-    /// NOTE(S12): with `limit == None` capture is currently unbounded; the
+    /// NOTE: with `limit == None` capture is currently unbounded; the
     /// internal safety ceiling will cap this later.
     pub truncated: bool,
     /// Error from the optional file sink, if any (capture continues past it).

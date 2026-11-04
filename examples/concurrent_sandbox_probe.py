@@ -1,9 +1,9 @@
-"""S12 extra: each thread builds its own Sandbox (concurrent stale-dir sweeps).
+"""Probe: each thread builds its own Sandbox (concurrent stale-dir sweeps).
 
-The sweep walks the shared temp dir; two threads sweeping the same
-directory used to race and surface as ERROR_SHARING_VIOLATION.
+The sweep walks the shared temp dir; concurrent sweeps must be serialized,
+not surface as ERROR_SHARING_VIOLATION.
 
-Run: uv run python examples/s12_probe.py
+Run: uv run python examples/concurrent_sandbox_probe.py
 """
 
 import os
@@ -43,7 +43,7 @@ def main():
     for e in errors[:5]:
         print("   ", e)
     ok = len(statuses) == 80 and not errors
-    print("S12 per-thread Sandbox:", "ALL PASS" if ok else "FAILURES PRESENT")
+    print("per-thread Sandbox:", "ALL PASS" if ok else "FAILURES PRESENT")
     sys.exit(0 if ok else 1)
 
 

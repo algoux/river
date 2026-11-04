@@ -285,7 +285,7 @@ mod tests {
         set.finish().unwrap();
     }
 
-    /// Compile a tiny native probe with rustc (same pattern as the S8
+    /// Compile a tiny native probe with rustc (same pattern as the
     /// mitigation probes in spawn.rs).
     fn compile_probe(dir: &Path, code: &str) -> PathBuf {
         let src = dir.join("probe.rs");
@@ -501,7 +501,7 @@ mod tests {
         dir
     }
 
-    /// S12: eight threads driving the full spawn→monitor→verdict pipeline
+    /// Eight threads driving the full spawn→monitor→verdict pipeline
     /// at once. Every run must produce its own, independent outcome — no
     /// cross-talk between runs (zero shared state).
     #[test]

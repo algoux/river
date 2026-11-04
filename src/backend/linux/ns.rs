@@ -17,7 +17,7 @@
 //! monitor — its `wait4` rusage aggregates the whole tree (A's waited
 //! descendants included), and killing A kills the process group.
 //!
-//! Fork-safety rules (docs/linux-plan.md §2.2), enforced by construction:
+//! Fork-safety rules, enforced by construction:
 //! - every path/string the child side needs is built **before** the fork
 //!   (`MountPlan`, `CString`s, NULL-terminated pointer arrays);
 //! - A and B do only raw syscalls between fork and exec — no allocation, no

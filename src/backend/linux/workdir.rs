@@ -5,9 +5,9 @@
 //! removed on drop — also on every error path (RAII, mirroring the Windows
 //! `WorkDir` guard).
 //!
-//! `copy_in` read-only enforcement (docs/linux-plan.md §2.1): files are
-//! written/copyed as root and chmod'd 0444; the sandboxed program runs as
-//! `nobody` (uid drop, stage L3) and cannot rewrite them. No ACL machinery
+//! `copy_in` read-only enforcement: files are
+//! written/copied as root and chmod'd 0444; the sandboxed program runs as
+//! `nobody` (uid drop) and cannot rewrite them. No ACL machinery
 //! is needed on Linux.
 
 use std::fs;

@@ -108,7 +108,7 @@ impl Drop for WorkDir {
 /// including ours — are never touched. Names without a parseable owner pid
 /// (other tools' `river-*` dirs) are skipped.
 ///
-/// Concurrency (S12): two threads sweeping at once would race on the same
+/// Concurrency: two threads sweeping at once would race on the same
 /// directory (one deletes it while the other walks it) and surface as
 /// `ERROR_SHARING_VIOLATION`. The sweep is therefore serialized through a
 /// process-global lock.

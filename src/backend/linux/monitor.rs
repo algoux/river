@@ -25,7 +25,7 @@ use crate::contract::verdict::KillOrigin;
 pub(crate) struct Outcome {
     pub(crate) kill: KillOrigin,
     /// Raw exit code: `WEXITSTATUS`, or `128 + WTERMSIG` on a signal
-    /// termination (docs/linux-plan.md §2.4).
+    /// termination.
     pub(crate) exit_code: u32,
     /// CPU time of the reaped tree, in milliseconds (rusage).
     pub(crate) cpu_time_ms: u64,

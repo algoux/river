@@ -56,7 +56,7 @@ class Sandbox:
 
     Platform support: **Windows and Linux** are implemented (macOS is not
     yet). `rootfs` is not supported on Windows (processes always resolve
-    system DLLs from the real `System32`) nor yet on Linux (stage L6) — use
+    system DLLs from the real `System32`) nor on Linux — use
     `runtimes` there instead.
 
     Linux specifics: the process runs as `nobody` inside mount/pid/net/ipc/
@@ -110,11 +110,14 @@ def capabilities() -> _Capabilities:
 
     - `platform`: `"windows" | "linux" | "macos"`
     - `rootfs`: whether `Sandbox(rootfs=...)` is supported
-    - `network_isolation`: whether network access is denied in the sandbox
-    - `concurrent_runs`: whether one `Sandbox` may run on several threads
     - `default_max_processes`: default live-process cap per run
     - `internal_wall_limit_secs`: safety wall-clock ceiling for
       caller-unlimited runs
+
+    Network access is denied unconditionally on every platform, and a
+    `Sandbox` may always be used from several threads concurrently (it is
+    frozen; every run keeps its state in locals) — neither is a capability
+    key.
     """
     ...
 

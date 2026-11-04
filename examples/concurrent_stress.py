@@ -1,4 +1,4 @@
-"""S12 stress: 8-way concurrency x 50 rounds + timing-jitter baseline.
+"""Stress: 8-way concurrency x 50 rounds + timing-jitter baseline.
 
 Verifies:
 1. 8 threads x 50 rounds of concurrent runs — every run must produce a
@@ -8,7 +8,7 @@ Verifies:
    5-10% relaxation on Windows).
 3. No leftover working directories after the stress run.
 
-Run: uv run python examples/s12_stress.py
+Run: uv run python examples/concurrent_stress.py
 """
 
 import glob
@@ -103,7 +103,7 @@ def main():
     print(f"    samples: {samples}")
 
     all_ok = ok and not leftover and jitter_ok
-    print("S12 stress:", "ALL PASS" if all_ok else "FAILURES PRESENT")
+    print("concurrency stress:", "ALL PASS" if all_ok else "FAILURES PRESENT")
     sys.exit(0 if all_ok else 1)
 
 

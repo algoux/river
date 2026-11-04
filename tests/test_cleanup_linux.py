@@ -1,4 +1,4 @@
-"""Cleanup & lifecycle tests for the Linux backend (stage L5).
+"""Cleanup & lifecycle tests for the Linux backend.
 
 What is asserted here (mirroring docs/windows-backend.md §7 item 9):
 

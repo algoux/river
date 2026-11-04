@@ -40,8 +40,6 @@ pub(crate) fn capabilities() -> Capabilities {
     Capabilities {
         platform: "windows",
         rootfs: false, // Windows processes always load system DLLs from the real System32
-        network_isolation: true, // AppContainer: no capability => no network
-        concurrent_runs: true, // Sandbox is frozen; every run keeps its state in locals
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
     }

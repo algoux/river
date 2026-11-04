@@ -1,4 +1,4 @@
-# S8 冒烟：mitigation policies + 禁网 —— 攻击清单前 7 项。
+# 冒烟：mitigation policies + 禁网 —— Windows 攻击清单前 7 项。
 # 场景（每项在沙箱内探针验证，不是只看 API 返回值）：
 #   1. 写 C:\Windows\Temp / 桌面 → 拒绝（AppContainer + ACL）
 #   2. 读写 cwd 外文件（宿主目录）→ 拒绝
@@ -6,7 +6,7 @@
 #   4. socket 连外网 → 拒绝（无 capability，默认断网）
 #   5. 全局 Windows hook 注入 → 失败（EXTENSION_POINT_DISABLE）
 #   6. win32k 系统调用（SetCursorPos）→ 拒绝（WIN32K_SYSTEM_CALL_DISABLE）
-#   7. while(1)/sleep/输出喷泉 → TLE/TLE/OLE（OLE 判定在 S10）
+#   7. while(1)/sleep/输出喷泉 → TLE/TLE/OLE
 import os
 import sys
 
@@ -120,4 +120,4 @@ with sandbox:
     assert r3.status == "TLE" and r3.signal == 9, (r3.status, r3.signal)
     print("watchdog:", r3.status, r3.signal)
 
-print("S8 smoke OK")
+print("attack smoke OK")

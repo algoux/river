@@ -1,6 +1,6 @@
 //! Evidence-driven verdict classification (a pure, platform-neutral function).
 //!
-//! S9 principle: **evidence beats exit code**. A sandbox-enforced limit or a
+//! Core principle: **evidence beats exit code**. A sandbox-enforced limit or a
 //! sandbox kill is authoritative; the raw exit code of a terminated process
 //! must not downgrade the verdict (a killed process often exits with an
 //! arbitrary code — on Windows an NTSTATUS — that would otherwise read as

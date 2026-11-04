@@ -12,12 +12,10 @@ uv run ./examples/example.py
 ## Documentation
 
 - [DESIGN.md](DESIGN.md) — sandbox model, API contract, design decisions
-- [docs/windows-backend.md](docs/windows-backend.md) — Windows backend details
-  (AppContainer + Job Object + mitigation policies), decision log, pitfalls
-- [docs/linux-backend.md](docs/linux-backend.md) — Linux backend details
-  (namespaces + pivot_root + cgroups v2 + watchdog), decision log, pitfalls
-- [docs/linux-plan.md](docs/linux-plan.md) — Linux backend development plan
-  and progress log (frozen decisions, staged tasks L1–L6)
+- [docs/windows-backend.md](docs/windows-backend.md) — Windows backend
+  mechanisms (AppContainer + Job Object + mitigation policies)
+- [docs/linux-backend.md](docs/linux-backend.md) — Linux backend mechanisms
+  (namespaces + pivot_root + cgroups v2 + watchdog)
 
 ## Status
 
@@ -25,14 +23,13 @@ uv run ./examples/example.py
 |---|---|
 | Windows | ✅ implemented (AppContainer + Job Object) |
 | Linux | ✅ implemented (namespaces + pivot_root + cgroups v2) |
-| macOS | 待更新 |
+| macOS | not implemented |
 
 Both backends share the same frozen contract (`tests/test_conformance.py` runs
 unchanged on both); platform-specific probes live in `tests/test_attack.py`
 (Windows) and `tests/test_attack_linux.py` / `tests/test_cleanup_linux.py`
-(Linux). The Linux backend is stage L5 of
-[docs/linux-plan.md](docs/linux-plan.md); `rootfs` (stage L6) is not
-implemented yet, so `capabilities()["rootfs"]` is `false`.
+(Linux). `rootfs` is not implemented, so `capabilities()["rootfs"]` is
+`false`.
 
 ## Windows capability matrix
 
@@ -91,7 +88,7 @@ cgroup writes need `CAP_SYS_ADMIN`).
 |---|---|
 | Identity | uid/gid drop to `nobody` + empty capability sets + `no_new_privs` + non-dumpable |
 | Filesystem | mount namespace + `pivot_root` into a per-run tmpfs; `runtimes` and the system dirs bind-mounted read-only with `nosuid,nodev` |
-| Network | empty network namespace: no interfaces at all (loopback included) |
+| Network | always denied (unconditional): empty network namespace — no interfaces at all (loopback included) |
 | Process namespace | pid / cgroup namespaces: the program is PID 1, host pids and the host cgroup tree are invisible |
 | System calls | seccomp-bpf allowlist, default-deny with `EPERM` (no sockets, no userns/mount/ptrace/keyctl/io_uring/flock side channels) |
 | Process tree | cgroup `pids.max` + `kill(-pgid)` + `cgroup.kill` |
@@ -121,8 +118,8 @@ returns the same facts for deployment diagnosis.
 
 ### Known limitations
 
-- `rootfs` is not implemented yet (stage L6): `capabilities()["rootfs"]` is
-  false and passing `rootfs=` raises `ValueError`.
+- `rootfs` is not implemented: `capabilities()["rootfs"]` is false and
+  passing `rootfs=` raises `ValueError`.
 - Requires cgroups v2 (`/sys/fs/cgroup`) and Linux 5.9+ (`close_range`);
   `memory.peak`/`memory.swap.max` require 5.19+/5.0+.
 - Memory limits are RSS + page cache — reading a large file counts against

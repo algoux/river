@@ -1,6 +1,6 @@
-"""S10 smoke: OLE kill threshold + output archive/limit separation.
+"""Output-limit smoke: OLE kill threshold + output archive/limit separation.
 
-Run: uv run python examples/s10_smoke.py
+Run: uv run python examples/output_limit_smoke.py
 """
 
 import sys
@@ -74,7 +74,7 @@ def main():
         f"status={r.status} captured={len(r.stdout)}B truncated={r.stdout_truncated}",
     ))
 
-    print("S10 smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
+    print("output-limit smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
     sys.exit(0 if all(results) else 1)
 
 

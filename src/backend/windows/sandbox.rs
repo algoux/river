@@ -43,7 +43,7 @@ use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, validate};
 /// system DLLs from the real `System32`): passing it raises `ValueError`.
 /// See `river.capabilities()` for the programmatic capability matrix.
 ///
-/// Concurrency (S12): the class is `frozen` — it holds no mutable state
+/// Concurrency: the class is `frozen` — it holds no mutable state
 /// (only the configured `runtimes` and the safety ceilings), and every run
 /// keeps all of its state in locals. `run()` may therefore be called
 /// concurrently from several Python threads on the same `Sandbox`; per-run
@@ -96,7 +96,7 @@ impl Sandbox {
         slf
     }
 
-    /// Exit protocol (S11): everything a `run` leaves behind is owned by
+    /// Exit protocol: everything a `run` leaves behind is owned by
     /// per-run RAII guards — the `Job` (KILL_ON_JOB_CLOSE kills any still
     /// alive processes), the `WorkDir` (removed on drop, reparse-safe), and
     /// the stdio handles — so a normal block exit has nothing left to do.
@@ -199,7 +199,8 @@ impl Sandbox {
             .map(Duration::from_millis)
             .unwrap_or(self.ceilings.wall_limit);
         // Effective limits the job enforces (user limit or safety ceiling);
-        // the verdict compares measurements against these (S9 evidence).
+        // the verdict compares measurements against these (contract-layer
+        // evidence).
         let memory_limit_bytes = limits
             .memory_limit_bytes
             .unwrap_or_else(physical_memory_bytes);
@@ -223,7 +224,7 @@ impl Sandbox {
                 workdir.provision(files)?;
             }
 
-            // S7: AppContainer identity + ACL grants. The child adopts the
+            // AppContainer identity + ACL grants. The child adopts the
             // AppContainer at spawn time; its visible filesystem is exactly
             // the granted surface (cwd rw, runtimes ro, system DLLs default).
             let appcontainer = AppContainer::create_or_open()?;
@@ -236,7 +237,7 @@ impl Sandbox {
             // Whitelisted environment: base + caller overrides (incremental
             // merge). TEMP/TMP point into the private cwd. LOCALAPPDATA is
             // REQUIRED for an AppContainer spawn: without it CreateProcessW
-            // fails with ERROR_ENVVAR_NOT_FOUND (203) — see S7 踩坑记录.
+            // fails with ERROR_ENVVAR_NOT_FOUND (203).
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
             let mut env_vars: Vec<(String, String)> = vec![
@@ -286,7 +287,7 @@ impl Sandbox {
                     Some(&profile),
                 )
             })?;
-            // S10: the reader threads fire the overflow event past an output
+            // The reader threads fire the overflow event past an output
             // kill threshold; the monitor waits on it alongside the process
             // and reaps the job (verdict OLE) instead of waiting for exit.
             let outcome = monitor(
@@ -302,7 +303,7 @@ impl Sandbox {
 
         match result {
             Ok((outcome, peak_bytes, out, err)) => {
-                // Evidence-priority verdict (S9): the backend reports what it
+                // Evidence-priority verdict (contract layer): the backend reports what it
                 // observed; the contract classifies it — sandbox kills and
                 // limit evidence outrank the raw exit code of a killed process.
                 let evidence = RunEvidence {

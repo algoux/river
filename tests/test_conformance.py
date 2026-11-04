@@ -26,28 +26,52 @@ import river
 REQUIRED_CAPABILITY_KEYS = {
     "platform",
     "rootfs",
-    "network_isolation",
-    "concurrent_runs",
     "default_max_processes",
     "internal_wall_limit_secs",
 }
+
+# Network denial is an unconditional guarantee on every platform, not a
+# capability switch: the key must stay out of the frozen contract.
+REMOVED_CAPABILITY_KEYS = {"network_isolation"}
 
 
 def test_capabilities_has_the_frozen_keys():
     caps = river.capabilities()
     missing = REQUIRED_CAPABILITY_KEYS - set(caps)
     assert not missing, f"capabilities() is missing frozen keys: {missing}"
+    resurrected = REMOVED_CAPABILITY_KEYS & set(caps)
+    assert not resurrected, (
+        f"removed capability keys reappeared: {resurrected} "
+        "(network denial is unconditional, not a capability)"
+    )
 
 
 def test_capabilities_values_are_well_typed():
     caps = river.capabilities()
     assert caps["platform"] in ("windows", "linux", "macos")
-    for key in ("rootfs", "network_isolation", "concurrent_runs"):
-        assert isinstance(caps[key], bool), f"{key} must be bool"
+    assert isinstance(caps["rootfs"], bool), "rootfs must be bool"
     assert isinstance(caps["default_max_processes"], int)
     assert caps["default_max_processes"] > 0
     assert isinstance(caps["internal_wall_limit_secs"], int)
     assert caps["internal_wall_limit_secs"] > 0
+
+
+def test_one_sandbox_may_be_used_from_several_threads(sandbox, python_exe):
+    """Concurrency is an unconditional contract promise (not a capability
+    key): the class is frozen and every run keeps its state in locals, so
+    concurrent `run()` calls on one `Sandbox` must stay isolated."""
+    import concurrent.futures
+
+    def one(i: int):
+        r = sandbox.run(python_exe, ["-c", f"print({i})"])
+        return i, r
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(one, range(16)))
+
+    for i, r in results:
+        assert r.status == "AC", (i, r)
+        assert r.stdout.strip() == str(i).encode(), (i, r)
 
 
 # ---------------------------------------------------------------------------

@@ -1,8 +1,7 @@
-"""S9 smoke: watchdog + TLE/MLE complete verdicts.
+"""Limits smoke: watchdog + TLE/MLE complete verdicts.
 
-Acceptance cases from docs/windows-backend.md S9 row:
-    while(1) -> TLE, sleep(inf) -> TLE, malloc bomb -> MLE
-Run: uv run python examples/s9_smoke.py
+Cases: while(1) -> TLE, sleep(inf) -> TLE, malloc bomb -> MLE.
+Run: uv run python examples/limits_smoke.py
 """
 
 import sys
@@ -71,7 +70,7 @@ def main():
             memory_limit_kb=64 * 1024, wall_time_limit_ms=10000),
         "AC",
     ))
-    print("S9 smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
+    print("limits smoke:", "ALL PASS" if all(results) else "FAILURES PRESENT")
     sys.exit(0 if all(results) else 1)
 
 

@@ -4,12 +4,12 @@ The Linux counterpart of `tests/test_attack.py` (which is Windows-only).
 Every probe runs *inside* the sandbox and reports what it observed — a
 leak is a failure even if the surrounding API returned an error.
 
-Surface under test (docs/linux-plan.md §4 L3):
+Surface under test:
 
   1. the visible filesystem is exactly the private tree (no host dirs)
   2. host files outside the private cwd are invisible
   3. /etc secrets are unreadable (uid drop to nobody)
-  4. network namespace: no interfaces -> no connection, no DNS
+  4. network denial (unconditional): empty namespace -> no connection, no DNS
   5. /proc is a fresh pid namespace (program is PID 1)
   6. mounts are read-only / non-writable for the unprivileged program
   7. /sys and /proc/sys are not reachable
@@ -346,7 +346,7 @@ def test_dev_has_the_standard_nodes(sandbox, python_exe):
 
 def test_child_processes_are_allowed(sandbox, python_exe):
     # Wrapper/interpreter processes are part of the contract (DESIGN §3.6):
-    # children are allowed, the *count* is bounded (stage L4).
+    # children are allowed, the *count* is bounded.
     r = _probe(
         sandbox,
         python_exe,

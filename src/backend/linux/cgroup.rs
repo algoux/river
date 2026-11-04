@@ -1,4 +1,4 @@
-//! cgroups v2 integration (stage L4, docs/linux-plan.md §2.3).
+//! cgroups v2 integration.
 //!
 //! Every run gets a private cgroup under `/sys/fs/cgroup/river/`:
 //!

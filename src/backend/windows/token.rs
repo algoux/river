@@ -7,9 +7,10 @@
 //! SID is what the ACL layer (acl.rs) grants file access to.
 //!
 //! An AppContainer without capabilities has no network access: the firewall
-//! blocks it by default, which is our network isolation (agreed policy).
+//! blocks it by default. Network denial is therefore unconditional (it is
+//! not a configurable capability).
 //!
-//! Concurrency (S12): `CreateAppContainerProfile` **mutates system state**
+//! Concurrency: `CreateAppContainerProfile` **mutates system state**
 //! (it writes the AppContainer mapping registry key and the profile
 //! folder); concurrent callers corrupt each other — observed under 8-way
 //! concurrency as `ERROR_KEY_DELETED`, `ERROR_INVALIDARG`,
@@ -295,7 +296,7 @@ mod tests {
         assert_ne!(base.sid_string().unwrap(), other.sid_string().unwrap());
     }
 
-    /// S12: profile creation is the one *mutating* profile API — concurrent
+    /// Profile creation is the one *mutating* profile API — concurrent
     /// callers must not corrupt it. This is the regression test for the
     /// 8-way concurrency failure (`ERROR_KEY_DELETED` / `ERROR_INVALIDARG` /
     /// `ERROR_FILE_NOT_FOUND`): every thread must get the same SID.
@@ -317,7 +318,7 @@ mod tests {
         }
     }
 
-    /// S12: a *fresh* profile name created concurrently by many threads must
+    /// A *fresh* profile name created concurrently by many threads must
     /// end up with exactly one profile (and one SID).
     #[test]
     fn concurrent_creation_of_a_fresh_profile_is_serialized() {

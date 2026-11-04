@@ -27,8 +27,7 @@ def main() -> int:
     caps = river.capabilities()
     print("capabilities:", caps)
     assert caps["platform"] == "linux", caps
-    assert caps["rootfs"] is False, "rootfs is stage L6"
-    assert caps["network_isolation"] is True, caps
+    assert caps["rootfs"] is False, "rootfs is not implemented"
 
     facts = river.doctor()
     print("doctor:", {k: facts[k] for k in facts if k != "controllers"})

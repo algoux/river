@@ -44,15 +44,15 @@ fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
 
 /// Linux sandbox.
 ///
-/// The sandbox filesystem model (first stage, docs/linux-plan.md §2.1):
+/// The sandbox filesystem model:
 /// - a fresh private writable working directory per `run`, pivoted into a
 ///   mount namespace so the rest of the host filesystem is invisible;
 /// - each path in `runtimes` exposed read-only (+execute) via bind mounts;
 /// - `copy_in` files provisioned into the working directory (read-only for
 ///   the program: root-owned, mode 0444, program runs as nobody);
-/// - network access denied (empty network namespace).
+/// - network access denied unconditionally (empty network namespace).
 ///
-/// `rootfs` (a caller-supplied root tree) is stage L6: passing it raises
+/// `rootfs` (a caller-supplied root tree) is not implemented: passing it raises
 /// `ValueError` for now — check `river.capabilities()`.
 ///
 /// Concurrency: the class is `frozen` — it holds no mutable state (only the
@@ -82,7 +82,7 @@ impl Sandbox {
     ) -> PyResult<Self> {
         if rootfs.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "rootfs is not supported yet on Linux (stage L6); use runtimes=[...] to \
+                "rootfs is not supported on Linux; use runtimes=[...] to \
                  expose read-only runtime directories instead (check river.capabilities())",
             ));
         }
@@ -205,7 +205,7 @@ impl Sandbox {
         };
         // Effective limits the sandbox enforces (user limit or safety
         // fallback); the verdict compares measurements against these
-        // (contract S9 evidence).
+        // (contract-layer evidence).
         let memory_limit_bytes = spec
             .memory_limit_kb
             .map(|kb| kb.saturating_mul(1024))
@@ -235,8 +235,8 @@ impl Sandbox {
         };
 
         // Blocking pipeline with the GIL released. All threads (stdio
-        // feeder/readers) are created inside this closure, after the fork —
-        // the fork-safety rule from docs/linux-plan.md §2.2.
+        // feeder/readers) are created inside this closure, after the fork
+        // (fork-safety rule: no threads before the fork).
         let result = py.detach(move || -> io::Result<_> {
             // Per-run working directory: the only writable place the program
             // sees. `WorkDir` removes itself on drop (also on error paths).
@@ -329,7 +329,7 @@ impl Sandbox {
 
         match result {
             Ok((outcome, residual, oom_killed, cpu_used_ms, peak_bytes, out, err, overflowed)) => {
-                // Evidence-priority verdict (contract S9): the backend
+                // Evidence-priority verdict (contract layer): the backend
                 // reports what it observed; the contract classifies it.
                 //
                 // Output-limit evidence is *direct observation*: a fast

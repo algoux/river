@@ -271,7 +271,7 @@ pub(crate) fn env_block(vars: &[(String, String)]) -> Vec<u16> {
 /// between `CreateProcessW` and the successful job assignment, the child is
 /// terminated on drop. Closing its handles alone is NOT enough — a suspended
 /// process survives handle closure and would leak forever as an orphan
-/// outside any job (S11).
+/// outside any job.
 struct SuspendedGuard {
     /// `None` once the child has been handed off successfully (disarmed).
     child: Option<SpawnedChild>,
@@ -609,7 +609,7 @@ mod tests {
         set.finish().unwrap();
     }
 
-    /// S7: the child really becomes an AppContainer — writes inside the
+    /// The child really becomes an AppContainer — writes inside the
     /// granted cwd succeed, writes to C:\ are denied, and it runs on the
     /// whitelisted environment (cmd needs SystemRoot to even start).
     #[test]
@@ -623,7 +623,7 @@ mod tests {
         let dir = WorkDir::create().unwrap();
         acl::grant_rw(dir.path(), ac.sid()).unwrap();
 
-        // Whitelist base. Learned in S7: an AppContainer spawn REQUIRES
+        // Whitelist base: an AppContainer spawn REQUIRES
         // LOCALAPPDATA in the environment block — without it CreateProcessW
         // fails with ERROR_ENVVAR_NOT_FOUND (203). TEMP/TMP point inside the
         // granted cwd.
@@ -710,7 +710,7 @@ mod tests {
         );
     }
 
-    /// S8: the mitigation policies are *enforced by the kernel*, verified
+    /// The mitigation policies are *enforced by the kernel*, verified
     /// with behavioral probes from the child itself (not just attribute API
     /// return values):
     /// - EXTENSION_POINT_DISABLE: `SetWindowsHookExW` must fail with

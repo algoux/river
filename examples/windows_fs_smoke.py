@@ -1,4 +1,4 @@
-# S7 冒烟：AppContainer + ACL 端到端验证。
+# 冒烟：AppContainer + ACL 文件系统面端到端验证。
 # 场景：写 cwd 成功 / 写 C:\ 失败 / 读 runtimes 成功 / python via runtimes 跑通
 import os
 import sys
@@ -55,7 +55,7 @@ with sandbox:
     assert checks["write-root"] == "denied", checks
     assert checks["read-runtimes"].startswith("ok"), checks
     assert checks["write-runtimes"] == "denied", checks
-    print("S7 smoke OK")
+    print("filesystem smoke OK")
 
 # 清理误留文件（若隔离失效会存在）
 try:

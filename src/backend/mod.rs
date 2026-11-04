@@ -8,8 +8,6 @@
 pub(crate) struct Capabilities {
     pub platform: &'static str,
     pub rootfs: bool,
-    pub network_isolation: bool,
-    pub concurrent_runs: bool,
     pub default_max_processes: u32,
     pub internal_wall_limit_secs: u64,
 }
@@ -36,8 +34,6 @@ pub(crate) fn capabilities() -> Capabilities {
         Capabilities {
             platform: "unsupported",
             rootfs: false,
-            network_isolation: false,
-            concurrent_runs: false,
             default_max_processes: 0,
             internal_wall_limit_secs: 0,
         }

@@ -7,8 +7,8 @@
 //! `execve`; the compiled BPF program is passed across the fork, so the
 //! child itself never allocates.
 //!
-//! What the allowlist closes on top of namespaces (docs/linux-plan.md §2.3,
-//! the "not isolated by namespaces" set):
+//! What the allowlist closes on top of namespaces (the
+//! "not isolated by namespaces" set):
 //!
 //! - `keyctl`/`add_key`/`request_key` — uid-scoped keyring persistence
 //! - `AF_VSOCK` / any socket creation (`socket` denied; `socketpair` stays
@@ -87,7 +87,8 @@ pub(crate) fn apply(program: &Program) -> libc::c_int {
 
 /// Syscalls the sandboxed program may call. Deliberately absent: everything
 /// in the "closes" list of the module docs, plus socket/AF_VSOCK and the
-/// network syscalls (the network namespace has no interfaces anyway).
+/// network syscalls (network denial is unconditional: no interfaces in the
+/// network namespace, and no way to create a socket).
 #[cfg(target_arch = "x86_64")]
 const ALLOW: &[libc::c_long] = &[
     // --- process / signals ------------------------------------------------

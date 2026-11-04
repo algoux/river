@@ -7,7 +7,7 @@
 //! complete stream up to the kill, and the returned buffer is the truncated
 //! sample (at most `limit` bytes) with a per-channel truncation flag.
 //!
-//! Fork-safety note (docs/linux-plan.md §2.2): the pipes are created before
+//! Fork-safety note: the pipes are created before
 //! the fork, but **all threads are started after it** — the reader and
 //! feeder threads exist only in the parent, and the parent drops the child
 //! ends immediately after the fork so EOF semantics work.

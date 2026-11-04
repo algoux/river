@@ -1,5 +1,5 @@
-//! Mount-namespace construction primitives (stage L3, docs/linux-plan.md
-//! §2.1). Everything here runs **in the forked supervisor, between fork and
+//! Mount-namespace construction primitives. Everything here runs **in the
+//! forked supervisor, between fork and
 //! exec** — so it must be allocation-free and only use raw syscalls: all
 //! paths arrive pre-built as `CString`s from the parent (see `MountPlan` in
 //! `ns.rs`).
