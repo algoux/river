@@ -370,6 +370,30 @@ fn remove_dir_no_follow(dir: &Path) {
     let _ = remove_dir_no_follow_checked(dir);
 }
 
+/// Remove the *contents* of `dir`, keeping the directory itself. Used to
+/// wipe a profile slot's package folder between runs; reparse points are
+/// removed as links, never followed.
+pub(crate) fn wipe_dir_contents(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type();
+        let is_dir = file_type.as_ref().map(|t| t.is_dir()).unwrap_or(false);
+        let is_reparse = file_type.as_ref().map(|t| t.is_symlink()).unwrap_or(false)
+            || get_attributes(&path)
+                .map(|a| a & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+                .unwrap_or(false);
+        if is_reparse {
+            let _ = delete_reparse_point(&path);
+        } else if is_dir {
+            remove_dir_no_follow_checked(&path)?;
+        } else {
+            delete_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Recursively delete a directory **without following reparse points**.
 ///
 /// A junction inside the working directory is removed as a link (its
@@ -734,4 +758,3 @@ mod tests {
         fs::remove_dir_all(&victim).ok();
     }
 }
-

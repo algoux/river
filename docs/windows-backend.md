@@ -12,8 +12,12 @@ Windows 沙箱由三层原生机制叠加而成，缺一层即有对应攻击面
 Chromium/Edge 同款机制。子进程在创建时携带 AppContainer SID 直接成为
 AppContainer——不需要创建降权令牌，普通令牌即可。
 
-- 使用固定 profile（复用，避免反复创建/删除），令牌不含任何 capability
-  → **默认断网**，零防火墙配置
+- 使用**槽位 profile 池**（`river.sandbox.<session>.<slot>`，每会话最多 16 个）：
+  每个 run 独占一个槽，取用时擦除其 `%LOCALAPPDATA%\Packages\<profile>\AC`
+  目录、结束释放时再擦一次——固定 profile 曾让 run 之间通过该目录持久通信
+  （实测 run1 写的文件 run2 可读、宿主永久可见）。不逐 run 建/删 profile：
+  实测 create+delete ≈ 6.6ms/run 且被全局锁串行化，槽位复用的 per-run 成本
+  ≈ 0.5ms。令牌不含任何 capability → **默认断网**，零防火墙配置
 - 文件系统天然收窄：AppContainer 令牌默认几乎不可见任何目录，可见面 =
   显式授权的部分
 - 无需管理员权限，毫秒级创建
@@ -115,7 +119,13 @@ commit 限额让超额分配**失败**而非成功，因此峰值天然停在限
 
 - **并发安全**：`run()` 可并发调用，per-run 状态全在局部；`Sandbox` 无共享
   可变状态（声明为 `frozen`）。所有写系统状态的操作（profile 创建、DACL
-  授权、过期目录清扫）按进程串行化——全仓可变全局仅 5 处。
+  授权、过期目录清扫）都串行化：进程内用锁，槽位租约用**会话级命名互斥体**
+  （`Local\river.sandbox.profile.<session>.<slot>`），所以同一会话里的多个
+  judger 进程也不会同时擦除同一个 profile。
+- **profile 生命周期**：槽位 profile 首次使用时创建、之后一直复用（每会话
+  ≤16 个）；进程崩溃时内核自动释放命名互斥体（下一次租约看到
+  `WAIT_ABANDONED`，照常接管并擦除包目录）。旧版本遗留的固定
+  `river.sandbox` profile 不再使用，可手工删除。
 - **生命周期靠守卫**：`KILL_ON_JOB_CLOSE` 保证 judger 崩溃时全家终止；临时
   目录由 `Drop` 删除；judger 被硬杀时残留的目录由下次构造时的清扫回收
   （只清属主进程已死的目录）。

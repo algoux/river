@@ -9,11 +9,11 @@ use pyo3::types::PyAny;
 use crate::backend::windows::acl;
 use crate::backend::windows::job::{Job, JobLimits, physical_memory_bytes};
 use crate::backend::windows::monitor::monitor;
+use crate::backend::windows::profile;
 use crate::backend::windows::spawn::{
     SpawnProfile, env_block, spawn_bare, with_silent_crash_dialog,
 };
 use crate::backend::windows::stdio::{StdinSource, StdioCeilings, StdioSet};
-use crate::backend::windows::token::AppContainer;
 use crate::backend::windows::workdir::{WorkDir, sweep_stale_workdirs};
 use crate::contract::status::Status;
 use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
@@ -242,7 +242,13 @@ impl Sandbox {
             // AppContainer identity + ACL grants. The child adopts the
             // AppContainer at spawn time; its visible filesystem is exactly
             // the granted surface (cwd rw, runtimes ro, system DLLs default).
-            let appcontainer = AppContainer::create_or_open()?;
+            //
+            // The profile comes from a fixed slot pool: the lease wipes the
+            // slot's `%LOCALAPPDATA%\Packages\<profile>\AC` before the run and
+            // again on release, so no file survives between runs (that folder
+            // is fully writable by the sandboxed identity).
+            let slot = profile::acquire()?;
+            let appcontainer = slot.app()?;
             let sid = appcontainer.sid();
             acl::grant_rw(workdir.path(), sid)?;
             // `copy_in` first inherits the cwd's read/write ACE, then gets an

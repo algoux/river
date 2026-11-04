@@ -102,6 +102,41 @@ def test_copy_in_is_immutable_for_the_program(sandbox, python_exe):
 
 @pytest.mark.skipif(
     not sys.platform.startswith("win"),
+    reason="AppContainer profile slots are Windows-only",
+)
+def test_profile_state_does_not_survive_between_runs(sandbox, python_exe):
+    """The per-run profile slot is wiped: nothing a run writes under
+    `%LOCALAPPDATA%` may be visible to the next run (or on the host).
+
+    A fixed AppContainer profile used to keep that folder (and everything the
+    program wrote into it) for the lifetime of the machine.
+    """
+    write = (
+        "import os\n"
+        "p = os.path.join(os.environ['LOCALAPPDATA'], 'leak.txt')\n"
+        "open(p, 'w').write('leak')\n"
+        "print(os.environ['LOCALAPPDATA'])\n"
+    )
+    r1 = sandbox.run(python_exe, ["-c", write])
+    assert r1.status == "AC", r1.stderr
+    local = r1.stdout.decode().strip().splitlines()[-1]
+    assert "river.sandbox." in local, local
+    assert not os.path.exists(os.path.join(local, "leak.txt")), (
+        "run state survived on disk"
+    )
+
+    read = (
+        "import os\n"
+        "p = os.path.join(os.environ['LOCALAPPDATA'], 'leak.txt')\n"
+        "print('SEEN' if os.path.exists(p) else 'CLEAN')\n"
+    )
+    r2 = sandbox.run(python_exe, ["-c", read])
+    assert r2.status == "AC", r2.stderr
+    assert b"CLEAN" in r2.stdout, r2.stdout
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
     reason="Windows directory copy_in uses an inheritable protected DACL",
 )
 def test_directory_copy_in_is_immutable_and_cleaned_up(sandbox, python_exe, tmp_path):

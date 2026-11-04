@@ -3,8 +3,10 @@
 //! A child becomes an AppContainer at process creation time via the
 //! `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute (the Chromium
 //! approach) — no separate restricted token is needed. This module owns the
-//! AppContainer *profile*: it is created once, reused across runs, and its
-//! SID is what the ACL layer (acl.rs) grants file access to.
+//! profile *primitives*: creation (serialized), SID derivation and SID
+//! lifetime. The run path does not use a single global profile: it leases a
+//! slot from the fixed pool in `profile.rs`, which wipes that slot's package
+//! folder before and after every run.
 //!
 //! An AppContainer without capabilities has no network access: the firewall
 //! blocks it by default. Network denial is therefore unconditional (it is
@@ -72,7 +74,9 @@ unsafe extern "system" {
     fn ConvertSidToStringSidW(sid: PSID, stringsid: *mut *mut u16) -> i32;
 }
 
-/// Profile name reused across runs (must be stable for SID derivation).
+/// Profile name used by the backend unit tests (the run path uses the
+/// per-slot pool in `profile.rs`).
+#[cfg_attr(not(test), allow(dead_code))]
 const PROFILE_NAME: &str = "river.sandbox";
 
 /// Serializes profile *creation* (the only mutating profile API).
@@ -89,8 +93,17 @@ pub(crate) struct AppContainer {
     sid: PSID,
 }
 
+// SAFETY: the SID is immutable after creation and only read (ACL grants,
+// spawn attributes) from other threads; it is freed exactly once, on drop of
+// the owning `Arc`/value. The profile pool shares one `Arc<AppContainer>` per
+// slot across runs.
+unsafe impl Send for AppContainer {}
+unsafe impl Sync for AppContainer {}
+
 impl AppContainer {
-    /// Open the sandbox profile, creating it on first use.
+    /// Open the fixed test profile, creating it on first use (tests only;
+    /// the run path leases a slot from `profile.rs`).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn create_or_open() -> io::Result<Self> {
         Self::create_or_open_named(PROFILE_NAME)
     }
@@ -236,6 +249,14 @@ fn mark_profile_created(name: &str) {
 // Re-exported for sibling modules (acl.rs / spawn.rs build wide strings too).
 pub(crate) fn wide_of(path: &Path) -> Vec<u16> {
     path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// NUL-terminated UTF-16 for a plain string (named mutexes, etc.).
+pub(crate) fn wide_of_text(text: &str) -> Vec<u16> {
+    OsStr::new(text)
         .encode_wide()
         .chain(std::iter::once(0))
         .collect()

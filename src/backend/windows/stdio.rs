@@ -372,9 +372,7 @@ mod tests {
             status
         };
         assert!(status.success());
-        let r = set.finish();
-        eprintln!("[dbg] finish done");
-        r
+        set.finish()
     }
 
     fn temp_path(name: &str) -> PathBuf {

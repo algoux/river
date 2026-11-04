@@ -41,7 +41,7 @@ Everything below is verified by the test suite
 
 | Capability | Mechanism |
 |---|---|
-| Identity | AppContainer (profile `river.sandbox`) |
+| Identity | AppContainer (per-run profile slot `river.sandbox.<session>.<slot>`) |
 | Filesystem | private writable cwd per run; `runtimes` read-only via ACE grants |
 | Network | denied by default (no capability) |
 | Registry | denied (HKCU/HKLM) |
@@ -71,6 +71,13 @@ the sandbox killed the process).
   clear the read-only attribute and rewrite its input). The program may still
   delete/rename an entry inside its own cwd — that changes nothing it reads
   and cannot leak; see DESIGN §3.3.
+- AppContainer profiles come from a fixed slot pool (at most 16 per
+  session, `river.sandbox.<session>.<slot>`). Each run leases a slot
+  exclusively and its `%LOCALAPPDATA%\Packages\<profile>\AC` folder is wiped
+  before and after the run, so no file survives between runs. A run blocks
+  while every slot is leased (concurrency is capped at the pool size, which
+  is what a judge needs). A pre-1.0 installation may still have the legacy
+  `river.sandbox` profile folder — delete it once when upgrading.
 - Memory limits apply to *commit*, not RSS — a large `malloc` that is never
   written does not trigger `MLE`.
 - The memory limit is enforced both per process and for the whole process

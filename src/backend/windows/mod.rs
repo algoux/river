@@ -6,6 +6,7 @@ pub mod acl;
 pub mod job;
 pub mod monitor;
 pub mod ntstatus;
+pub mod profile;
 pub mod sandbox;
 pub mod spawn;
 pub mod stdio;
