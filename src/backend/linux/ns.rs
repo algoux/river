@@ -57,6 +57,11 @@ pub(crate) struct Child {
     pub(crate) pid: libc::pid_t,
     /// Judger-death watchdog pid (see `watchdog_loop`).
     watchdog: libc::pid_t,
+    /// Loop-device guard for a squashfs-image rootfs: keeps the image
+    /// attached and its squashfs mount alive for the run's duration; the
+    /// mount is detached and the loop freed on drop (after the last
+    /// collection/observation in the caller).
+    _loop: Option<LoopGuard>,
 }
 
 impl Child {
@@ -70,6 +75,8 @@ impl Child {
         // The supervisor itself was already reaped by the monitor; make the
         // watchdog a no-op from here on.
         self.watchdog = 0;
+        // Dropping `_loop` here releases the squashfs mount + loop device.
+        self._loop = None;
     }
 }
 
@@ -82,6 +89,132 @@ impl Drop for Child {
             unsafe { libc::waitpid(self.watchdog, &mut status, libc::WNOHANG) };
         }
     }
+}
+
+/// Keeps one squashfs image attached to a loop device and mounted
+/// read-only for a single run (host namespace, cleaned up on drop — the
+/// sandbox's *own* mount tree is built privately in the supervisor and
+/// inherits this mount through the fork).
+struct LoopGuard {
+    /// Open fd of the bound loop device (`LOOP_CLR_FD` needs it).
+    loop_fd: libc::c_int,
+    /// Squashfs mountpoint (detached on drop).
+    mount_point: PathBuf,
+}
+
+impl Drop for LoopGuard {
+    fn drop(&mut self) {
+        // Best effort: detach the mount first (the overlay in the (by now
+        // dead) private namespace held its own reference), then free the
+        // loop. Any failure is recovered from — loop devices and mounts
+        // leak nothing permanent once the fd closes.
+        let point = std::ffi::CString::new(
+            self.mount_point
+                .as_os_str()
+                .to_str()
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+        )
+        .ok();
+        if let Some(point) = point {
+            unsafe {
+                libc::umount2(point.as_ptr(), libc::MNT_DETACH);
+            }
+        }
+        if self.loop_fd >= 0 {
+            unsafe {
+                libc::ioctl(self.loop_fd, LOOP_CLR_FD, 0);
+                libc::close(self.loop_fd);
+            }
+        }
+    }
+}
+
+/// `LOOP_SET_FD` / `LOOP_CLR_FD` / `LOOP_CTL_GET_FREE` ioctls (libc does
+/// not export the loop constants on every target).
+const LOOP_SET_FD: libc::c_ulong = 0x4C00;
+const LOOP_CLR_FD: libc::c_ulong = 0x4C01;
+const LOOP_CTL_GET_FREE: libc::c_ulong = 0x4C82;
+
+/// Squashfs magic ("hsqs", little-endian superblock).
+const SQUASHFS_MAGIC: [u8; 4] = *b"hsqs";
+
+/// Attach a squashfs image to a free loop device and mount it read-only at
+/// `mount_point` (host namespace; the supervisor's private copy inherits it
+/// across the fork). Cleanup is `LoopGuard`'s job.
+fn setup_loop_mount(image: &Path, mount_point: &Path) -> io::Result<LoopGuard> {
+    let cstr = |p: &Path| -> io::Result<std::ffi::CString> {
+        std::ffi::CString::new(
+            p.as_os_str()
+                .to_str()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 path"))?,
+        )
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))
+    };
+    // Pick a free loop device through loop-control (no scanning).
+    let ctl = unsafe {
+        libc::open(
+            c"/dev/loop-control".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if ctl < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no /dev/loop-control: squashfs rootfs needs loop device support",
+        ));
+    }
+    let idx = unsafe { libc::ioctl(ctl, LOOP_CTL_GET_FREE, 0) };
+    unsafe { libc::close(ctl) };
+    if idx < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let loop_path = format!("/dev/loop{idx}");
+    let loop_c = std::ffi::CString::new(loop_path.clone()).unwrap();
+    let loop_fd = unsafe { libc::open(loop_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if loop_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let img_c = cstr(image)?;
+    let img_fd = unsafe { libc::open(img_c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if img_fd < 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(loop_fd) };
+        return Err(err);
+    }
+    let rc = unsafe { libc::ioctl(loop_fd, LOOP_SET_FD, img_fd as libc::c_ulong) };
+    unsafe { libc::close(img_fd) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        unsafe { libc::close(loop_fd) };
+        return Err(err);
+    }
+    // Mount the bound loop device read-only (squashfs is read-only by
+    // design; the flags double as the usual hardening). The mountpoint is
+    // a plain workdir-local directory, created here.
+    let point_c = cstr(mount_point)?;
+    std::fs::create_dir_all(mount_point)?;
+    let rc = unsafe {
+        libc::mount(
+            loop_c.as_ptr(),
+            point_c.as_ptr(),
+            c"squashfs".as_ptr(),
+            libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+            std::ptr::null(),
+        )
+    };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::ioctl(loop_fd, LOOP_CLR_FD, 0);
+            libc::close(loop_fd);
+        }
+        return Err(err);
+    }
+    Ok(LoopGuard {
+        loop_fd,
+        mount_point: mount_point.to_path_buf(),
+    })
 }
 
 /// Everything the child side needs, built by the parent before the fork.
@@ -122,7 +255,7 @@ impl MountPlan {
         runtimes: &[PathBuf],
         executable: &Path,
         cwd_rel: Option<&str>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, Option<LoopGuard>)> {
         let cstr = |p: &Path| {
             CString::new(p.as_os_str().to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 sandbox path")
@@ -137,14 +270,16 @@ impl MountPlan {
         let cwd_dir = cstr(&root_path.join("cwd"))?;
         let workdir_c = cstr(workdir)?;
 
-        // Caller-supplied rootfs: overlayfs with the host tree as the
-        // read-only lower layer and per-run tmpfs upper/work dirs. Overlayfs
-        // (rather than a plain bind) means the sandbox never has to create
-        // mountpoint directories *inside* the caller's tree — with a plain
-        // read-only bind, a rootfs lacking `/cwd` or `/proc` could not be
-        // used at all. The overlay is remounted read-only after the
-        // mountpoints exist (supervise); the upper layer is per-run and
-        // discarded with the workdir, so the host rootfs stays untouched.
+        // Caller-supplied rootfs: overlayfs with the host tree (or a
+        // squashfs image bound to a loop device) as the read-only lower
+        // layer and per-run tmpfs upper/work dirs. Overlayfs (rather than a
+        // plain bind) means the sandbox never has to create mountpoint
+        // directories *inside* the caller's tree — with a plain read-only
+        // bind, a rootfs lacking `/cwd` or `/proc` could not be used at
+        // all. The overlay is remounted read-only after the mountpoints
+        // exist (supervise); the upper layer is per-run and discarded with
+        // the workdir, so the host rootfs stays untouched.
+        let mut loop_guard: Option<LoopGuard> = None;
         let rootfs_overlay = match rootfs {
             Some(fs) => {
                 // Paths are embedded in a comma-separated mount(8)-style
@@ -161,9 +296,38 @@ impl MountPlan {
                 let fs_str = fs.to_str().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 rootfs path")
                 })?;
-                if fs_str.contains(',') || fs_str.contains(':') {
-                    return Err(bad(fs, "path"));
-                }
+                let md = std::fs::symlink_metadata(fs)?;
+                // A regular file is treated as a squashfs image: verify the
+                // magic, attach it to a free loop device and mount it
+                // read-only — the *mountpoint* becomes the overlay lowerdir
+                // (so commas in the image path are fine; the lowerdir is
+                // the workdir-local mountpoint below).
+                let lower: String = if md.is_file() {
+                    let mut magic = [0u8; 4];
+                    std::fs::File::open(fs)?.read_exact(&mut magic)?;
+                    if magic != SQUASHFS_MAGIC {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "rootfs image is not a squashfs image (bad magic): {}",
+                                fs.display()
+                            ),
+                        ));
+                    }
+                    let mount_point = workdir.join("sqfs");
+                    let guard = setup_loop_mount(fs, &mount_point)?;
+                    let lower = mount_point
+                        .to_str()
+                        .ok_or_else(|| bad(&mount_point, "workdir path"))?
+                        .to_string();
+                    loop_guard = Some(guard);
+                    lower
+                } else {
+                    if fs_str.contains(',') || fs_str.contains(':') {
+                        return Err(bad(fs, "path"));
+                    }
+                    fs_str.to_string()
+                };
                 let upper = workdir.join("upper");
                 let work = workdir.join("ovl-work");
                 if upper.to_str().map(|s| s.contains(',') || s.contains(':')) == Some(true)
@@ -174,7 +338,7 @@ impl MountPlan {
                 std::fs::create_dir_all(&upper)?;
                 std::fs::create_dir_all(&work)?;
                 Some(CString::new(format!(
-                    "lowerdir={fs_str},upperdir={},workdir={}",
+                    "lowerdir={lower},upperdir={},workdir={}",
                     upper.display(),
                     work.display()
                 ))?)
@@ -282,20 +446,23 @@ impl MountPlan {
             Some(rel) => format!("/cwd/{}", rel.trim_start_matches('/')),
             None => "/cwd".to_string(),
         };
-        Ok(MountPlan {
-            root,
-            oldroot,
-            proc_dir,
-            dev_dir,
-            cwd_dir,
-            workdir: workdir_c,
-            rootfs_overlay,
-            binds,
-            file_binds,
-            exec_path,
-            cwd_preferred: CString::new(preferred).unwrap(),
-            cwd_fallback: CString::new("/cwd").unwrap(),
-        })
+        Ok((
+            MountPlan {
+                root,
+                oldroot,
+                proc_dir,
+                dev_dir,
+                cwd_dir,
+                workdir: workdir_c,
+                rootfs_overlay,
+                binds,
+                file_binds,
+                exec_path,
+                cwd_preferred: CString::new(preferred).unwrap(),
+                cwd_fallback: CString::new("/cwd").unwrap(),
+            },
+            loop_guard,
+        ))
     }
 }
 
@@ -316,7 +483,7 @@ pub(crate) fn spawn(
     seccomp: Option<&crate::backend::linux::seccomp::Program>,
     stdio: &mut StdioSet,
 ) -> io::Result<Child> {
-    let plan = MountPlan::build(workdir, rootfs, runtimes, executable, cwd_rel)?;
+    let (plan, loop_guard) = MountPlan::build(workdir, rootfs, runtimes, executable, cwd_rel)?;
 
     // argv[0] is the path the program is actually exec'd from (the injected
     // `/cwd/.river/<name>` when the host path was not visible).
@@ -407,6 +574,7 @@ pub(crate) fn spawn(
     Ok(Child {
         pid: fork_rc,
         watchdog,
+        _loop: loop_guard,
     })
 }
 

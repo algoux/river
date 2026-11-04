@@ -597,3 +597,36 @@ def test_doctor_reports_ok():
         assert key in facts, key
     assert facts["seccomp"] is True
     assert facts["memory_swap_max"] is True
+
+
+def test_copy_out_never_follows_symlinks(sandbox, python_exe, tmp_path):
+    # The judger (root) does the collecting: a symlink planted by the
+    # program must never be read through, or any host file becomes
+    # exfiltratable via copy_out. Both a symlinked *product* and a symlink
+    # hidden inside a collected directory are denied.
+    victim = tmp_path / "host-secret.txt"
+    victim.write_bytes(b"host-only-secret")
+    dst = tmp_path / "collected"
+
+    r = sandbox.run(
+        python_exe,
+        [
+            "-c",
+            (
+                "import os\n"
+                "os.symlink(" + repr(str(victim)) + ", 'leak')\n"
+                "os.makedirs('tree')\n"
+                "open('tree/ok', 'w').write('data')\n"
+                "os.symlink(" + repr(str(victim)) + ", 'tree/leak')\n"
+            ),
+        ],
+        copy_out={"leak": str(dst / "leak"), "tree": str(dst / "tree")},
+    )
+    assert r.status == "AC", r
+    assert not (dst / "leak").exists(), "the direct symlink must not be followed"
+    assert not (dst / "tree" / "leak").exists(), "the nested symlink must not be followed"
+    assert (dst / "tree" / "ok").read_bytes() == b"data"
+    # The victim's content must not appear anywhere under the destination.
+    for p in dst.rglob("*"):
+        if p.is_file():
+            assert p.read_bytes() != b"host-only-secret", p

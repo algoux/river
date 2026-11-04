@@ -229,3 +229,103 @@ def test_the_working_directory_is_removed_after_the_run(sandbox, python_exe):
     assert r.status == "AC"
     after = set(glob.glob(pattern))
     assert after - before == set(), "the per-run directory was left behind"
+
+
+# ---------------------------------------------------------------------------
+# copy_out: product recovery (collected after the run, never via links)
+# ---------------------------------------------------------------------------
+
+
+def test_copy_out_recovers_products(sandbox, python_exe, tmp_path):
+    dst_file = tmp_path / "out" / "answer.txt"
+    dst_dir = tmp_path / "out" / "tree"
+    r = sandbox.run(
+        python_exe,
+        [
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "Path('answer.txt').write_text('hello-product')\n"
+                "Path('tree').mkdir()\n"
+                "Path('tree/nested').mkdir()\n"
+                "Path('tree/nested/x.bin').write_bytes(b'\\x01\\x02')\n"
+            ),
+        ],
+        copy_out={
+            "answer.txt": str(dst_file),
+            "tree": str(dst_dir),
+        },
+    )
+    assert r.status == "AC", r
+    assert dst_file.read_text() == "hello-product"
+    assert (dst_dir / "nested" / "x.bin").read_bytes() == b"\x01\x02"
+
+
+def test_copy_out_missing_source_is_skipped(sandbox, python_exe, tmp_path):
+    dst = tmp_path / "optional.txt"
+    r = sandbox.run(
+        python_exe, ["-c", "pass"], copy_out={"never-written.txt": str(dst)}
+    )
+    assert r.status == "AC", r
+    assert not dst.exists()
+
+
+def test_copy_out_quota_breach_is_ole(sandbox, python_exe, tmp_path):
+    dst = tmp_path / "dump.bin"
+    r = sandbox.run(
+        python_exe,
+        ["-c", "open('dump.bin', 'wb').write(b'x' * (64 * 1024))"],
+        copy_out={"dump.bin": str(dst)},
+        copy_out_limit_kb=1,
+    )
+    assert r.status == "OLE", r
+    assert r.signal == 9
+    assert not dst.exists(), "a file past the quota must not be collected"
+
+
+def test_copy_out_within_quota_is_ac(sandbox, python_exe, tmp_path):
+    dst = tmp_path / "small.txt"
+    r = sandbox.run(
+        python_exe,
+        ["-c", "open('small.txt', 'wb').write(b'x' * 100)"],
+        copy_out={"small.txt": str(dst)},
+        copy_out_limit_kb=1,
+    )
+    assert r.status == "AC", r
+    assert len(dst.read_bytes()) == 100
+
+
+def test_invalid_copy_out_key_raises(sandbox, python_exe, tmp_path):
+    with pytest.raises(ValueError):
+        sandbox.run(
+            python_exe, ["-c", "pass"], copy_out={"../escape": str(tmp_path / "x")}
+        )
+    with pytest.raises(ValueError):
+        sandbox.run(
+            python_exe, ["-c", "pass"], copy_out={r"C:\abs": str(tmp_path / "x")}
+        )
+
+
+def test_copy_in_directory_is_provisioned_recursively(sandbox, python_exe, tmp_path):
+    src = tmp_path / "proj"
+    (src / "data").mkdir(parents=True)
+    (src / "config.txt").write_text("cfg")
+    (src / "data" / "rows.csv").write_text("1,2,3")
+    r = sandbox.run(
+        python_exe,
+        [
+            "-c",
+            (
+                "from pathlib import Path\n"
+                "print(Path('proj/config.txt').read_text())\n"
+                "print(Path('proj/data/rows.csv').read_text())\n"
+                "try:\n"
+                "    Path('proj/config.txt').write_text('nope')\n"
+                "except (PermissionError, OSError):\n"
+                "    pass\n"
+            ),
+        ],
+        copy_in={"proj": str(src)},
+    )
+    assert r.status == "AC", r
+    assert r.stdout.decode().splitlines() == ["cfg", "1,2,3"]

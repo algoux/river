@@ -59,6 +59,7 @@ with sandbox:
         copy_in={
             "nums.txt": b"1 2 3 4 5\n",  # bytes 直接写入
             # "data.txt": "D:/oj/data/P1001/1.in",  # 或宿主机路径拷贝
+            # "templates": "D:/oj/templates/p1001",  # 或宿主机目录（递归投放）
         },
         time_limit_ms=5000,
         memory_limit_kb=512 * 1024,  # 解释器有底噪，给宽些
@@ -66,6 +67,20 @@ with sandbox:
     assert r2.status == "AC"
     assert r2.stdout.rstrip() == b"15"
     print("copy_in:", r2.status, r2.stdout)
+
+    # ── 场景 2b：copy_out 回收产物（编译产物/文件型答案；永不跟随链接）──
+    import tempfile
+
+    out_dir = tempfile.mkdtemp(prefix="river-out-")
+    r2b = sandbox.run(
+        PYTHON,
+        args=["-c", "open('answer.txt', 'w').write('42\\n')"],
+        copy_out={"answer.txt": f"{out_dir}/answer.txt"},
+        copy_out_limit_kb=1024,  # 回收总字节配额，超限判 OLE
+    )
+    assert r2b.status == "AC"
+    assert open(f"{out_dir}/answer.txt").read().strip() == "42"
+    print("copy_out:", r2b.status, open(f"{out_dir}/answer.txt").read())
 
     # ── 场景 3：TLE —— wall 看门狗强杀 ────────────────────────────
     r3 = sandbox.run(

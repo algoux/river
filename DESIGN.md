@@ -39,7 +39,9 @@ Linux 的两种文件系统模式（机制细节见
 - **rootfs 模式**：调用方提供自包含根树，以 overlayfs 只读替换沙箱根
   （宿主树是 lower 层，零写入；挂载点目录落在 per-run upper 层），
   `runtimes` 只读叠加；`executable` 坐标系变为 **rootfs 内路径**。
-  唯一可写处仍是 `/cwd`。
+  唯一可写处仍是 `/cwd`。rootfs 也可以是一个 **squashfs 镜像文件**：
+  绑定到空闲 loop 设备只读挂载后作为 overlay lower 层（容器镜像同款
+  用法），loop/mount 随 run 结束由父进程 RAII 释放。
 
 ## 2. API 契约
 
@@ -83,7 +85,9 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 | `wall_time_limit_ms` | — | `None` = 不限制；仅设 `time_limit_ms` 时默认 `2×time_limit_ms + 1000` |
 | `memory_limit_kb` | — | `None` = 不限制 |
 | `stdin` / `stdin_file` | — | 互斥（同给抛 `ValueError`）；`stdin_file` 零拷贝优先 |
-| `copy_in` | 键为沙箱相对路径 | 程序对文件默认**只读** |
+| `copy_in` | 键为沙箱相对路径 | 程序对文件默认**只读**；值可为宿主机目录（递归投放，跳过链接） |
+| `copy_out` | 键为沙箱相对路径，值为宿主机路径 | 运行结束后回收产物（目录递归）；**永不跟随符号链接/junction**；源缺失则跳过 |
+| `copy_out_limit_kb` | — | 回收总字节配额：超限停止回收（超限文件不收、无半截文件）并判 `OLE` |
 | `stdout_limit_kb` / `stderr_limit_kb` | — | 击杀阈值：超过即杀并判 OLE |
 | `stdout_file` / `stderr_file` | 宿主机路径 | 完整输出留档（截至被杀为止）；与 `r.stdout`（截断 bytes）并存 |
 
@@ -133,6 +137,12 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
    存活子孙。参数校验失败仍抛 Python 异常。
 8. **判定以证据优先**：沙箱强杀与限额证据的优先级高于进程的原始退出码
    （被强杀的进程退出码往往无意义）。
+9. **copy_out 不跟随链接**：被测程序可以植入指向宿主任意路径的符号链接
+   （Linux）/junction（Windows），而回收方是 root judger——跟随链接就是
+   任意宿主文件外泄通道。因此链接条目一律跳过（对齐 workdir 清理的
+   "不跟随 reparse point"规则）；Linux 文件打开带 `O_NOFOLLOW`（防
+   TOCTOU）。配额超限判 `OLE`（`KillOrigin::CopyOutQuota`，证据优先于
+   退出码——即便进程正常退出也不判 `AC`）。
 
 ### 3.1 分层架构（contract / backend）
 

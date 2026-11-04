@@ -16,11 +16,24 @@ use std::time::Duration;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-/// Source of a `copy_in` entry: inline bytes or a host-side file path.
+/// Source of a `copy_in` entry: inline bytes or a host-side file/directory
+/// path (a directory is provisioned recursively).
 #[derive(Clone)]
 pub(crate) enum CopyInSource {
     Bytes(Vec<u8>),
     Path(PathBuf),
+}
+
+/// One `copy_out` request: a sandbox-relative source path (a file or a
+/// directory — directories are collected recursively) and the host-side
+/// destination path it must be written to.
+#[derive(Clone)]
+pub(crate) struct CopyOutEntry {
+    /// Path inside the sandbox working directory (validated relative).
+    pub src_rel: String,
+    /// Absolute host path the collected content is written to (parents are
+    /// created as needed).
+    pub dst_host: PathBuf,
 }
 
 /// Frozen `run()` argument set shared by all platform backends.
@@ -29,6 +42,8 @@ pub(crate) enum CopyInSource {
 /// - `executable`, `stdin_file`, `stdout_file`, `stderr_file`: host paths
 /// - `cwd`: path relative to the sandbox private working directory
 /// - `copy_in` keys: paths relative to the sandbox working directory
+/// - `copy_out` keys: paths relative to the sandbox working directory
+///   (values are host paths; collection never follows symlinks)
 ///
 /// Limit semantics: `None` means *no caller-imposed limit*. Backends must
 /// still enforce internal safety ceilings (see [`SafetyCeilings`]) so that
@@ -44,6 +59,11 @@ pub(crate) struct RunSpec {
     pub stdin: Option<Vec<u8>>,
     pub stdin_file: Option<PathBuf>,
     pub copy_in: Option<HashMap<String, CopyInSource>>,
+    /// Product-recovery requests (sandbox-relative source -> host path).
+    pub copy_out: Option<Vec<CopyOutEntry>>,
+    /// Kill threshold for the *total collected bytes*: exceeding it stops
+    /// the collection and classifies the run as `OLE` (output quota).
+    pub copy_out_limit_bytes: Option<u64>,
     pub stdout_limit_kb: Option<u64>,
     pub stderr_limit_kb: Option<u64>,
     pub stdout_file: Option<PathBuf>,
@@ -84,7 +104,8 @@ impl Default for SafetyCeilings {
     }
 }
 
-/// Parse the raw `copy_in` mapping (`sandbox-relative path -> bytes | host path`).
+/// Parse the raw `copy_in` mapping (`sandbox-relative path -> bytes | host
+/// path`, the latter also accepting a host *directory*).
 pub(crate) fn parse_copy_in(
     map: &HashMap<String, pyo3::Py<pyo3::PyAny>>,
     py: Python<'_>,
@@ -98,11 +119,40 @@ pub(crate) fn parse_copy_in(
             out.insert(key.clone(), CopyInSource::Path(path));
         } else {
             return Err(PyValueError::new_err(format!(
-                "copy_in[{key:?}]: value must be bytes or a host file path"
+                "copy_in[{key:?}]: value must be bytes, a host file path, or a host directory path"
             )));
         }
     }
     Ok(out)
+}
+
+/// Parse the raw `copy_out` mapping (`sandbox-relative path -> host path`).
+/// The destination must be a host path (a file, or a directory when the
+/// source is a directory).
+pub(crate) fn parse_copy_out(map: &HashMap<String, String>) -> PyResult<Vec<CopyOutEntry>> {
+    Ok(map
+        .iter()
+        .map(|(src, dst)| CopyOutEntry {
+            src_rel: src.clone(),
+            dst_host: PathBuf::from(dst),
+        })
+        .collect())
+}
+
+/// Validate one sandbox-relative path key (shared by `copy_in` and
+/// `copy_out`): relative, no `..` components, no drive colon, non-empty.
+fn validate_rel_key(kind: &str, key: &str) -> PyResult<()> {
+    let path = Path::new(key);
+    if key.is_empty()
+        || path.is_absolute()
+        || key.contains(':')
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+    {
+        return Err(PyValueError::new_err(format!(
+            "invalid {kind} key {key:?}: must be a relative path inside the sandbox working directory"
+        )));
+    }
+    Ok(())
 }
 
 /// Cross-platform argument validation, run before any backend work.
@@ -113,15 +163,10 @@ pub(crate) fn validate(spec: &RunSpec) -> PyResult<()> {
         ));
     }
     for key in spec.copy_in.iter().flat_map(|m| m.keys()) {
-        let path = Path::new(key);
-        if path.is_absolute()
-            || key.contains(':')
-            || path.components().any(|c| matches!(c, Component::ParentDir))
-        {
-            return Err(PyValueError::new_err(format!(
-                "invalid copy_in key {key:?}: must be a relative path inside the sandbox working directory"
-            )));
-        }
+        validate_rel_key("copy_in", key)?;
+    }
+    for entry in spec.copy_out.iter().flatten() {
+        validate_rel_key("copy_out", &entry.src_rel)?;
     }
     Ok(())
 }
@@ -142,6 +187,8 @@ mod tests {
             stdin: None,
             stdin_file: None,
             copy_in: None,
+            copy_out: None,
+            copy_out_limit_bytes: None,
             stdout_limit_kb: None,
             stderr_limit_kb: None,
             stdout_file: None,

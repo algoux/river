@@ -104,6 +104,21 @@ def main() -> int:
             print("empty rootfs exec:", r)
             assert r.status == "SE", r  # /bin/sh does not exist in the rootfs
 
+    # copy_out: the program writes a product into /cwd, the judger collects
+    # it to a host path after the run.
+    with river.Sandbox(runtimes=RUNTIMES) as sb:
+        import tempfile
+
+        out = tempfile.mktemp(prefix="river-smoke-out-")
+        r = sb.run(
+            sys.executable,
+            ["-c", "open('answer.txt', 'w').write('smoke\\n')"],
+            copy_out={"answer.txt": out},
+        )
+        print("copy_out:", r)
+        assert r.status == "AC" and open(out).read() == "smoke\n", r
+        os.unlink(out)
+
     print("linux smoke: OK")
     return 0
 

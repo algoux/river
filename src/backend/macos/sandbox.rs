@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use crate::contract::status::Status;
-use crate::contract::{RunSpec, parse_copy_in, validate};
+use crate::contract::{RunSpec, parse_copy_in, parse_copy_out, validate};
 
 /// macOS sandbox — **not implemented yet**.
 ///
@@ -73,14 +73,17 @@ impl Sandbox {
         stdin = None,
         stdin_file = None,
         copy_in = None,
+        copy_out = None,
+        copy_out_limit_kb = None,
         stdout_limit_kb = None,
         stderr_limit_kb = None,
         stdout_file = None,
         stderr_file = None,
     ))]
     #[pyo3(
-        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
+        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         executable: PathBuf,
@@ -93,6 +96,8 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
+        copy_out: Option<HashMap<String, String>>,
+        copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,
         stdout_file: Option<PathBuf>,
@@ -113,6 +118,11 @@ impl Sandbox {
                 Some(map) => Some(parse_copy_in(map, py)?),
                 None => None,
             },
+            copy_out: match &copy_out {
+                Some(map) => Some(crate::contract::parse_copy_out(map)?),
+                None => None,
+            },
+            copy_out_limit_bytes: copy_out_limit_kb.map(|kb| kb.saturating_mul(1024)),
             stdout_limit_kb,
             stderr_limit_kb,
             stdout_file,

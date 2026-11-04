@@ -14,7 +14,7 @@ use crate::backend::linux::stdio::{StdinSource, StdioSet};
 use crate::backend::linux::workdir::{self, WorkDir};
 use crate::contract::status::Status;
 use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
-use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, validate};
+use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, parse_copy_out, validate};
 
 /// How long a cgroup may take to become empty after the main process was
 /// reaped before its leftovers count as residual descendants (anti-cheat).
@@ -30,10 +30,12 @@ const CHILD_FSIZE_BYTES: u64 = 64 * 1024 * 1024;
 /// `RLIMIT_NOFILE` for the sandboxed program.
 const CHILD_NOFILE: u64 = 1024;
 
-/// Constructor-time validation of a caller-supplied rootfs directory: an
-/// absolute host path to an existing directory, and not `/` (binding the
-/// host root would erase the whole isolation model, same rule as
-/// `runtimes=["/"]` in `ns::MountPlan`).
+/// Constructor-time validation of a caller-supplied rootfs: an absolute
+/// host path to an existing directory or squashfs image file, and not `/`
+/// (binding the host root would erase the whole isolation model, same rule
+/// as `runtimes=["/"]` in `ns::MountPlan`). Image magic is verified per
+/// run in `MountPlan::build` (the file may change between construction and
+/// `run`).
 fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(format!(
@@ -44,10 +46,18 @@ fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
     if path == std::path::Path::new("/") {
         return Err("rootfs \"/\" is refused: it would expose the whole host".to_string());
     }
-    if !path.is_dir() {
-        return Err(format!("rootfs is not a directory: {}", path.display()));
+    match std::fs::symlink_metadata(path) {
+        Ok(md) => {
+            if !md.is_dir() && !md.is_file() {
+                return Err(format!(
+                    "rootfs must be a directory or a squashfs image file: {}",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
+        Err(_) => Err(format!("rootfs does not exist: {}", path.display())),
     }
-    Ok(())
 }
 
 /// Translate the contract limits into the child-side rlimits.
@@ -163,6 +173,10 @@ impl Sandbox {
     /// `stdin` / `stdin_file` are mutually exclusive. `*_file` output
     /// parameters receive the full captured stream (host paths); the returned
     /// `Status` still carries truncated copies plus truncation flags.
+    ///
+    /// `copy_out` maps sandbox-relative product paths to host destinations
+    /// (collected after the run, never following symlinks); when the
+    /// collected bytes pass `copy_out_limit_kb` the verdict is `OLE`.
     #[pyo3(signature = (
         executable,
         args = vec![],
@@ -174,13 +188,15 @@ impl Sandbox {
         stdin = None,
         stdin_file = None,
         copy_in = None,
+        copy_out = None,
+        copy_out_limit_kb = None,
         stdout_limit_kb = None,
         stderr_limit_kb = None,
         stdout_file = None,
         stderr_file = None,
     ))]
     #[pyo3(
-        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
+        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
     fn run(
         &self,
@@ -194,6 +210,8 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
+        copy_out: Option<HashMap<String, String>>,
+        copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,
         stdout_file: Option<PathBuf>,
@@ -214,6 +232,11 @@ impl Sandbox {
                 Some(map) => Some(parse_copy_in(map, py)?),
                 None => None,
             },
+            copy_out: match &copy_out {
+                Some(map) => Some(parse_copy_out(map)?),
+                None => None,
+            },
+            copy_out_limit_bytes: copy_out_limit_kb.map(|kb| kb.saturating_mul(1024)),
             stdout_limit_kb,
             stderr_limit_kb,
             stdout_file,
@@ -247,6 +270,8 @@ impl Sandbox {
         let args = spec.args.clone();
         let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
         let copy_in = spec.copy_in.clone();
+        let copy_out = spec.copy_out.clone();
+        let copy_out_limit_bytes = spec.copy_out_limit_bytes;
         let cwd_rel = spec.cwd.clone();
         let env_map = spec.env.clone().unwrap_or_default();
         let runtimes = self.runtimes.clone();
@@ -333,6 +358,11 @@ impl Sandbox {
                 let _ = cgroup.wait_until_empty(RESIDUAL_GRACE);
             }
             let oom_killed = cgroup.oom_killed().unwrap_or(false);
+            // copy_out: collect the products before the workdir disappears.
+            let collected = match &copy_out {
+                Some(entries) => workdir.collect(entries, copy_out_limit_bytes)?,
+                None => crate::backend::linux::workdir::Collected::default(),
+            };
             let cpu_used_ms = cgroup
                 .usage_usec()
                 .map(|us| us / 1000)
@@ -350,11 +380,22 @@ impl Sandbox {
                 out,
                 err,
                 overflowed,
+                collected.quota_exceeded,
             ))
         });
 
         match result {
-            Ok((outcome, residual, oom_killed, cpu_used_ms, peak_bytes, out, err, overflowed)) => {
+            Ok((
+                outcome,
+                residual,
+                oom_killed,
+                cpu_used_ms,
+                peak_bytes,
+                out,
+                err,
+                overflowed,
+                quota_exceeded,
+            )) => {
                 // Evidence-priority verdict (contract layer): the backend
                 // reports what it observed; the contract classifies it.
                 //
@@ -364,6 +405,8 @@ impl Sandbox {
                 // (OLE outranks inferred memory/time evidence by contract.)
                 let kill = if overflowed {
                     KillOrigin::OutputLimit
+                } else if quota_exceeded {
+                    KillOrigin::CopyOutQuota
                 } else {
                     outcome.kill
                 };

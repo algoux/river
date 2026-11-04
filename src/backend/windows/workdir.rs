@@ -22,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     RemoveDirectoryW,
 };
 
-use crate::contract::CopyInSource;
+use crate::contract::{CopyInSource, CopyOutEntry};
 
 /// Root for per-run working directories.
 fn workdir_root() -> PathBuf {
@@ -61,25 +61,76 @@ impl WorkDir {
     /// - bytes are written directly;
     /// - host paths are **copied** (never moved: a move would carry the
     ///   source ACL along, while a copy inherits the destination's);
+    ///   a host *directory* is provisioned recursively;
     /// - the copies are marked read-only, so the program cannot modify its
     ///   own input (see DESIGN.md §3.3).
+    ///
+    /// Symlinks / junctions inside a directory source are skipped (a
+    /// trusted-source convenience must never become a link farm).
     pub(crate) fn provision(&self, files: &HashMap<String, CopyInSource>) -> io::Result<()> {
         for (rel, source) in files {
             let target = self.path.join(rel);
-            if let Some(parent) = target.parent() {
-                fs::create_dir_all(parent)?;
-            }
             match source {
                 CopyInSource::Bytes(bytes) => {
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
                     fs::write(&target, bytes)?;
+                    mark_read_only(&target)?;
                 }
                 CopyInSource::Path(src) => {
-                    fs::copy(src, &target)?;
+                    let md = fs::metadata(src)?;
+                    if md.is_dir() {
+                        provision_dir(src, &target)?;
+                    } else {
+                        if let Some(parent) = target.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::copy(src, &target)?;
+                        mark_read_only(&target)?;
+                    }
                 }
             }
-            mark_read_only(&target)?;
         }
         Ok(())
+    }
+
+    /// Collect `copy_out` products from the working directory into their
+    /// host destinations (called after the Job Object reaped the tree,
+    /// before the `Drop`).
+    ///
+    /// **Never follows reparse points** (junctions / symlinks): the program
+    /// could plant one pointing at any host path, and the judger may run
+    /// privileged — following it would be an arbitrary-host-file
+    /// exfiltration channel. Reparse-point entries are skipped entirely;
+    /// missing sources are skipped (optional products). Collection stops at
+    /// the first file that would push the total past `quota_bytes` (that
+    /// file is *not* collected — no partial files).
+    pub(crate) fn collect(
+        &self,
+        entries: &[CopyOutEntry],
+        quota_bytes: Option<u64>,
+    ) -> io::Result<Collected> {
+        let mut out = Collected::default();
+        for entry in entries {
+            if out.quota_exceeded {
+                break;
+            }
+            let src = self.path.join(&entry.src_rel);
+            let md = match fs::symlink_metadata(&src) {
+                Ok(md) => md,
+                Err(_) => continue, // missing source: optional product
+            };
+            if is_reparse(&md) {
+                continue;
+            }
+            if md.is_dir() {
+                collect_dir(&src, &entry.dst_host, quota_bytes, &mut out)?;
+            } else {
+                copy_one(&src, &entry.dst_host, quota_bytes, &mut out)?;
+            }
+        }
+        Ok(out)
     }
 
     /// Remove the working directory (best effort; used by `Drop`).
@@ -98,6 +149,98 @@ impl Drop for WorkDir {
     fn drop(&mut self) {
         self.remove();
     }
+}
+
+/// Outcome of a `copy_out` collection.
+#[derive(Default)]
+pub(crate) struct Collected {
+    /// Total bytes written to the host destinations.
+    pub total_bytes: u64,
+    /// True when the quota stopped the collection early.
+    pub quota_exceeded: bool,
+}
+
+/// Does this metadata describe a symlink / junction / reparse point?
+fn is_reparse(md: &fs::Metadata) -> bool {
+    md.file_type().is_symlink()
+}
+
+/// Recursively provision a host source directory into the working
+/// directory (`copy_in` with a directory value). Regular files and
+/// subdirectories only; reparse points are skipped.
+fn provision_dir(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        if is_reparse(&entry.metadata()?) {
+            continue;
+        }
+        let md = entry.metadata()?;
+        let target = dst.join(entry.file_name());
+        if md.is_dir() {
+            provision_dir(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+            mark_read_only(&target)?;
+        }
+    }
+    Ok(())
+}
+
+/// Recursively collect a source directory into the host destination.
+fn collect_dir(
+    src: &Path,
+    dst: &Path,
+    quota_bytes: Option<u64>,
+    out: &mut Collected,
+) -> io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        if out.quota_exceeded {
+            return Ok(());
+        }
+        let entry = entry?;
+        if is_reparse(&entry.metadata()?) {
+            continue; // an exfiltration channel: never follow, never copy
+        }
+        let md = entry.metadata()?;
+        let target = dst.join(entry.file_name());
+        if md.is_dir() {
+            collect_dir(&entry.path(), &target, quota_bytes, out)?;
+        } else {
+            copy_one(&entry.path(), &target, quota_bytes, out)?;
+        }
+    }
+    Ok(())
+}
+
+/// Copy a single regular file to the host destination, updating the quota
+/// accounting. Refuse reparse points (no link following, no partial files
+/// on quota breach — see [`WorkDir::collect`]).
+fn copy_one(
+    src: &Path,
+    dst: &Path,
+    quota_bytes: Option<u64>,
+    out: &mut Collected,
+) -> io::Result<()> {
+    let md = fs::symlink_metadata(src)?;
+    if is_reparse(&md) {
+        return Ok(());
+    }
+    if let Some(quota) = quota_bytes
+        && out.total_bytes + md.len() > quota
+    {
+        // Do not collect a file that would breach the quota (no partial
+        // files); the caller sees `quota_exceeded` and reports OLE.
+        out.quota_exceeded = true;
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(src, dst)?;
+    out.total_bytes += md.len();
+    Ok(())
 }
 
 /// Best-effort sweep of working directories abandoned by a **dead** judger
@@ -443,5 +586,130 @@ mod tests {
 
         fs::remove_dir_all(&live).ok();
         fs::remove_dir_all(&foreign).ok();
+    }
+
+    /// A directory-valued `copy_in` is provisioned recursively, read-only.
+    #[test]
+    fn provisions_a_directory_recursively() {
+        let host = workdir_root().join(format!("river-wd-src-{}", std::process::id()));
+        fs::create_dir_all(host.join("sub")).unwrap();
+        fs::write(host.join("a.txt"), b"A").unwrap();
+        fs::write(host.join("sub/b.txt"), b"B").unwrap();
+
+        let dir = WorkDir::create().unwrap();
+        let mut files = HashMap::new();
+        files.insert("proj".to_string(), CopyInSource::Path(host.clone()));
+        dir.provision(&files).unwrap();
+
+        assert_eq!(fs::read(dir.path().join("proj/a.txt")).unwrap(), b"A");
+        assert_eq!(fs::read(dir.path().join("proj/sub/b.txt")).unwrap(), b"B");
+        fs::remove_dir_all(&host).ok();
+    }
+
+    /// `copy_out` writes the product to the host path and reports its size.
+    #[test]
+    fn collect_copies_products_to_host_paths() {
+        let dir = WorkDir::create().unwrap();
+        fs::write(dir.path().join("out.txt"), b"product").unwrap();
+        fs::create_dir_all(dir.path().join("tree/nested")).unwrap();
+        fs::write(dir.path().join("tree/nested/x"), b"XX").unwrap();
+
+        let dst_dir = workdir_root().join(format!("river-wd-dst-{}", std::process::id()));
+        let entries = vec![
+            CopyOutEntry {
+                src_rel: "out.txt".to_string(),
+                dst_host: dst_dir.join("collected.txt"),
+            },
+            CopyOutEntry {
+                src_rel: "tree".to_string(),
+                dst_host: dst_dir.join("tree"),
+            },
+        ];
+        let got = dir.collect(&entries, None).unwrap();
+        assert_eq!(got.total_bytes, 9); // 7 + 2
+        assert!(!got.quota_exceeded);
+        assert_eq!(fs::read(dst_dir.join("collected.txt")).unwrap(), b"product");
+        assert_eq!(fs::read(dst_dir.join("tree/nested/x")).unwrap(), b"XX");
+        fs::remove_dir_all(&dst_dir).ok();
+    }
+
+    /// The quota stops the collection: files that would breach it are not
+    /// collected (no partial files) and the caller learns why.
+    #[test]
+    fn collect_stops_at_the_quota() {
+        let dir = WorkDir::create().unwrap();
+        fs::write(dir.path().join("small"), b"12345").unwrap();
+        fs::write(dir.path().join("big"), b"0123456789").unwrap();
+
+        let dst = workdir_root().join(format!("river-wd-quota-{}", std::process::id()));
+        let entries = vec![
+            CopyOutEntry {
+                src_rel: "small".to_string(),
+                dst_host: dst.join("small"),
+            },
+            CopyOutEntry {
+                src_rel: "big".to_string(),
+                dst_host: dst.join("big"),
+            },
+        ];
+        let got = dir.collect(&entries, Some(5)).unwrap();
+        assert!(got.quota_exceeded);
+        assert_eq!(got.total_bytes, 5);
+        assert_eq!(fs::read(dst.join("small")).unwrap(), b"12345");
+        assert!(!dst.join("big").exists(), "no partial/breach files");
+        fs::remove_dir_all(&dst).ok();
+    }
+
+    /// A junction planted where a product is expected is skipped — the
+    /// judger must not read through it (exfiltration channel).
+    #[test]
+    fn collect_never_follows_junctions() {
+        let victim = workdir_root().join(format!("river-wd-victim2-{}", std::process::id()));
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep.txt"), b"host-secret").unwrap();
+
+        let dir = WorkDir::create().unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(dir.path().join("leak"))
+            .arg(&victim)
+            .status()
+            .unwrap();
+        if !status.success() {
+            fs::remove_dir_all(&victim).ok();
+            return;
+        }
+
+        let dst = workdir_root().join(format!("river-wd-junc-{}", std::process::id()));
+        let entries = vec![CopyOutEntry {
+            src_rel: "leak".to_string(),
+            dst_host: dst.join("leak"),
+        }];
+        let got = dir.collect(&entries, None).unwrap();
+        assert_eq!(got.total_bytes, 0);
+        assert!(
+            !dst.join("leak").exists(),
+            "the junction must not be followed"
+        );
+
+        // A junction nested *inside* a collected directory is skipped too.
+        fs::create_dir_all(dir.path().join("tree")).unwrap();
+        fs::write(dir.path().join("tree/ok"), b"data").unwrap();
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "mklink", "/J"])
+            .arg(dir.path().join("tree/leak"))
+            .arg(&victim)
+            .status()
+            .unwrap();
+        let entries = vec![CopyOutEntry {
+            src_rel: "tree".to_string(),
+            dst_host: dst.join("tree"),
+        }];
+        let got = dir.collect(&entries, None).unwrap();
+        assert_eq!(got.total_bytes, 4);
+        assert_eq!(fs::read(dst.join("tree/ok")).unwrap(), b"data");
+        assert!(!dst.join("tree/leak").exists());
+        fs::remove_dir_all(&dst).ok();
+        fs::remove_dir_all(&victim).ok();
     }
 }

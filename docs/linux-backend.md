@@ -40,8 +40,16 @@ mount -o remount,ro,nosuid,nodev <root>     # 冻结 rootfs 视图
   之上）。upper 层随 workdir 每次 run 销毁。
 - `executable` 坐标系变为 **rootfs 内路径**（如 `/usr/bin/python3`），不做宿主
   注入；rootfs 里不存在即 exec 失败（`SE`）。
-- 构造期校验：绝对路径、存在、非 `/`；路径含 `,` 或 `:` 会被拒绝（它们是
-  overlay options 的分隔符）。
+- 构造期校验：绝对路径、存在（目录或 squashfs 镜像文件）、非 `/`；目录形式
+  的路径含 `,` 或 `:` 会被拒绝（它们是 overlay options 的分隔符）。
+- **squashfs 镜像**：`rootfs` 指向常规文件时校验 magic（`hsqs`），经
+  `/dev/loop-control` 选空闲 loop 设备 → `LOOP_SET_FD` 绑定镜像 → 以
+  `MS_RDONLY|MS_NOSUID|MS_NODEV` 挂载 squashfs 到 `<workdir>/sqfs`（宿主
+  namespace，fork 时被 supervisor 的私有 ns 继承），该挂载点即 overlay
+  lowerdir。镜像路径可以含逗号/冒号（lowerdir 用的是挂载点）。loop 绑定与
+  挂载由父进程 `LoopGuard` RAII 释放（`umount2(MNT_DETACH)` +
+  `LOOP_CLR_FD`），时序上晚于 copy_out 回收。无 `/dev/loop-control`（常见
+  于容器宿主）或 squashfs 模块不可加载 → 明确报错，不静默降级。
 
 `pivot_root(root, root/.oldroot)` 后 `umount2("/.oldroot", MNT_DETACH)`，
 宿主文件系统完全不可见。
@@ -50,7 +58,15 @@ mount -o remount,ro,nosuid,nodev <root>     # 冻结 rootfs 视图
 前提。这是 Windows 后端"System32 永远可读"规则的 Linux 对应物（DESIGN §4）。
 
 **copy_in 只读**：文件 root 属主 + mode 0444；程序以 nobody(65534) 运行。
-目录（cwd 树）递归 chown 给 nobody，否则程序连文件都建不了。
+目录（cwd 树）递归 chown 给 nobody，否则程序连文件都建不了。`copy_in` 值
+为宿主机目录时递归投放（常规文件与子目录；符号链接跳过）。
+
+**copy_out 回收**：运行结束（monitor 返回后、workdir Drop 前）由 root
+judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以植入指向宿主任意
+路径的链接，跟随即任意文件外泄——链接条目跳过，文件打开带 `O_NOFOLLOW`
+（防 TOCTOU）。源缺失跳过（可选产物）；`copy_out_limit_kb` 是回收总字节
+配额：超限的文件不收（无半截文件）、停止回收并上报 `KillOrigin::CopyOutQuota`
+→ 契约层判 `OLE`。
 
 ### 权限围栏（setuid 面归零）
 

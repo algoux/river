@@ -64,9 +64,14 @@ class Sandbox:
     through `runtimes`/the system dirs it is bind-mounted read-only at
     `/cwd/.river/<name>`; with `rootfs`, `executable` is a path *inside the
     rootfs* and the host system dirs are not merged in (the rootfs must be
-    self-contained; it is mounted read-only via overlayfs — the host tree is
-    never written — with `runtimes` layered on top, and the only writable
+    self-contained; it is mounted read-only via overlayfs — a directory
+    tree, or a squashfs image file bound to a loop device — with the host
+    tree never written and `runtimes` layered on top; the only writable
     place stays `/cwd`).
+    `copy_in` values accept a host directory (provisioned recursively);
+    `copy_out` maps sandbox-relative product paths to host destinations —
+    collected after the run, never following symlinks, and `OLE` when the
+    collected bytes pass `copy_out_limit_kb`.
     Construction fails closed when cgroups v2, `memory.peak`,
     `memory.swap.max` or seccomp are unavailable (see `doctor()`); the
     backend must run as root.
@@ -101,6 +106,8 @@ class Sandbox:
         stdin: Buffer | None = None,
         stdin_file: _StrOrPath | None = None,
         copy_in: Mapping[str, _CopyInSource] | None = None,
+        copy_out: Mapping[str, _StrOrPath] | None = None,
+        copy_out_limit_kb: int | None = None,
         stdout_limit_kb: int | None = None,
         stderr_limit_kb: int | None = None,
         stdout_file: _StrOrPath | None = None,

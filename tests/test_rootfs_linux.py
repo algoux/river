@@ -249,6 +249,53 @@ def test_host_rootfs_tree_is_never_written(rootfs):
 
 
 # ---------------------------------------------------------------------------
+# squashfs image rootfs
+# ---------------------------------------------------------------------------
+
+
+def _mksquashfs_available() -> bool:
+    import shutil
+
+    return shutil.which("mksquashfs") is not None
+
+
+@pytest.mark.skipif(not _mksquashfs_available(), reason="mksquashfs not installed")
+def test_squashfs_image_rootfs(rootfs, tmp_path):
+    import subprocess
+
+    image = tmp_path / "root.sqsh"
+    subprocess.run(
+        ["mksquashfs", str(rootfs), str(image), "-noappend", "-no-progress"],
+        check=True,
+        capture_output=True,
+    )
+    before = image.stat().st_mtime_ns
+    with _sb(image) as sb:
+        r = sb.run("/bin/sh", ["-c", "echo from-squashfs; cat /etc/hostname 2>/dev/null; true"])
+        assert r.status == "AC", r
+        assert b"from-squashfs" in r.stdout, r
+        # The image view is read-only like the directory rootfs.
+        r = sb.run("/bin/sh", ["-c", "echo tampered > /etc/river-tamper 2>/dev/null && echo WROTE"])
+        assert r.status == "RE" or b"WROTE" not in r.stdout, r
+        # /cwd stays writable.
+        r = sb.run("/bin/sh", ["-c", "echo persisted > /cwd/f && cat /cwd/f"])
+        assert r.status == "AC" and r.stdout.strip() == b"persisted", r
+    assert image.stat().st_mtime_ns == before, "the image file must not be touched"
+    # The loop device was released: a second run over the same image works.
+    with _sb(image) as sb:
+        r = sb.run("/bin/sh", ["-c", "echo second-run"])
+        assert r.status == "AC" and b"second-run" in r.stdout, r
+
+
+def test_non_squashfs_image_is_rejected(rootfs, tmp_path):
+    fake = tmp_path / "fake.sqsh"
+    fake.write_bytes(b"definitely not a squashfs image" * 4)
+    with _sb(fake) as sb:
+        r = sb.run("/bin/sh", ["-c", "echo hi"])
+        assert r.status == "SE", r  # bad magic → spawn fails closed
+
+
+# ---------------------------------------------------------------------------
 # limits still bind in rootfs mode
 # ---------------------------------------------------------------------------
 

@@ -12,9 +12,11 @@
 //!
 //! Priority (highest first):
 //! 1. `SE` — residual descendants after the main process exited (anti-cheat)
-//! 2. `OLE` — output kill: a channel passed its kill threshold and the
-//!    sandbox reaped the job mid-run (`KillOrigin::OutputLimit`). Direct
-//!    sandbox observation outranks inferred evidence.
+//! 2. `OLE` — output quota: a stdout/stderr channel passed its kill
+//!    threshold and the sandbox reaped the job mid-run
+//!    (`KillOrigin::OutputLimit`), or the collected `copy_out` bytes passed
+//!    `copy_out_limit_kb` (`KillOrigin::CopyOutQuota`). Direct sandbox
+//!    observations outrank inferred evidence.
 //! 3. `MLE` — abnormal end (killed or nonzero exit) with peak memory at the
 //!    limit: the memory cap made an allocation fail, so the failure *is* the
 //!    memory-limit event. Ranked above `TLE` because an allocation bomb is
@@ -40,6 +42,10 @@ pub(crate) enum KillOrigin {
     /// A stdout/stderr channel produced more than its kill threshold; the
     /// sandbox reaped the job mid-run.
     OutputLimit,
+    /// The collected `copy_out` output surpassed `copy_out_limit_kb`; the
+    /// quota stop is a *direct* sandbox observation (collection happens
+    /// post-run), so it upgrades even a clean exit to `OLE`.
+    CopyOutQuota,
 }
 
 /// Everything the sandbox observed about one finished run. Backends fill
@@ -136,8 +142,13 @@ pub(crate) fn classify(evidence: &RunEvidence) -> Verdict {
     }
     // 2. Output: an overflow kill is a *direct* sandbox observation (the
     //    reader fired past the kill threshold and the job was terminated
-    //    mid-run) — it outranks the inferred memory/time evidence below.
-    if evidence.kill == KillOrigin::OutputLimit {
+    //    mid-run); a copy_out quota stop is the file-output analogue (the
+    //    sandbox measured the collected bytes itself). Both are direct
+    //    observations — they outrank the inferred memory/time evidence below.
+    if matches!(
+        evidence.kill,
+        KillOrigin::OutputLimit | KillOrigin::CopyOutQuota
+    ) {
         return Verdict::Ole;
     }
     // 3. Memory: an OOM kill is direct kernel evidence, and an abnormal end
@@ -242,6 +253,15 @@ mod tests {
         e.memory_limit_bytes = Some(limit);
         e.peak_memory_bytes = limit;
         assert_eq!(classify_ev(e), Verdict::Ole);
+    }
+
+    #[test]
+    fn copy_out_quota_upgrades_even_a_clean_exit_to_ole() {
+        // The program exited 0, but it produced more collected output than
+        // allowed: the quota evidence beats the exit code.
+        let v = classify_ev(ev(KillOrigin::CopyOutQuota, 0));
+        assert_eq!(v, Verdict::Ole);
+        assert_eq!(v.synthesized_signal(), 9);
     }
 
     // -- CPU evidence -------------------------------------------------------

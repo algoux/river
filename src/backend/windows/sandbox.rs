@@ -16,8 +16,8 @@ use crate::backend::windows::stdio::{StdinSource, StdioSet};
 use crate::backend::windows::token::AppContainer;
 use crate::backend::windows::workdir::{WorkDir, sweep_stale_workdirs};
 use crate::contract::status::Status;
-use crate::contract::verdict::{RunEvidence, classify};
-use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, validate};
+use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
+use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, parse_copy_out, validate};
 
 /// Recover working directories abandoned by a *dead* judger process (its
 /// sandboxed processes died with KILL_ON_JOB_CLOSE, but the per-run dirs
@@ -134,13 +134,15 @@ impl Sandbox {
         stdin = None,
         stdin_file = None,
         copy_in = None,
+        copy_out = None,
+        copy_out_limit_kb = None,
         stdout_limit_kb = None,
         stderr_limit_kb = None,
         stdout_file = None,
         stderr_file = None,
     ))]
     #[pyo3(
-        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
+        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
     // The signature mirrors the frozen Python contract (one parameter per
     // run() keyword); collapsing it into a struct would hide that mapping.
@@ -157,6 +159,8 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
+        copy_out: Option<HashMap<String, String>>,
+        copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,
         stdout_file: Option<PathBuf>,
@@ -177,6 +181,11 @@ impl Sandbox {
                 Some(map) => Some(parse_copy_in(map, py)?),
                 None => None,
             },
+            copy_out: match &copy_out {
+                Some(map) => Some(parse_copy_out(map)?),
+                None => None,
+            },
+            copy_out_limit_bytes: copy_out_limit_kb.map(|kb| kb.saturating_mul(1024)),
             stdout_limit_kb,
             stderr_limit_kb,
             stdout_file,
@@ -214,6 +223,8 @@ impl Sandbox {
         let args = spec.args.clone();
         let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
         let copy_in = spec.copy_in.clone();
+        let copy_out = spec.copy_out.clone();
+        let copy_out_limit_bytes = spec.copy_out_limit_bytes;
         let cwd_rel = spec.cwd.clone();
         let env_map = spec.env.clone().unwrap_or_default();
         let runtimes = self.runtimes.clone();
@@ -300,17 +311,28 @@ impl Sandbox {
                 Some(set.overflow_event_handle()),
             )?;
             let peak_bytes = job.peak_process_memory_used()?;
+            // copy_out: collect the products while the Job Object has
+            // already reaped the tree, before the workdir disappears.
+            let collected = match &copy_out {
+                Some(entries) => workdir.collect(entries, copy_out_limit_bytes)?,
+                None => crate::backend::windows::workdir::Collected::default(),
+            };
             let (out, err) = set.finish()?;
-            Ok((outcome, peak_bytes, out, err))
+            Ok((outcome, peak_bytes, out, err, collected.quota_exceeded))
         });
 
         match result {
-            Ok((outcome, peak_bytes, out, err)) => {
+            Ok((outcome, peak_bytes, out, err, quota_exceeded)) => {
                 // Evidence-priority verdict (contract layer): the backend reports what it
                 // observed; the contract classifies it — sandbox kills and
                 // limit evidence outrank the raw exit code of a killed process.
+                let kill = if quota_exceeded {
+                    KillOrigin::CopyOutQuota
+                } else {
+                    outcome.kill
+                };
                 let evidence = RunEvidence {
-                    kill: outcome.kill,
+                    kill,
                     exit_code: outcome.exit_code,
                     residual_processes: outcome.residual_processes,
                     // Windows memory caps make allocations fail (commit

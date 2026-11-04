@@ -103,6 +103,7 @@ cgroup writes need `CAP_SYS_ADMIN`).
 | CPU time | `time_limit_ms` | `cpu.stat usage_usec` polled every 10 ms, killed at the limit; `RLIMIT_CPU` backstop | `TLE` |
 | Wall clock | `wall_time_limit_ms` (default `2 × time_limit + 1000`) | 2 ms poll watchdog | `TLE` |
 | Memory (RSS + page cache) | `memory_limit_kb` | cgroup `memory.max` + `memory.swap.max=0`; OOM kills read from `memory.events` and exposed as `Status.oom_killed` | `MLE` |
+| Collected output | `copy_out_limit_kb` | total `copy_out` bytes measured by the collector; collection stops (no partial files) | `OLE` |
 | File writes | — | `RLIMIT_FSIZE` 64 MB per file | `RE` on `SIGXFSZ`/`EFBIG` |
 | Open files | — | `RLIMIT_NOFILE` 1024 | `RE` |
 | stdout / stderr | `stdout_limit_kb` / `stderr_limit_kb` | pipe readers + kill threshold | `OLE` |
@@ -117,8 +118,18 @@ overlayfs (the host tree is the lower layer and is never written, not even
 mountpoint directories), with `runtimes` layered on top and `/cwd` the only
 writable place. The host system directories are *not* merged in, and
 `executable` becomes a path **inside the rootfs** (e.g. `/usr/bin/python3`).
-Requires overlayfs (universal on kernels ≥ 5.9); rootfs paths must not
-contain `,` or `:`.
+The rootfs may also be a **squashfs image file** (verified by magic,
+attached to a free loop device and mounted read-only; released with the
+run). Requires overlayfs (universal on kernels ≥ 5.9); rootfs paths must
+not contain `,` or `:`.
+
+**Product recovery** (`copy_out`): sandbox-relative paths are collected to
+host destinations after the run — recursively for directories, **never
+following symlinks** (the collector runs as root; a program-planted link
+is an exfiltration channel, so links are skipped). `copy_out_limit_kb`
+caps the total collected bytes: the breach stops the collection (no
+partial files) and the verdict is `OLE`. `copy_in` values also accept a
+host directory (provisioned recursively, links skipped).
 
 ### Startup check
 
