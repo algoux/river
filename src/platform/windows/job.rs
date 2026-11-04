@@ -191,6 +191,17 @@ impl Job {
     /// a program must not offload its work to a child and let the child keep
     /// running (or keep writing answers) after the main process is gone.
     pub(crate) fn alive_process_count(&self) -> io::Result<u32> {
+        Ok(self.alive_process_ids()?.len() as u32)
+    }
+
+    /// Pids of the processes currently alive in the job.
+    ///
+    /// The pid list lets the caller exclude the *main* process: the kernel
+    /// updates the job's process list asynchronously, so right after the
+    /// main process is signaled it may still be listed — counting it as a
+    /// "residual descendant" produced spurious `SE` verdicts under load
+    /// (observed: 1 in 400 concurrent runs).
+    pub(crate) fn alive_process_ids(&self) -> io::Result<Vec<u32>> {
         // The process-id list is variable-length; query with a generous
         // buffer and grow it if the job holds more processes than fit.
         const INITIAL_CAPACITY: u32 = 64;
@@ -224,7 +235,15 @@ impl Job {
             }
             // SAFETY: the call filled the buffer with a valid structure.
             let list = unsafe { &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
-            return Ok(list.NumberOfProcessIdsInList);
+            let count = list.NumberOfProcessIdsInList as usize;
+            let ids = list.ProcessIdList.as_ptr();
+            return Ok((0..count)
+                .map(|i| {
+                    // SAFETY: `ids` points at `count` valid entries inside
+                    // the buffer we own.
+                    unsafe { *ids.add(i) as u32 }
+                })
+                .collect());
         }
     }
 }

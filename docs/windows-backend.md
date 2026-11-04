@@ -1,10 +1,12 @@
-# Windows 后端技术方案与实施计划
+# Windows 后端技术设计
 
 支撑最低版本：Windows 10 21H2+ / Windows 11。零外部依赖：无 WSL、无虚拟化、
-无驱动、无需管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
+无驱动、无管理员权限、仅新增 `windows-sys` crate（按 feature 裁剪）。
 
-> **实现进度（2026-11，详见文末 §9）**：P1–P6 全部完成（S1–S13），S1–S13
-> 已提交——Windows 后端首版完成，pytest 三件套 + README 能力矩阵齐备。
+> **状态（2026-11）**：Windows 后端首版**已完成**。实施计划（S1–S13）全部
+> 落地并提交；本文档现在是**技术设计文档**：§1–§8 是架构与判定语义
+> （长期参考），§9 是决策记录、踩坑记录与实施历史。
+> §9.4 列出的后续方向（Linux/macOS 后端等）尚未开始。
 
 ## 1. 安全架构：三层防御
 
@@ -59,6 +61,8 @@ EXTENSION_POINT_DISABLE  禁 DLL 注入式 hook
 
 另有 `SetErrorMode(SEM_NOGPFAULTERRORBOX)`（父进程设置，子进程继承，静默崩溃
 弹窗——不走 `CreateProcessWithLogonW` 就没有继承链被打断的问题）。
+错误模式是**进程全局**的，所以 spawn.rs 的 `with_silent_crash_dialog` 在
+spawn 前后保存/恢复旧值，不影响 judger 自身行为。
 
 ### 明确不做 / 留待升级
 
@@ -88,9 +92,9 @@ validate(spec)                          已完成
   ① workdir：创建 per-run 临时目录，copy_in 落盘（bytes 直写/宿主拷贝 + ACL 重置）
   ② token：AppContainer 令牌；acl：cwd 可写 / runtimes 只读 grant
   ③ spawn：STARTUPINFOEX —— std 句柄 + JOB_LIST + MITIGATION_POLICY 属性
-           + SEM_NOGPFAULTERRORBOX + CREATE_SUSPENDED → ResumeThread
-  ④ monitor：主线程 WaitForSingleObject(wall 预算，GIL 已释放)
-           + 2×管道读线程（计数/截断/落盘 *_file）
+           + SEM_NOGPFAULTERRORBOX（子进程继承）+ CREATE_SUSPENDED → ResumeThread
+  ④ monitor：主线程 WaitForMultipleObjects({进程, 输出超限事件}, wall 预算，GIL 已释放)
+           + 2×管道读线程（计数/截断/落盘 *_file/超限 SetEvent）
   ⑤ 收尾：GetExitCodeProcess / Job accounting(CPU) / Job PeakProcessMemoryUsed
            → verdict 映射（NTSTATUS 表）→ Status
   ⑥ 清理：TerminateJobObject(若存活) → 句柄关闭(KILL_ON_JOB_CLOSE 兜底)
@@ -100,7 +104,7 @@ validate(spec)                          已完成
 ## 4. 判定与测量
 
 - **双计时**：CPU = **Job accounting**（`JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`，
-  统计整棵进程树），wall = `QueryPerformanceCounter`；
+  统计整棵进程树），wall = Rust `Instant`（Windows 上底层即 QPC）；
   TLE = 看门狗 wall 超限 ∪ 实测 CPU 超限（`Sleep` 挂机靠前者抓）
   —— 注意 Windows 8+ 上 `GetProcessTimes` 读**别的进程**恒为 0，
   必须用 Job accounting（见 §9.2.10）
@@ -118,8 +122,8 @@ src/platform/windows/
 ├── mod.rs        模块组装（~10 行）
 ├── sandbox.rs    pyclass 胶水：构造/上下文管理/run() 编排；唯一的 Python 边界
 ├── token.rs      AppContainer profile/SID/令牌
-├── acl.rs        授权原语：目录/文件 grant、只读/读写、完整性标签
-├── job.rs        Job Object 创建、四类限制、峰值内存查询
+├── acl.rs        授权原语：目录/文件 grant、只读/读写（无完整性标签）
+├── job.rs        Job Object 创建、四类限制、峰值内存与 CPU 统计查询
 ├── spawn.rs      STARTUPINFOEX 属性组装、CreateProcess、挂起启动
 ├── stdio.rs      三通道：stdin 供给、stdout/stderr 读线程（限额/截断/落盘）
 ├── workdir.rs    临时目录生命周期、copy_in 落盘、reparse 安全删除
@@ -137,53 +141,30 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 内部安全上限（None=无限的机制层兜底）：wall ≤ 24h、内存 ≤ 物理内存；
 首版为常量，后续按需升级为构造参数。
 
-## 6. 实施计划（13 步，每步 ≤250 行、独立提交、独立验证）
+## 6. 实施历史（13 步，每步 ≤250 行、独立提交、独立验证）
 
-### P1 测量核心（无安全，验证测量正确性）
+> 计划**已全部完成**（S1–S13）。下表保留作为**实施历史与验收依据**，
+> 各步的 commit hash 见 §9.1，代码见 `src/platform/windows/`。
+> 新增功能请直接开新步，格式沿用下表。
 
-| 步 | 内容 | 行数 | 验证 | review 重点 |
+| 阶段 | 步 | 内容 | 验收 | 产出 |
 |---|---|---|---|---|
-| S1 ✅ `stdio.rs` 管道层 | ~200 | 单测：echo 捕获、截断标志 | 读线程终止条件，防死锁 |
-| S2 ✅ `job.rs` + 裸 spawn | ~250 | Job 强杀 ping；进程数=1 生效 | 句柄 RAII、KILL_ON_JOB_CLOSE 时序 |
-| S3 ✅ `monitor.rs` + verdict(AC/RE) | ~200 | sleep 程序 CPU/wall 差异；非零退出判 RE | GIL 释放边界 |
-| S4 ✅ `sandbox.rs` 接线 | ~150 | 冒烟：run() 返回真实 Status | 字段语义对照冻结 API |
+| **P1 测量核心**<br>（无安全，验证测量正确性） | S1 ✅ | `stdio.rs` 管道层 | echo 捕获、截断标志 | 单测：读线程终止条件，防死锁 |
+| | S2 ✅ | `job.rs` + 裸 spawn | Job 强杀 ping；进程数=1 生效 | 单测：句柄 RAII、KILL_ON_JOB_CLOSE 时序 |
+| | S3 ✅ | `monitor.rs` + verdict(AC/RE) | sleep 程序 CPU/wall 差异；非零退出判 RE | 单测：GIL 释放边界 |
+| | S4 ✅ | `sandbox.rs` 接线 | 冒烟：run() 返回真实 Status | 单测：字段语义对照冻结 API |
+| **P2 沙箱化** | S5 ✅ | `workdir.rs` 临时目录+copy_in | copy_in 落 cwd；块退出目录消失；junction 删净 | 单测：删除不跟随 reparse；异常不泄漏目录 |
+| | S6 ✅ | `token.rs` AppContainer profile/SID | 令牌起进程身份正确 | 单测：profile 复用策略 |
+| | S7 ✅ | `acl.rs` + 接入 spawn | **安全里程碑**：写 C:\ 失败、写 cwd 成功、读 runtimes 成功（写 runtimes 拒绝） | 单测：ACE 权限位精确；TEMP 指向 cwd |
+| **P3 攻击面加固** | S8 ✅ | mitigation policies + 禁网 | 攻击清单 1–7（`examples/s8_smoke.py`，行为级探针 + 子进程内核状态自查询） | 单测：WIN32K=0x1<<28、EXTENSION_POINT=0x1<<32（官方 shift） |
+| **P4 判定完备** | S9 ✅ | 看门狗 + TLE/MLE | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE | 单测：证据优先于 exit code（见 §9.2.5） |
+| | S10 ✅ | 完整 NTSTATUS 表 + OLE | 段错误/栈溢出分类；输出喷泉 mid-run 击杀判 OLE+truncated | 单测：`*_limit` 是击杀阈值；NTSTATUS 表逐条对照 |
+| **P5 生命周期** | S11 ✅ | 异常路径 + `__exit__` 强化 | judger 被杀后无孤儿进程/无残留目录 | 单测：守卫类型(Drop)而非手动清理 |
+| | S12 ✅ | 并发与压力 | 8 路并发 ×50 次稳定（400 次全 AC、无残留目录、抖动 2-4%） | 单测：零共享状态审查（可变全局仅 5 处） |
+| **P6 测试套件** | S13 ✅ | pytest 三件套 + README 能力矩阵 | 59 pytest 全绿（functional 21 / attack 23 / limits 15） | 单测：顺带修掉 CPU 时间测量 bug（见 §9.2.10）与残余子孙竞态（见 §9.2.11） |
 
-### P2 沙箱化
-
-| 步 | 内容 | 行数 | 验证 | review 重点 |
-|---|---|---|---|---|
-| S5 ✅ `workdir.rs` 临时目录+copy_in | ~200 | copy_in 落 cwd；块退出目录消失；junction 删净 | 删除不跟随 reparse；异常不泄漏目录 |
-| S6 ✅ `token.rs` AppContainer profile/SID | ~150 | 令牌起进程身份正确 | profile 复用策略 |
-| S7 ✅ `acl.rs` + 接入 spawn | ~300 | **安全里程碑达成**：写 C:\ 失败、写 cwd 成功、读 runtimes 成功（写 runtimes 也拒绝）；python via runtimes 跑通 | ACE 权限位精确（READ\|EXECUTE 无 WRITE/DELETE）；TEMP 指向 cwd |
-
-### P3 攻击面加固
-
-| 步 | 内容 | 行数 | 验证 |
-|---|---|---|---|
-| S8 ✅ mitigation policies + 禁网 | ~250 | 攻击清单 1–7 全灭（examples/s8_smoke.py；每个 policy 有行为级探针/子进程内核状态自查询） | WIN32K=0x1<<28、EXTENSION_POINT=0x1<<32（官方 shift，非 winnt.h 记忆值） |
-
-### P4 判定完备
-
-| 步 | 内容 | 行数 | 验证 | review 重点 |
-|---|---|---|---|---|
-| S9 ✅ 看门狗 + TLE/MLE | ~200 | `while(1)`/`sleep(inf)`/malloc 炸弹 → TLE/TLE/MLE（examples/s9_smoke.py + 行为级单测） | 强杀后 CPU 证据仍可读（改用 Job accounting，见 §9.2.10）；证据优先于 exit code（MLE>TLE>exit code） |
-| S10 ✅ 完整 NTSTATUS 表 + OLE | ~250 | 段错误/栈溢出分类（rustc 探针）；输出喷泉 mid-run 击杀判 OLE+truncated（examples/s10_smoke.py） | `*_limit` 是击杀阈值：读线程超限 SetEvent → monitor WaitForMultipleObjects 强杀；恰好等于限额仍 AC；`truncated` 只在真正丢字节时置位；NTSTATUS 表逐条对照 ntstatus_name |
-
-### P5 生命周期
-
-| 步 | 内容 | 行数 | 验证 | review 重点 |
-|---|---|---|---|---|
-| S11 ✅ 异常路径 + `__exit__` 强化 | ~200 | judger 被杀后无孤儿进程/无残留目录（examples/s11_smoke.py + sweep 单测） | 守卫类型(Drop)而非手动清理：spawn 的 `SuspendedGuard`（assign 失败即杀挂起子进程）+ `WorkDir::Drop` + 死主 sweep（`Sandbox::new`/`__exit__`） |
-| S12 ✅ 并发与压力 | ~250 | 8 路并发 ×50 次稳定（examples/s12_stress.py：400 次全 AC、无残留目录、计时抖动 2-4%）；每线程各自构造 Sandbox 的并发 sweep（examples/s12_probe.py） | 零共享状态审查：全部可变全局仅 5 处（见 §9.2.7），均已加锁/原子化 |
-
-### P6 测试套件
-
-| 步 | 内容 | 验证 |
-|---|---|---|
-| S13 ✅ pytest 三件套 | 55 pytest（functional 21 / attack 19 / limits 15）+ README 能力矩阵 | 全绿；顺带修掉 CPU 时间测量 bug（见 §9.2.10） | 攻击样本用纯 Python 探针（沙箱内 ctypes 不可用，见踩坑 15）；子进程"允许但有界"按既定设计断言 |
-
-**节奏约定**：每步一个 commit（`feat(win32): S<n> ...`）；单步预计超 250 行时
-先停下协商拆分，不硬写。
+**节奏约定（沿用）**：每步一个 commit（`feat(win32): S<n> ...`）；单步预计超
+250 行时先停下协商拆分，不硬写。
 
 ### 6.1 测试套件（S13）
 
@@ -191,7 +172,7 @@ verdict.rs 的映射表独立成文件便于逐条 review。
 tests/
 ├── conftest.py          fixtures：被测解释器、runtimes、sandbox、宿主秘密文件
 ├── test_functional.py   21 例：API 契约的正常路径（copy_in/env/stdin/stdout_file/校验异常）
-├── test_attack.py       19 例：§7 攻击清单的 pytest 化（每个都断言"被拒绝"的行为级证据）
+├── test_attack.py       23 例：§7 攻击清单的 pytest 化（每个都断言"被拒绝"的行为级证据）
 └── test_limits.py       15 例：CPU/墙钟/内存/输出四类限额与判定
 ```
 
@@ -200,19 +181,32 @@ tests/
 `ctypes` 连加载都失败（踩坑 15），所以"ctypes 加载失败"本身就是
 win32k 策略生效的直接证据。
 
+> **测试有效性纪律**：断言必须"非平凡"——例如"judger 被中断后无孤儿进程"
+> 那条用例，把 `KILL_ON_JOB_CLOSE` 去掉后**必须失败**才算有效断言；
+> 清理动作（taskkill）只能放在断言**之后**，否则断言会被清理动作本身
+> 满足而变成同义反复。
 
-## 7. 攻击样本回归清单（S8 起逐步变绿，S13 全量 pytest 化）
 
-1. 写 `C:\Windows\Temp` / 桌面 → 拒绝（AppContainer + ACL）
-2. 读写 cwd 外文件、遍历 `C:\` → 拒绝
-3. `RegSetValue` HKCU/HKLM → 拒绝
-4. socket 连外网 → 拒绝（无 capability）
-5. `CreateProcess` 自复制 → 失败（双保险）
-6. `while(1)` / `Sleep(∞)` / malloc 炸弹 / stdout 喷泉 → TLE/TLE/MLE/OLE
-7. `ExitWindowsEx`/`BlockInput`/`MessageBox` → 失败/无效果（win32k 禁用 + UI 限制）
-8. `OpenProcess(WRITE)` 他人进程 / 发窗口消息 → 拒绝
-9. judger 被 Ctrl+C → 被测进程随 KILL_ON_JOB_CLOSE 死亡，无残留 `river-*` 目录
-10. cwd 留 junction 指向系统目录 → 清理不跟随
+## 7. 攻击样本回归清单（pytest 化，S13 收口）
+
+| # | 攻击面 | 期望 | 覆盖位置 |
+|---|---|---|---|
+| 1 | 写 `C:\Windows\Temp` / 桌面 | 拒绝（AppContainer + ACL） | `test_attack.py::test_write_to_system_temp_is_denied` / `..._to_desktop_...` |
+| 2 | 读写 cwd 外文件、遍历 `C:\` | 拒绝 | `..._host_file_outside_cwd_is_invisible` / `..._walking_the_host_drive_...` |
+| 3 | `RegSetValue` HKCU/HKLM | 拒绝 | `..._registry_write_is_denied` / `..._registry_read_outside_the_profile_...` |
+| 4 | socket 连外网 / DNS | 拒绝（无 capability） | `..._outbound_network_is_denied` / `..._dns_resolution_is_denied` |
+| 5 | `CreateProcess` 自复制 | **允许但有界**（设计决策 §9.2.2） | `..._child_processes_are_allowed_but_bounded` / `..._fork_bomb_is_bounded` |
+| 6 | `while(1)` / `Sleep(∞)` / malloc 炸弹 / stdout 喷泉 | TLE/TLE/MLE/OLE | `test_limits.py` 四例 + `test_attack.py::..._resource_exhaustion_...` |
+| 7 | `ExitWindowsEx`/`BlockInput`/`MessageBox` | 失败/无效果（win32k 禁用） | `test_attack.py::test_gui_and_shutdown_apis_are_unreachable`（+ Rust 侧 `LoadLibraryA` 原生探针） |
+| 8 | `OpenProcess(WRITE)` 他人进程 / 发窗口消息 | 拒绝 | `test_attack.py::test_opening_another_process_for_write_is_denied` / `..._window_messages_...` |
+| 9 | judger 被中断（Ctrl+C / 崩溃） | 被测进程随 KILL_ON_JOB_CLOSE 死亡，无残留 `river-*` 目录 | `test_attack.py::test_an_interrupted_judger_leaves_no_orphan_process`（**已验证：去掉 KILL_ON_JOB_CLOSE 该用例必失败**） || 10 | cwd 留 junction 指向系统目录 | 清理不跟随 | `test_attack.py::..._junction_left_in_cwd_is_not_followed_...` + workdir.rs 单测 |
+
+> **注（攻击面 7/8 的探针限制）**：win32k 锁定下 `import ctypes` 整体失败
+> （`_ctypes.pyd` 静态依赖 user32），所以 Python 层的攻击探针**无法**直接
+> 调用 Win32 GUI API。能观察到的证据是"ctypes 加载失败"本身——它证明所有
+> user32 后端 API（ExitWindowsEx/BlockInput/MessageBox/PostMessage）都
+> 不可达。底层证据（`LoadLibraryA("user32.dll")` 在不静态导入 user32 的
+> 原生探针里失败）在 Rust 单测 `spawn.rs` 里。
 
 ## 8. 已知限制（首版）
 
@@ -221,10 +215,14 @@ win32k 策略生效的直接证据。
 - 内存为 commit 语义（与 Linux RSS 差异见 DESIGN.md）
 - Defender 实时扫描对首次冷启动有影响（建议对临时目录根加排除，文档说明，
   不自动改系统配置）
+- 允许派生子进程（普通包装器需要）；约束是 64 存活上限 + 残余检测（SE）
+- 普通 Win32 GUI 程序的窗口会暴露到用户桌面（未做私有桌面隔离，见踩坑 18）
+- 沙箱内 `ctypes` 整体不可用（win32k 锁定的副作用）——被测程序若依赖
+  ctypes/PowerShell/CLR 会在加载阶段失败（0xC0000142）
 
-## 9. 实施进度与交接说明（2026-11，跨对话工作上下文）
+## 9. 决策记录与实施历史（2026-11）
 
-### 9.1 已完成（S1–S6，全部有提交 + 单测 + 冒烟验证）
+### 9.1 提交清单（全部有提交 + 单测 + 冒烟验证）
 
 | 提交 | 内容 |
 |---|---|
@@ -240,17 +238,19 @@ win32k 策略生效的直接证据。
 | `a759830` | S7 acl.rs（grant/grant_rw/grant_ro，幂等去重）+ spawn.rs 接入 AppContainer（SECURITY_CAPABILITIES + HANDLE_LIST + 白名单环境块）+ sandbox.rs 全链路接线 |
 | `3d929c7` | S8 spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`（WIN32K_SYSTEM_CALL_DISABLE + EXTENSION_POINT_DISABLE，均为 ALWAYS_ON）+ examples/s8_smoke.py（攻击清单 1–7 探针） |
 | `cb6f7f6` | S8 修整：移除探针中的 GUI 触发路径（打包版 notepad stub 句柄杀不掉真窗口，泄漏桌面窗口）；EXTENSION_POINT 验证定版为子进程内核状态自查询 |
-| （S9） | S9 verdict.rs 证据优先判定（SE>MLE>TLE>exit code）+ monitor CPU/MLE 行为级单测 + examples/s9_smoke.py |
-| （S10） | S10 OLE 击杀阈值（stdio 超限事件 + monitor 双路等待 + `KillReason::OutputLimit`）+ NTSTATUS 全表（ntstatus_name）+ examples/s10_smoke.py |
-| （S11） | S11 `SuspendedGuard`（assign 失败杀挂起子进程）+ `sweep_stale_workdirs`（死主目录清扫，接入 `Sandbox::new`/`__exit__`）+ examples/s11_smoke.py |
-| （S12） | S12 并发修复：AppContainer profile 创建加锁 + 每进程只创建一次（token.rs）、DACL 授权串行化（acl.rs）、过期目录清扫串行化（workdir.rs）、`Sandbox` 改 `frozen`（可多线程并发 run）+ examples/s12_stress.py / s12_probe.py |
-| （S13） | S13 pytest 三件套（tests/：functional 21 / attack 19 / limits 15）+ README 能力矩阵 + **CPU 时间测量修复**（改用 Job accounting，见 §9.2.10） |
+| `8a28e2e` | S9 verdict.rs 证据优先判定（SE>OLE>MLE>TLE>exit code）+ monitor CPU/MLE 行为级单测 + examples/s9_smoke.py |
+| `40aad23` | S10 OLE 击杀阈值（stdio 超限事件 + monitor 双路等待 + `KillReason::OutputLimit`）+ NTSTATUS 全表（ntstatus_name）+ examples/s10_smoke.py |
+| `948ba7a` | S11 `SuspendedGuard`（assign 失败杀挂起子进程）+ `sweep_stale_workdirs`（死主目录清扫，接入 `Sandbox::new`/`__exit__`）+ examples/s11_smoke.py |
+| `96bf8d4` | S12 并发修复：AppContainer profile 创建加锁 + 每进程只创建一次（token.rs）、DACL 授权串行化（acl.rs）、过期目录清扫串行化（workdir.rs）、`Sandbox` 改 `frozen`（可多线程并发 run）+ examples/s12_stress.py / s12_probe.py |
+| `722e31e` | S13 pytest 三件套（tests/：functional 21 / attack 23 / limits 15）+ README 能力矩阵 + **CPU 时间测量修复**（改用 Job accounting，见 §9.2.10） |
 
-当前状态：`run()` 已可端到端工作（example.py 三个场景全过：AC、copy_in、TLE
-看门狗），Rust 单测 29/29 绿。**进程已跑在 AppContainer 身份下 + 内核攻击面
-收窄**：win32k 系统调用与全局钩子/AppInit/Winsock LSP/legacy IME 注入被禁，
-无 capability 即禁网；文件系统可见面 = cwd 可写 + runtimes 只读（攻击清单
-1–7 见 examples/s8_smoke.py，OLE 判定待 S10）。
+当前状态：Windows 后端首版完成。`run()` 端到端可用；Rust 单测 53/53 绿，
+pytest 59 例全绿（functional / attack / limits 三件套）。**进程跑在
+AppContainer 身份下 + 内核攻击面收窄**：win32k 系统调用与全局钩子/AppInit/
+Winsock LSP/legacy IME 注入被禁，无 capability 即禁网；文件系统可见面 =
+cwd 可写 + runtimes 只读；判定完备（AC/TLE/MLE/OLE/RE/SE）；生命周期由
+RAII 守卫保证（杀 judger 无孤儿进程、无残留目录）；并发安全（8 路 ×50 次
+压力全绿）。
 
 ### 9.2 关键实现决策（已定，勿翻案）
 
@@ -301,6 +301,12 @@ win32k 策略生效的直接证据。
     正确来源是 Job 的 `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`
     （`TotalUserTime`/`TotalKernelTime`）——它统计**整棵树**（主进程 +
     所有子孙），这正是评测需要的语义。改动见 `Job::cpu_time_ms`。
+11. **残余子孙判定必须排除主进程自己的 pid（S13 竞态）**：内核是
+    **异步**更新 Job 的进程列表的——主进程被 signal 之后的一小段时间内，
+    它仍可能出现在列表里。把主进程算作"残余子孙"会让正常程序偶发被判
+    `SE`（实测 400 次并发里偶发 1 次）。修法：`Job::alive_process_ids()`
+    返回 pid 列表，monitor 用主进程 pid 过滤掉它
+    （见 `monitor.rs` 的 `main_pid` 过滤）。
 
 ### 9.3 踩坑记录（写后续代码前必读）
 
@@ -389,33 +395,33 @@ win32k 策略生效的直接证据。
     实测 500ms 的 CPU 限额在 ~1200ms 才触发（且含进程启动开销）。判定
     不能依赖"恰好在限额处被杀"，必须用**实测 CPU 时间与限额比较**
     （这正是 S9 引入的证据逻辑）。
+28. **抖动基线要用 MAD，不能用极差（S13）**：宿主机偶发卡顿（Defender
+    扫描、调度、其他进程）会让单次样本翻倍（实测 326ms → 637ms）。
+    用极差（max-min）判定基线会被宿主机噪声打穿；改用**中位数绝对偏差**
+    （MAD）后，真实抖动是 **0–0.5%**，宿主机噪声单独作为 outliers 报告。
+    另：第一次样本是冷启动（新建 .pyd 的首次扫描），基线要丢掉它。
 
-### 9.4 下一步（按序）
+### 9.4 后续方向（Windows 后端已收官）
 
-1. ~~**S7 `acl.rs` + spawn 接入**~~ ✅ 已完成（见 §9.1）：
-   - spawn.rs 加 `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`（SID 来自 token.rs）
-     与 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`（只继承三个 std 句柄）——均已实现
-   - acl.rs：cwd 目录加 AppContainer SID 的读写 ACE；runtimes 目录只读+执行 ACE；
-     TEMP/TMP 环境变量指向 cwd 下 tmp 子目录；env 白名单基底（SystemRoot 必带，
-     **LOCALAPPDATA 也必带**，见踩坑 10）——均已实现
-2. ~~S8 mitigation policies~~ ✅ 已完成（见 §9.1）：
-   - spawn.rs 加 `PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY`
-     （WIN32K_SYSTEM_CALL_DISABLE = 0x1<<28 + EXTENSION_POINT_DISABLE =
-     0x1<<32，ALWAYS_ON，单 u64；CHILD_PROCESS_DISABLED 保持弃用）
-   - 行为级验证：win32k=探针进程 LoadLibrary(user32) 拒绝（Rust 单测现编
-     原生探针）、ext-point=子进程自查询 GetProcessMitigationPolicy(6)、
-     禁网=沙箱内 socket 连外网拒绝（examples/s8_smoke.py）
-3. ~~S9–S13~~ ✅（见 §9.1/§9.2.5–§9.2.10）。**Windows 后端首版完成**：
-   S1–S13 全部提交，49+2 Rust 单测 + 55 pytest 全绿，README 能力矩阵
-   齐备。后续方向（按需排期）：Linux/macOS 后端（§1 的统一模型已定义，
-   但尚未实现）、`allow_network` 能力、copy_in 可写白名单、私有桌面
-   隔离 GUI（见踩坑 18）、S12 之后的压力基线常态化。
-4. 全程：每步一 commit（`feat(win32): S<n> ...`），单步 ≤250 行，先验证后提交
+**Windows 后端首版完成**：S1–S13 全部提交，52 Rust 单测 + 59 pytest 全绿，
+README 能力矩阵齐备。后续可排期的方向（按价值排序，均**未开始**）：
+
+| 方向 | 说明 | 备注 |
+|---|---|---|
+| Linux / macOS 后端 | §1 的统一模型已定义（chroot / sandbox-exec + bind mount），但尚未实现 | 跨平台承诺的另一半 |
+| `allow_network` 能力 | AppContainer 加 `internetClient` capability 即可，机制已通 | 当前一律禁网 |
+| copy_in 可写白名单 | 需要一个"哪些 copy_in 文件可写"的参数 | 现为一律只读 |
+| 私有桌面隔离 GUI | `CreateDesktopW` 让 GUI 程序不落到用户桌面 | 见踩坑 18（已知并接受） |
+| 压力基线常态化 | 把 S12 的 8×50 压力与抖动基线接进 CI | 目前靠 examples/s12_stress.py 手动跑 |
+| 限额可配置化 | 内部安全上限（wall ≤ 24h、内存 ≤ 物理内存）目前是常量 | 可提升为构造参数 |
+
+**节奏约定（沿用）**：每步一个 commit（`feat(win32): S<n> ...`）；单步预计超
+250 行时先停下协商拆分，不硬写。
 
 ### 9.5 工作环境备忘
 
-- 构建/测试：`cargo test --lib -- --test-threads=1`（51 个单测）；pytest：
-  `uv sync --extra test && uv run maturin develop && uv run pytest`（55 例）；
+- 构建/测试：`cargo test --lib -- --test-threads=1`（53 个单测）；pytest：
+  `uv sync --extra test && uv run maturin develop && uv run pytest`（59 例）；
   Python 冒烟：`uv run python -c ...`（用 `sys.executable` 作为被测程序）
 - example.py：`uv run python examples/example.py`（三个场景可运行，已跑在
   AppContainer 下）；`examples/s7_smoke.py`：S7 安全里程碑四项验证；

@@ -44,6 +44,28 @@ pub(crate) fn mitigation_policies_ext_only() -> u64 {
 use crate::platform::windows::job::{Job, wait_process_exit};
 use crate::platform::windows::stdio::StdioSet;
 
+/// Silence the Windows "crash" dialog for sandboxed children.
+///
+/// `SEM_NOGPFAULTERRORBOX` suppresses the pop-up the system would show when
+/// a child dies from an unhandled exception (the classic "This program has
+/// encountered a serious problem" dialog). The child inherits the error
+/// mode of the process that created it, so setting it in the judger before
+/// the spawn is enough.
+///
+/// The mode is process-global, so the previous value is restored right
+/// after the spawn to avoid changing the judger's own behaviour.
+pub(crate) fn with_silent_crash_dialog<T>(f: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Diagnostics::Debug::{
+        SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SetErrorMode,
+    };
+    // SAFETY: SetErrorMode takes/returns an error mode bitmask; no pointers.
+    let previous = unsafe { SetErrorMode(SEM_NOGPFAULTERRORBOX | SEM_FAILCRITICALERRORS) };
+    let result = f();
+    // SAFETY: restoring the previously observed mode.
+    unsafe { SetErrorMode(previous) };
+    result
+}
+
 /// A spawned, still-owned child. The process starts suspended inside `job`;
 /// call [`SpawnedChild::resume`] to let it run.
 pub(crate) struct SpawnedChild {
@@ -396,6 +418,35 @@ mod tests {
             cpu_time_limit_ms: None,
             max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
         }
+    }
+
+    /// The error mode is process-global: the helper must restore whatever
+    /// was set before, so the judger's own behaviour is untouched.
+    #[test]
+    fn silent_crash_dialog_restores_the_previous_error_mode() {
+        use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
+        // SAFETY: no pointers; returns the previous mode.
+        let before = unsafe { SetErrorMode(0) };
+        // SAFETY: restore the mode we just observed.
+        unsafe { SetErrorMode(before) };
+
+        with_silent_crash_dialog(|| {
+            use windows_sys::Win32::System::Diagnostics::Debug::SetErrorMode;
+            // SAFETY: read the current mode back.
+            let inside = unsafe { SetErrorMode(0) };
+            // SAFETY: restore it.
+            unsafe { SetErrorMode(inside) };
+            assert_ne!(
+                inside, before,
+                "SEM_NOGPFAULTERRORBOX was not applied inside the guard"
+            );
+        });
+
+        // SAFETY: read the mode back after the guard.
+        let after = unsafe { SetErrorMode(0) };
+        // SAFETY: restore it.
+        unsafe { SetErrorMode(after) };
+        assert_eq!(after, before, "the error mode was not restored");
     }
 
     /// Spawn + resume + wait, returning (exit_code, outputs).

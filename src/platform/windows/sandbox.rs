@@ -10,7 +10,7 @@ use crate::platform::windows::acl;
 use crate::platform::windows::job::{Job, JobLimits, physical_memory_bytes};
 use crate::platform::windows::monitor::monitor;
 use crate::platform::windows::spawn::{
-    SpawnSecurity, env_block, mitigation_policies, spawn_bare,
+    SpawnSecurity, env_block, mitigation_policies, spawn_bare, with_silent_crash_dialog,
 };
 use crate::platform::windows::stdio::{StdinSource, StdioSet};
 use crate::platform::windows::token::AppContainer;
@@ -250,14 +250,19 @@ impl Sandbox {
                 stdout_file,
                 stderr_file,
             )?;
-            let child = spawn_bare(
-                &exe,
-                &args,
-                &job,
-                &mut set,
-                cwd_path.as_deref(),
-                Some(&security),
-            )?;
+            // The child inherits the judger's error mode: suppress the
+            // Windows "serious problem" crash dialog for sandboxed
+            // programs (see `with_silent_crash_dialog`).
+            let child = with_silent_crash_dialog(|| {
+                spawn_bare(
+                    &exe,
+                    &args,
+                    &job,
+                    &mut set,
+                    cwd_path.as_deref(),
+                    Some(&security),
+                )
+            })?;
             // S10: the reader threads fire the overflow event past an output
             // kill threshold; the monitor waits on it alongside the process
             // and reaps the job (verdict OLE) instead of waiting for exit.

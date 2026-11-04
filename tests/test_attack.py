@@ -213,6 +213,105 @@ def test_win32k_calls_are_denied(sandbox, python_exe):
     assert r.stdout.strip() == b"DENIED"
 
 
+def test_gui_and_shutdown_apis_are_unreachable(sandbox, python_exe):
+    """Attack item 7: ExitWindowsEx / BlockInput / MessageBox must fail.
+
+    All three live in user32. Under WIN32K_SYSTEM_CALL_DISABLE the user32
+    subsystem cannot initialize at all — and that is observable from Python:
+    `import ctypes` fails, because `_ctypes.pyd` statically imports user32
+    ("DLL 初始化例程失败"). Since ctypes is the only way for a Python
+    program to reach *any* Win32 GUI API, its failure is proof that the
+    whole API surface is unreachable.
+
+    (The lower-level proof — `LoadLibraryA("user32.dll")` failing in a
+    native probe that does not import user32 statically — lives in the Rust
+    test `spawn.rs::mitigation_policies_are_enforced_...`.)
+    """
+    code = (
+        "try:\n"
+        "    import ctypes\n"
+        "    # ctypes loaded: the lockdown did NOT hold.\n"
+        "    try:\n"
+        "        u = ctypes.WinDLL('user32', use_last_error=True)\n"
+        "    except OSError:\n"
+        "        print('user32-unloadable')\n"
+        "        raise SystemExit(0)\n"
+        "    out = []\n"
+        "    for name, fn in (('exitwindows', lambda: u.ExitWindowsEx(0, 0)),\n"
+        "                       ('blockinput', lambda: (u.BlockInput(True),\n"
+        "                                            u.BlockInput(False))),\n"
+        "                       ('messagebox', lambda: u.MessageBoxW(\n"
+        "                           None, 'x', 'x', 0))):\n"
+        "        try:\n"
+        "            fn()\n"
+        "            out.append(name + '=LEAK')\n"
+        "        except Exception:\n"
+        "            out.append(name + '=denied')\n"
+        "    print('|'.join(out))\n"
+        "except ImportError as e:\n"
+        "    # The lockdown holds: ctypes itself cannot be loaded.\n"
+        "    print('ctypes-unloadable')\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    assert r.status == "AC", r.stderr
+    out = r.stdout.decode(errors="replace").strip()
+    assert "LEAK" not in out, f"a shutdown/UI call had an effect: {out}"
+    if "ctypes-unloadable" not in out:
+        # ctypes did load (unexpected) — then each call must still fail.
+        assert out.count("=denied") == 3, out
+
+
+def test_opening_another_process_for_write_is_denied(sandbox, python_exe):
+    """Attack item 8: OpenProcess(WRITE) on a foreign process must fail.
+
+    The AppContainer token holds no rights on processes outside its
+    profile. ctypes is unavailable inside the sandbox (win32k lockdown), so
+    the probe uses the closest reachable equivalent: `os.kill` on a foreign
+    pid, which needs the same kind of PROCESS_TERMINATE / handle rights.
+    Any successful termination of a foreign process would be a leak.
+    """
+    code = (
+        "import os, signal\n"
+        "leaked = []\n"
+        "for pid in (4, 1):\n"
+        "    try:\n"
+        "        os.kill(pid, signal.SIGTERM)\n"
+        "        leaked.append(str(pid))\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "print('LEAK' if leaked else 'DENIED')\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    assert r.status == "AC", r.stderr
+    assert r.stdout.strip() == b"DENIED"
+
+
+def test_window_messages_to_foreign_windows_are_denied(sandbox, python_exe):
+    """Attack item 8 (second half): posting window messages must fail.
+
+    Window messages need a user32 handle. The lockdown makes user32
+    uninitializable, so the message API is unreachable — observed through
+    the ctypes load failure (see the item 7 test for the full argument).
+    """
+    code = (
+        "try:\n"
+        "    import ctypes\n"
+        "    u = ctypes.WinDLL('user32', use_last_error=True)\n"
+        "    u.PostMessageW.restype = ctypes.c_int\n"
+        "    u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,\n"
+        "                              ctypes.c_uintptr, ctypes.c_intptr]\n"
+        "    ok = u.PostMessageW(None, 0x0010, 0, 0)  # WM_CLOSE to no window\n"
+        "    print('LEAK' if ok else 'DENIED')\n"
+        "except (ImportError, OSError):\n"
+        "    print('DENIED')\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    assert r.status == "AC", r.stderr
+    assert r.stdout.strip() == b"DENIED"
+
+
 def test_ctypes_cannot_initialize_under_the_win32k_lock(sandbox, python_exe):
     # Attack item 8/7 (ctypes is the only in-sandbox way to reach
     # OpenProcess/ExitWindowsEx/BlockInput): under WIN32K_SYSTEM_CALL_DISABLE
@@ -324,6 +423,109 @@ def test_the_program_cannot_escape_via_the_parent_process(sandbox, python_exe):
     r = _probe(sandbox, python_exe, code)
     assert r.status == "AC", r.stderr
     assert r.stdout.strip() == b"DENIED"
+
+
+def test_an_interrupted_judger_leaves_no_orphan_process(sandbox, python_exe, runtimes):
+    """Attack item 9: interrupting the judger must not leave orphans.
+
+    The judger runs in a child process and is killed abruptly (a hard
+    termination — the same end state a user pressing Ctrl+C produces, and a
+    stricter one than a clean exit). The sandboxed program must die with it
+    (KILL_ON_JOB_CLOSE), and no per-run directory may be left behind.
+
+    The assertions run BEFORE any forced cleanup of ours: otherwise the
+    cleanup itself would satisfy them and the test would be vacuous.
+
+    NOTE on pids: the venv `python.exe` is a launcher, so the pid we get
+    back is not the interpreter's. We therefore identify the sandboxed
+    program by its command line instead of by pid.
+    """
+    import glob
+    import subprocess
+    import tempfile
+    import time
+
+    marker = "river-attack-ctrlc-marker"
+    # The marker is in the *sandboxed program's* command line, so we can
+    # find it (and prove it is gone) by scanning process command lines.
+    program_code = f"import time; time.sleep(120)  # {marker}"
+    judger_code = f"""
+import river, sys, time
+sb = river.Sandbox(runtimes={runtimes!r})
+with sb:
+    sb.run(r'''{python_exe}''', ['-c', {program_code!r}],
+           wall_time_limit_ms=120000)
+    time.sleep(120)
+"""
+    src = os.path.join(tempfile.gettempdir(), "river-attack-judger.py")
+    with open(src, "w") as f:
+        f.write(judger_code)
+
+    before = set(glob.glob(os.path.join(tempfile.gettempdir(), "river-*")))
+    # The judger runs in its own console process group, so that the
+    # interruption below cannot leak into the test runner.
+    judger = subprocess.Popen(
+        [python_exe, src],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    )
+    try:
+        # Wait until the sandboxed program is really running.
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            if _processes_with_marker(marker):
+                break
+            if judger.poll() is not None:
+                break
+            time.sleep(0.2)
+        assert _processes_with_marker(marker), "the sandboxed program never started"
+
+        # Interrupt the judger the way a user aborting it would: a hard
+        # termination (Ctrl+C at the console ends up here too, and a crash
+        # is the harsher case). No `finally`-cleanup may run before the
+        # assertions below, or they would be tautological.
+        judger.kill()
+        deadline = time.time() + 15
+        while time.time() < deadline and judger.poll() is None:
+            time.sleep(0.2)
+        assert judger.poll() is not None, \
+            "the judger did not die — the scenario was not exercised"
+
+        # The sandbox guarantees, checked *before* any forced cleanup.
+        time.sleep(2.0)
+        orphans = _processes_with_marker(marker)
+        assert orphans == [], \
+            f"the sandboxed program survived the interrupted judger: {orphans}"
+    finally:
+        if judger.poll() is None:
+            subprocess.run(
+                ["taskkill", "/PID", str(judger.pid), "/T", "/F"],
+                capture_output=True,
+            )
+            judger.wait()
+
+    # No per-run directory may be left behind (the sweep in Sandbox.__new__
+    # recovers it).
+    river.Sandbox()
+    leaked = set(glob.glob(os.path.join(tempfile.gettempdir(), "river-*"))) - before
+    assert leaked == set(), f"residual working directories: {leaked}"
+
+    os.remove(src)
+
+
+def _processes_with_marker(marker: str) -> list[str]:
+    """Command lines of running python processes containing `marker`."""
+    import subprocess
+    ps = (
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
+        "| ForEach-Object { $_.CommandLine }"
+    )
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-c", ps],
+        capture_output=True, text=True,
+    ).stdout
+    return [l for l in out.splitlines() if marker in l]
 
 
 def test_residual_children_are_reported_as_se(sandbox, python_exe):

@@ -110,7 +110,17 @@ pub(crate) fn monitor(
     // descendant that outlived its parent. Kill it immediately (no program
     // may keep running after the judged process is gone) and report it so
     // the verdict can be `SE` instead of a misleading `AC`.
-    let residual_processes = job.alive_process_count().unwrap_or(0);
+    //
+    // The main process' own pid is excluded: the kernel updates the job's
+    // process list asynchronously, so right after the main process is
+    // signaled it may still be listed — counting it as a residual
+    // descendant produced spurious `SE` verdicts under load (1 in 400
+    // concurrent runs).
+    let main_pid = child.pid;
+    let residual_processes = match job.alive_process_ids() {
+        Ok(ids) => ids.iter().filter(|pid| **pid != main_pid).count() as u32,
+        Err(_) => 0,
+    };
     if residual_processes > 0 {
         let _ = job.terminate(KILL_EXIT_CODE);
     }
@@ -226,6 +236,26 @@ mod tests {
             o.cpu_time_ms,
             o.wall_time_ms
         );
+    }
+
+    /// S13 regression: a plain program that exits on its own must never be
+    /// reported as having residual descendants.
+    ///
+    /// The kernel updates the job's process-id list asynchronously, so right
+    /// after the main process is signaled it may still be listed. Counting
+    /// it produced spurious `SE` verdicts under load (1 in 400 concurrent
+    /// runs). The main process' pid is excluded for that reason.
+    #[test]
+    fn a_self_exiting_program_has_no_residual_children() {
+        for _ in 0..20 {
+            let o = run_monitored("cmd", &["/c", "echo hi"], None).unwrap();
+            assert_eq!(o.kill_reason, KillReason::None);
+            assert_eq!(o.exit_code, 0);
+            assert_eq!(
+                o.residual_processes, 0,
+                "a self-exiting program was reported as having residual children"
+            );
+        }
     }
 
     #[test]

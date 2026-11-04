@@ -14,15 +14,15 @@ uv run ./examples/example.py
 - [DESIGN.md](DESIGN.md) — frozen API contract and the unified cross-platform
   model (private cwd + read-only runtimes + copy_in + env)
 - [docs/windows-backend.md](docs/windows-backend.md) — Windows backend
-  technical design (AppContainer + Job Object + mitigation policies) and the
-  staged implementation plan
+  technical design (AppContainer + Job Object + mitigation policies),
+  verdict semantics, decision log and implementation history
 
 ## Status
 
 | Area | Linux | macOS | Windows |
 |---|---|---|---|
 | Implementation | planned | planned | **done** (AppContainer + Job Object) |
-| Tests | — | — | 49 Rust unit tests + 55 pytest tests |
+| Tests | — | — | 53 Rust unit tests + 59 pytest tests |
 
 ## Windows capability matrix
 
@@ -37,9 +37,10 @@ Everything below is verified by the test suite
 | Filesystem | private writable cwd per run; `runtimes` read-only via ACE grants | `test_functional.py::test_cwd_is_inside_the_sandbox` |
 | Network | denied by default (no capability) | `test_attack.py::test_outbound_network_is_denied` |
 | Registry | denied (HKCU/HKLM) | `test_attack.py::test_registry_write_is_denied` |
-| Kernel attack surface | `WIN32K_SYSTEM_CALL_DISABLE` + `EXTENSION_POINT_DISABLE` | `test_attack.py::test_win32k_calls_are_denied` |
+| Kernel attack surface | `WIN32K_SYSTEM_CALL_DISABLE` + `EXTENSION_POINT_DISABLE` | `test_attack.py::test_win32k_calls_are_denied` / `..._gui_and_shutdown_apis_are_unreachable` |
 | Process tree | Job Object: max 64 live processes, `KILL_ON_JOB_CLOSE` | `test_attack.py::test_fork_bomb_is_bounded` |
 | Residual children | killed + verdict `SE` (anti-cheat) | `test_attack.py::test_residual_children_are_reported_as_se` |
+| Judger death | `KILL_ON_JOB_CLOSE` reaps the tree; stale dirs swept | `test_attack.py::test_an_interrupted_judger_leaves_no_orphan_process` |
 
 ### Limits and verdicts
 
@@ -65,10 +66,13 @@ on abnormal Windows termination.
   written does not trigger `MLE`.
 - Child processes are allowed by design (ordinary wrappers must work); the
   guarantees are the 64-process cap and residual detection (`SE`).
-- Timing jitter on Windows is larger than on Linux (measured spread 2-4% for a
-  300ms program); allow 5-10% when using limits as thresholds.
+- Timing jitter on Windows is larger than on Linux (measured MAD 0–0.5% for
+  a 300ms program, but the host occasionally hiccups); allow 5-10% when
+  using limits as thresholds.
 - Ordinary Win32 GUI programs can put windows on the user's desktop
   (isolation via a private desktop is not implemented).
+- `ctypes` cannot be loaded inside the sandbox (a side effect of the win32k
+  lockdown) — programs depending on ctypes/PowerShell/CLR fail at load time.
 
 ## Testing
 
