@@ -1056,6 +1056,7 @@ mod tests {
     fn exec_failure_surfaces_as_error() {
         let mut stdio = set();
         let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        workdir.grant_to(NOBODY_UID, NOBODY_GID).unwrap();
         let err = spawn(
             Path::new("/nonexistent/river-probe-xyz"),
             &[],
@@ -1084,6 +1085,7 @@ mod tests {
     fn spawn_and_reap_a_clean_child() {
         let mut stdio = set();
         let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        workdir.grant_to(NOBODY_UID, NOBODY_GID).unwrap();
         let child = spawn(
             Path::new("/bin/sh"),
             &["-c".to_string(), "exit 0".to_string()],
@@ -1117,6 +1119,7 @@ mod tests {
     fn rootfs_exec_uses_rootfs_coordinates() {
         let mut stdio = set();
         let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        workdir.grant_to(NOBODY_UID, NOBODY_GID).unwrap();
         let rootfs_dir =
             std::env::temp_dir().join(format!("river-rootfs-empty-{}", std::process::id()));
         std::fs::create_dir_all(&rootfs_dir).unwrap();
@@ -1148,6 +1151,7 @@ mod tests {
     fn nonzero_exit_propagates() {
         let mut stdio = set();
         let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        workdir.grant_to(NOBODY_UID, NOBODY_GID).unwrap();
         let child = spawn(
             Path::new("/bin/sh"),
             &["-c".to_string(), "exit 3".to_string()],

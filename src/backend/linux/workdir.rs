@@ -6,9 +6,16 @@
 //! `WorkDir` guard).
 //!
 //! `copy_in` read-only enforcement: files are
-//! written/copied as root and chmod'd 0444; the sandboxed program runs as
-//! `nobody` (uid drop) and cannot rewrite them. No ACL machinery
-//! is needed on Linux.
+//! written/copied as root and later chowned to the sandbox uid, mode 0440;
+//! the sandboxed program can read but never write them. Directories are
+//! chowned to the sandbox uid and mode 0700, so an unrelated host process
+//! (and another uid) cannot traverse the tree by path. Residual exposure:
+//! other processes running as the *same* uid (nobody) still share owner
+//! rights — true per-run isolation needs a distinct uid, which this backend
+//! does not allocate (documented limitation).
+//!
+//! The workdir is created mode 0700 (root-owned) so nothing can read it
+//! before the run starts.
 
 use std::fs;
 use std::io;
@@ -42,13 +49,16 @@ impl WorkDir {
         let base = std::env::temp_dir();
         let mut last_err = None;
         for _ in 0..8 {
+            // `as_nanos` (not `subsec_nanos`) keeps the full resolution: the
+            // earlier sum of seconds + subsecond nanos collapsed the time
+            // component to whole seconds.
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
+                .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = base.join(format!("river-{}-{}-{:x}", std::process::id(), n, nanos));
-            match fs::create_dir(&path) {
+            match create_private_dir(&path) {
                 Ok(()) => {
                     let owner = fs::OpenOptions::new()
                         .create(true)
@@ -77,8 +87,9 @@ impl WorkDir {
 
     /// Provision `copy_in` entries into the working directory. Keys are
     /// sandbox-relative paths (validated upstream by `contract::validate`);
-    /// parent directories are created as needed. Every file ends up
-    /// root-owned mode 0444 (read-only for the untrusted nobody).
+    /// parent directories are created as needed. Every file ends up mode
+    /// 0440 (chowned to the sandbox uid later by `grant_to`: readable by the
+    /// untrusted program, never writable).
     ///
     /// A `CopyInSource::Path` value pointing at a host **directory** is
     /// provisioned recursively (regular files and subdirectories; symlinks
@@ -154,23 +165,31 @@ impl WorkDir {
 
     /// Hand the working directory to the unprivileged program: the tree is
     /// bind-mounted into the sandbox as `/cwd`, so its owner must be the
-    /// sandbox uid or the program cannot create files there. Directories
-    /// are chowned recursively; `copy_in` **files** stay root-owned mode
-    /// 0444 (the read-only contract, DESIGN §3.3).
+    /// sandbox uid or the program cannot create files there. Directories are
+    /// chowned recursively and mode 0700; `copy_in` **files** are chowned
+    /// too and set mode 0440 — read-only and no longer world-readable
+    /// (DESIGN §3.3). `.owner` stays root-owned: it is the sweep's liveness
+    /// probe, not part of the program's surface.
     pub(crate) fn grant_to(&self, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let mut stack = vec![self.path.clone()];
         while let Some(dir) = stack.pop() {
-            let c = std::ffi::CString::new(dir.as_os_str().as_bytes())
-                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
-            let rc = unsafe { libc::chown(c.as_ptr(), uid, gid) };
-            if rc != 0 {
-                return Err(io::Error::last_os_error());
-            }
+            // Root included: created 0700 root-owned; after the chown the
+            // program owns it and other uids stay locked out.
+            chown(&dir, uid, gid)?;
+            chmod(&dir, 0o700)?;
             for entry in fs::read_dir(&dir)? {
                 let entry = entry?;
-                if entry.file_type()?.is_dir() {
+                let ft = entry.file_type()?;
+                if ft.is_dir() {
                     stack.push(entry.path());
+                } else if ft.is_file()
+                    && entry.file_name() != ".owner"
+                {
+                    // `.owner` stays root-owned: it is the sweep's liveness
+                    // probe, not part of the program's surface.
+                    chown(&entry.path(), uid, gid)?;
+                    chmod(&entry.path(), 0o440)?;
                 }
             }
         }
@@ -276,14 +295,37 @@ fn copy_one(
     Ok(())
 }
 
-/// Best-effort read-only (u+r, go-rwx). Must not fail provisioning: a
+/// Best-effort read-only (u+r, g-rwx, o-rwx). Must not fail provisioning: a
 /// program that could write its copy_in files is an attack-suite failure,
-/// so any chmod error here is loud.
+/// so any chmod error here is loud. The file is chowned to the sandbox uid
+/// later by `grant_to`, which is when 0440 becomes "readable by the program
+/// only".
 fn make_read_only(path: &Path) -> io::Result<()> {
-    let mut perms = fs::metadata(path)?.permissions();
+    chmod(path, 0o440)
+}
+
+/// Create the workdir mode 0700: before the run starts nothing on the host
+/// (not even another `nobody` process) can read the provisioned inputs.
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// `chown(2)` with a path that may contain arbitrary bytes.
+fn chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL in path"))?;
+    if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `chmod(2)` on a path.
+fn chmod(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    perms.set_mode(0o444);
-    fs::set_permissions(path, perms)
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
 /// Try to take (or release) the ownership lock on a workdir.
@@ -374,11 +416,12 @@ fn owner_pid_of(dir_name: &str) -> Option<u32> {
 mod tests {
     use super::*;
 
-    /// Provisioned files exist, carry exactly the given bytes, and are
-    /// mode 0444 (non-trivial: removing the chmod in `provision` must make
-    /// this fail).
+    /// Provisioned files exist, carry exactly the given bytes, and are mode
+    /// 0440 (non-trivial: removing the chmod in `provision` must make this
+    /// fail). Before `grant_to` the file is root-owned, so 0440 also means
+    /// no other uid can read it.
     #[test]
-    fn provisioned_copy_in_is_read_only_0444() {
+    fn provisioned_copy_in_is_read_only_0440() {
         use std::os::unix::fs::PermissionsExt;
         let workdir = WorkDir::create().unwrap();
         let mut files = std::collections::HashMap::new();
@@ -391,8 +434,46 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"payload");
         assert_eq!(
             fs::metadata(&p).unwrap().permissions().mode() & 0o777,
-            0o444
+            0o440
         );
+    }
+
+    /// The workdir itself is created 0700: nothing (but root) can look
+    /// inside before the run starts.
+    #[test]
+    fn workdir_is_created_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let workdir = WorkDir::create().unwrap();
+        assert_eq!(
+            fs::metadata(workdir.path()).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    /// `grant_to` hands the whole tree to the sandbox uid: directories 0700,
+    /// `copy_in` files 0440 (readable, never writable) and `.owner` left
+    /// root-owned for the stale sweep. Needs root (chown).
+    #[test]
+    fn grant_to_makes_the_tree_private_to_the_sandbox_uid() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return; // chown requires CAP_CHOWN; the suite runs as root on Linux
+        }
+        let workdir = WorkDir::create().unwrap();
+        fs::write(workdir.path().join("run.sh"), b"#!/bin/sh\n").unwrap();
+        make_read_only(&workdir.path().join("run.sh")).unwrap();
+        workdir.grant_to(65534, 65534).unwrap();
+
+        let root_md = fs::metadata(workdir.path()).unwrap();
+        assert_eq!(root_md.permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&root_md), 65534);
+
+        let file_md = fs::metadata(workdir.path().join("run.sh")).unwrap();
+        assert_eq!(file_md.permissions().mode() & 0o777, 0o440);
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&file_md), 65534);
+
+        let owner_md = fs::metadata(workdir.path().join(".owner")).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&owner_md), 0);
     }
 
     /// Nested copy_in keys get their parent directories created.

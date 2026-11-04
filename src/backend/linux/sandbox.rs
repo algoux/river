@@ -79,7 +79,8 @@ fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
 ///   mount namespace so the rest of the host filesystem is invisible;
 /// - each path in `runtimes` exposed read-only (+execute) via bind mounts;
 /// - `copy_in` files provisioned into the working directory (read-only for
-///   the program: root-owned, mode 0444, program runs as nobody);
+///   the program: mode 0440, owned by the sandbox uid, program runs as
+///   nobody);
 /// - network access denied unconditionally (empty network namespace).
 ///
 /// `rootfs` (a caller-supplied root tree) replaces the tmpfs root when
@@ -299,7 +300,8 @@ impl Sandbox {
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
             // The program is nobody; the bind-mounted workdir must belong to
-            // it or nothing is writable (copy_in files stay root:0444).
+            // it or nothing is writable (directories 0700, copy_in files
+            // 0440 — both chowned to the sandbox uid).
             workdir.grant_to(ns::NOBODY_UID, ns::NOBODY_GID)?;
 
             // Whitelisted environment, in **sandbox coordinates** (the
