@@ -44,10 +44,36 @@ fn limit_ms(limit: &Duration) -> u32 {
     limit.as_millis().min((u32::MAX - 1) as u128) as u32
 }
 
+/// Count the processes still alive in the job (excluding the main pid, see
+/// the note above). The query is retried a few times: the kernel updates the
+/// job's process list asynchronously right after the main process exits, so
+/// a single failed read is not evidence of "no residuals" — after
+/// [`RESIDUAL_RETRIES`] consecutive failures the caller treats the invariant
+/// as unverifiable (fail closed, verdict `SE`).
+fn residual_count(job: &Job, main_pid: u32) -> io::Result<u32> {
+    let mut last_err = None;
+    for _ in 0..RESIDUAL_RETRIES {
+        match job.alive_process_ids() {
+            Ok(ids) => return Ok(ids.iter().filter(|pid| **pid != main_pid).count() as u32),
+            Err(e) => {
+                last_err = Some(e);
+                std::thread::sleep(RESIDUAL_RETRY_DELAY);
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "residual query failed")))
+}
+
 /// How often the job's CPU accounting is polled while a CPU limit is set.
 /// Overshoot of the limit is bounded by this interval (the same contract as
 /// the Linux `cpu.stat` poll).
 const CPU_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Retry budget for the post-run residual-process query (see
+/// [`residual_count`]); each retry waits
+/// [`RESIDUAL_RETRY_DELAY`] to let the kernel settle the job list.
+const RESIDUAL_RETRIES: usize = 3;
+const RESIDUAL_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 fn wait_forever(handle: HANDLE) {
     // SAFETY: the process handle is owned and valid; INFINITE is fine here
@@ -135,9 +161,16 @@ pub(crate) fn monitor(
     // descendant produced spurious `SE` verdicts under load (1 in 400
     // concurrent runs).
     let main_pid = child.pid;
-    let residual_processes = match job.alive_process_ids() {
-        Ok(ids) => ids.iter().filter(|pid| **pid != main_pid).count() as u32,
-        Err(_) => 0,
+    let residual_processes = match residual_count(job, main_pid) {
+        Ok(n) => n,
+        Err(e) => {
+            // Fail closed: the anti-cheat invariant ("no descendant may
+            // outlive the main process") could not be verified. Reporting 0
+            // here would silently disable it; `infra_se` keeps the verdict
+            // `SE` instead of a potentially misleading `AC`/`RE`.
+            let _ = job.terminate(KILL_EXIT_CODE);
+            return Err(e);
+        }
     };
     if residual_processes > 0 {
         let _ = job.terminate(KILL_EXIT_CODE);

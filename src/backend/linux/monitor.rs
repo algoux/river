@@ -40,6 +40,12 @@ const POLL_INTERVAL: Duration = Duration::from_millis(2);
 /// limit is bounded by this interval (documented in DESIGN §5).
 const CPU_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Consecutive `cpu.stat` read failures tolerated before the monitor gives
+/// up, kills the tree and reports an infrastructure error (fail closed —
+/// the verdict becomes `SE` instead of the CPU limit silently degrading to
+/// the `RLIMIT_CPU` backstop).
+const CPU_READ_FAILURE_LIMIT: u32 = 5;
+
 /// Wait for `pid`, enforcing `wall_limit`, `cpu_limit_ms` (when given) and
 /// the stdio overflow flags. On a sandbox kill the process group gets
 /// SIGKILL and is reaped before returning.
@@ -55,6 +61,7 @@ pub(crate) fn monitor(
     let mut status: libc::c_int = 0;
     let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
     let mut last_cpu_check = start;
+    let mut cpu_read_failures: u32 = 0;
 
     // wait4 with WNOHANG reaps as soon as the child exits AND carries the
     // rusage — waitpid(2) has no rusage, so wait4 is used from the start.
@@ -96,15 +103,31 @@ pub(crate) fn monitor(
         if let (Some(cg), Some(limit)) = (cgroup, cpu_limit_ms) {
             if last_cpu_check.elapsed() >= CPU_POLL_INTERVAL {
                 last_cpu_check = Instant::now();
-                if let Ok(usec) = cg.usage_usec() {
-                    if usec / 1000 > limit {
-                        return finish_killed(
-                            pid,
-                            KillOrigin::CpuLimit,
-                            start,
-                            &mut status,
-                            &mut rusage,
-                        );
+                match cg.usage_usec() {
+                    Ok(usec) => {
+                        cpu_read_failures = 0;
+                        if usec / 1000 > limit {
+                            return finish_killed(
+                                pid,
+                                KillOrigin::CpuLimit,
+                                start,
+                                &mut status,
+                                &mut rusage,
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        // Fail closed: a transient read error is retried on
+                        // the next tick, but persistent failures must not
+                        // silently degrade the CPU limit to the RLIMIT_CPU
+                        // backstop (whose overshoot is a full second). Kill
+                        // and surface an infrastructure error (verdict SE).
+                        cpu_read_failures += 1;
+                        if cpu_read_failures >= CPU_READ_FAILURE_LIMIT {
+                            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+                            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+                            return Err(e);
+                        }
                     }
                 }
             }
