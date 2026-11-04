@@ -35,6 +35,7 @@ pub(crate) enum KillOrigin {
     /// the process was still running); the sandbox terminated the tree.
     /// Linux-only in practice — Windows relies on the wall watchdog plus
     /// the post-exit CPU evidence check.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     CpuLimit,
     /// A stdout/stderr channel produced more than its kill threshold; the
     /// sandbox reaped the job mid-run.

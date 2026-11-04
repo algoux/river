@@ -5,6 +5,7 @@ Run: uv run python examples/limits_smoke.py
 """
 
 import sys
+
 import river
 
 EXE = sys.executable

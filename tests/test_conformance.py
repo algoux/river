@@ -143,12 +143,12 @@ def test_copy_in_host_file_is_copied(sandbox, python_exe, tmp_path):
 def test_copy_in_is_read_only_for_the_program(sandbox, python_exe):
     r = sandbox.run(
         python_exe,
-        ["-c", "import sys\n"
-               "try:\n"
-               "    open(sys.argv[1], 'w').write('x')\n"
-               "    print('MUTABLE')\n"
-               "except OSError:\n"
-               "    print('READONLY')\n",
+        ["-c", ("import sys\n"
+                "try:\n"
+                "    open(sys.argv[1], 'w').write('x')\n"
+                "    print('MUTABLE')\n"
+                "except OSError:\n"
+                "    print('READONLY')\n"),
          "in.txt"],
         copy_in={"in.txt": b"immutable"},
     )
@@ -328,9 +328,8 @@ def test_rootfs_follows_the_capability_matrix():
 
 def test_with_block_never_suppresses_exceptions():
     sb = river.Sandbox()
-    with pytest.raises(RuntimeError):
-        with sb:
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), sb:
+        raise RuntimeError("boom")
 
 
 def test_the_working_directory_is_removed_after_the_run(sandbox, python_exe):

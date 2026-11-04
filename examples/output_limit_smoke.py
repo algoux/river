@@ -4,6 +4,7 @@ Run: uv run python examples/output_limit_smoke.py
 """
 
 import sys
+
 import river
 
 EXE = sys.executable
@@ -46,13 +47,14 @@ def main():
     # 2. output is archived in stdout_file up to the kill; the returned
     #    sample stays capped at the limit. The program is reaped as soon as
     #    its total passes the threshold, so the archive holds >= 1 chunk.
-    import os, tempfile
+    import os
+    import tempfile
     path = os.path.join(tempfile.gettempdir(), "river-s10-ole-full.bin")
     with river.Sandbox(runtimes=RUNTIMES) as sb:
-        r = sb.run(EXE, ["-c", "import sys\n"
-                            "for _ in range(4):\n"
-                            "    sys.stdout.write('y' * 65536)\n"
-                            "    sys.stdout.flush()\n"],
+        r = sb.run(EXE, ["-c", ("import sys\n"
+                                "for _ in range(4):\n"
+                                "    sys.stdout.write('y' * 65536)\n"
+                                "    sys.stdout.flush()\n")],
                    stdout_limit_kb=64, stdout_file=path,
                    wall_time_limit_ms=15000)
     full = os.path.getsize(path)

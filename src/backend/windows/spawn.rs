@@ -255,7 +255,7 @@ impl Drop for AttributeList {
 /// what CreateProcessW expects) from `vars`.
 pub(crate) fn env_block(vars: &[(String, String)]) -> Vec<u16> {
     let mut sorted = vars.to_vec();
-    sorted.sort_by(|a, b| a.0.to_uppercase().cmp(&b.0.to_uppercase()));
+    sorted.sort_by_key(|(k, _)| k.to_uppercase());
     let mut block = Vec::new();
     for (k, v) in sorted {
         block.extend(k.encode_utf16());
@@ -363,9 +363,9 @@ pub(crate) fn spawn_bare(
         Reserved: 0,
     };
     let handles = [
-        child_stdin.as_raw_handle() as *mut core::ffi::c_void,
-        child_stdout.as_raw_handle() as *mut core::ffi::c_void,
-        child_stderr.as_raw_handle() as *mut core::ffi::c_void,
+        child_stdin.as_raw_handle(),
+        child_stdout.as_raw_handle(),
+        child_stderr.as_raw_handle(),
     ];
     if let Some(profile) = profile {
         let has_ac = profile.has_appcontainer();
@@ -423,7 +423,7 @@ pub(crate) fn spawn_bare(
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null()),
-            &mut si_ex.StartupInfo, // EXW prefix shares the STARTUPINFOW layout
+            &si_ex.StartupInfo, // EXW prefix shares the STARTUPINFOW layout
             &mut pi,
         )
     };
@@ -449,10 +449,9 @@ pub(crate) fn spawn_bare(
     // suspended child (it is outside the job and would outlive its handles).
     let guarded = SuspendedGuard::new(child);
 
-    // Attach before resume so no grandchild can escape the job.
-    if let Err(e) = job.assign(guarded.child.as_ref().unwrap().process.as_raw_handle() as HANDLE) {
-        return Err(e); // guard drops → suspended child terminated
-    }
+    // Attach before resume so no grandchild can escape the job. On error
+    // the guard drops → suspended child terminated.
+    job.assign(guarded.child.as_ref().unwrap().process.as_raw_handle() as HANDLE)?;
 
     let child = guarded.disarm();
 
@@ -717,6 +716,7 @@ mod tests {
     ///   ERROR_ACCESS_DISABLED_BY_POLICY (1260);
     /// - WIN32K_SYSTEM_DISABLE: `GetCursorPos` (a win32k syscall) must fail
     ///   with the same code.
+    ///
     /// Both probes are also run from a plain judger-token child to prove the
     /// delta comes from the policies, not from some environmental accident.
     #[test]

@@ -6,14 +6,19 @@
 //! (`contract::verdict`).
 
 /// True when the exit code is an NTSTATUS (abnormal termination) rather than
-/// a normal exit code.
+/// a normal exit code. Referenced by the table tests below; classification
+/// itself uses the generic severity mask in `contract::verdict`.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_ntstatus(exit_code: u32) -> bool {
     // NTSTATUS severity/facility layout: 0xC000xxxx are customer-facility
     // failures raised by the kernel (access violation, stack overflow, ...).
     (exit_code & 0xF000_0000) == 0xC000_0000
 }
 
-/// Human-readable name for known abnormal-termination NTSTATUS codes.
+/// Human-readable name for known abnormal-termination NTSTATUS codes. The
+/// table is the reviewed, per-entry documentation of every abnormal end the
+/// contract can surface; tests pin each name.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn ntstatus_name(code: u32) -> Option<&'static str> {
     Some(match code {
         // Memory / address errors

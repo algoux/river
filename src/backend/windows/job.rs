@@ -56,9 +56,6 @@ pub(crate) struct JobLimits {
     pub max_processes: u32,
 }
 
-/// Default cap on simultaneously alive processes (main process included).
-pub(crate) const DEFAULT_MAX_PROCESSES: u32 = 64;
-
 impl JobLimits {
     /// Effective memory limit: the user limit, or the physical-memory safety
     /// ceiling. `JOB_OBJECT_LIMIT_PROCESS_MEMORY` is therefore always set,
@@ -185,11 +182,8 @@ impl Job {
         }
     }
 
-    /// Number of processes currently alive in the job.
-    ///
-    /// Used to detect residual descendants after the main process exited:
-    /// a program must not offload its work to a child and let the child keep
-    /// running (or keep writing answers) after the main process is gone.
+    /// Number of processes currently alive in the job (tests).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn alive_process_count(&self) -> io::Result<u32> {
         Ok(self.alive_process_ids()?.len() as u32)
     }
@@ -266,6 +260,7 @@ pub(crate) fn wait_process_exit(process: HANDLE) -> io::Result<u32> {
 }
 
 /// Sleep helper so tests do not depend on external timing behaviour.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn brief_pause() {
     std::thread::sleep(Duration::from_millis(150));
 }

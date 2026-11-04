@@ -69,12 +69,12 @@ def test_copy_in_is_read_only_for_the_program(sandbox, python_exe):
     # The program may read its input but must not modify it (DESIGN §3.3).
     r = sandbox.run(
         python_exe,
-        ["-c", "import sys\n"
-               "try:\n"
-               "    open(sys.argv[1], 'w').write('x')\n"
-               "    print('MUTABLE')\n"
-               "except OSError:\n"
-               "    print('READONLY')\n",
+        ["-c", ("import sys\n"
+                "try:\n"
+                "    open(sys.argv[1], 'w').write('x')\n"
+                "    print('MUTABLE')\n"
+                "except OSError:\n"
+                "    print('READONLY')\n"),
          "in.txt"],
         copy_in={"in.txt": b"immutable"},
     )
@@ -205,9 +205,8 @@ def test_invalid_copy_in_key_raises(sandbox, python_exe):
 
 def test_with_block_never_suppresses_exceptions():
     sb = river.Sandbox()
-    with pytest.raises(RuntimeError):
-        with sb:
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), sb:
+        raise RuntimeError("boom")
 
 
 def test_status_repr_mentions_the_verdict(sandbox, python_exe):

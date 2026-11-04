@@ -19,7 +19,6 @@ import glob
 import os
 import subprocess
 import sys
-import tempfile
 import time
 
 EXE = sys.executable
@@ -43,7 +42,7 @@ def sandboxed_python_cmdlines():
         "| ForEach-Object { $_.CommandLine }"
     )
     out = subprocess.run(["powershell", "-NoProfile", "-c", ps],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, text=True, check=False).stdout
     return [l for l in out.splitlines() if "sleep(60)" in l]
 
 
@@ -86,7 +85,7 @@ with sb:
     ))
 
     subprocess.run(["taskkill", "/PID", str(judger.pid), "/T", "/F"],
-                   capture_output=True)
+                   capture_output=True, check=False)
     judger.wait()
     time.sleep(2.0)  # give KILL_ON_JOB_CLOSE a moment
 
@@ -97,7 +96,7 @@ with sb:
     ))
 
     # --- 2. the next Sandbox construction sweeps the residue -------------
-    owner_pid = int(os.path.basename(sorted(new_dirs)[0]).split("-")[1])
+    owner_pid = int(os.path.basename(min(new_dirs)).split("-")[1])
     residue = sorted(d for d in new_dirs if os.path.isdir(d)
                      and os.path.basename(d).startswith(f"river-{owner_pid}-"))
     river.Sandbox()  # sweeps stale dirs

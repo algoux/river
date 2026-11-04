@@ -26,7 +26,6 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const RIVER_DIR: &str = "river";
 
 /// Environment override for the cgroup2 mount point (a container/delegated

@@ -327,7 +327,7 @@ mod tests {
         let outcome = monitor(&child, &job, None, None).unwrap();
         set.finish().unwrap();
         assert!(
-            outcome.cpu_time_ms > u64::from(cpu_limit),
+            outcome.cpu_time_ms > cpu_limit,
             "cpu {}ms over limit {cpu_limit}ms",
             outcome.cpu_time_ms
         );
@@ -335,7 +335,7 @@ mod tests {
             kill: outcome.kill,
             exit_code: outcome.exit_code,
             residual_processes: outcome.residual_processes,
-            cpu_time_limit_ms: Some(u64::from(cpu_limit)),
+            cpu_time_limit_ms: Some(cpu_limit),
             cpu_time_used_ms: outcome.cpu_time_ms,
             ..Default::default()
         };
@@ -375,7 +375,7 @@ mod tests {
         set.finish().unwrap();
         let peak = job.peak_process_memory_used().unwrap();
         assert!(
-            peak + mem_limit as u64 / 8 >= mem_limit as u64,
+            peak + mem_limit / 8 >= mem_limit,
             "peak {peak} should pin at the {mem_limit}-byte commit cap"
         );
         let evidence = RunEvidence {
@@ -386,7 +386,7 @@ mod tests {
             oom_killed: false,
             cpu_time_limit_ms: None,
             cpu_time_used_ms: outcome.cpu_time_ms,
-            memory_limit_bytes: Some(mem_limit as u64),
+            memory_limit_bytes: Some(mem_limit),
             peak_memory_bytes: peak,
         };
         assert_eq!(classify(&evidence), Verdict::Mle);

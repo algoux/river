@@ -18,6 +18,8 @@ Checklist mapping:
  10. junction left in cwd                    -> cleanup does not follow it
 """
 
+from __future__ import annotations
+
 import os
 import sys
 
@@ -394,7 +396,6 @@ def test_output_fountain_is_ole(sandbox, python_exe):
 def test_a_junction_left_in_cwd_is_not_followed_by_cleanup(sandbox, python_exe):
     # The program plants a junction pointing at a host directory; the
     # cleanup must delete the link, never the target's content.
-    import glob
     import tempfile
 
     victim = os.path.join(tempfile.gettempdir(), f"river-attack-victim-{os.getpid()}")
@@ -510,6 +511,7 @@ with sb:
             subprocess.run(
                 ["taskkill", "/PID", str(judger.pid), "/T", "/F"],
                 capture_output=True,
+                check=False,
             )
             judger.wait()
 
@@ -532,7 +534,7 @@ def _processes_with_marker(marker: str) -> list[str]:
     )
     out = subprocess.run(
         ["powershell", "-NoProfile", "-c", ps],
-        capture_output=True, text=True,
+        capture_output=True, text=True, check=False,
     ).stdout
     return [l for l in out.splitlines() if marker in l]
 

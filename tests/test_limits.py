@@ -14,10 +14,6 @@ Covers DESIGN.md §2.2 / §2.3:
 
 import time
 
-import pytest
-
-import river
-
 
 def test_cpu_limit_produces_tle(sandbox, python_exe):
     r = sandbox.run(python_exe, ["-c", "while True: pass"], time_limit_ms=500)

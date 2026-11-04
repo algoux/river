@@ -14,7 +14,6 @@
 //! measured at ~2s.)
 
 use std::io;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use super::cgroup::Cgroup;
@@ -32,9 +31,6 @@ pub(crate) struct Outcome {
     /// Peak RSS of the reaped tree, in bytes (`ru_maxrss`).
     pub(crate) peak_memory_bytes: u64,
     pub(crate) wall_time_ms: u64,
-    /// Processes still alive after the main process exited (cgroup members
-    /// left after the grace period).
-    pub(crate) residual_processes: u32,
 }
 
 /// How often the wait loop re-checks the overflow flags / wall deadline.
@@ -114,7 +110,6 @@ pub(crate) fn monitor(
         cpu_time_ms: rusage_cpu_ms(&rusage),
         peak_memory_bytes: rusage_peak_bytes(&rusage),
         wall_time_ms: start.elapsed().as_millis() as u64,
-        residual_processes: 0,
     })
 }
 
@@ -143,7 +138,6 @@ fn finish_killed(
         cpu_time_ms: rusage_cpu_ms(rusage),
         peak_memory_bytes: rusage_peak_bytes(rusage),
         wall_time_ms: start.elapsed().as_millis() as u64,
-        residual_processes: 0,
     })
 }
 
@@ -173,6 +167,7 @@ fn rusage_peak_bytes(rusage: &libc::rusage) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn monitor_simple(
         pid: libc::pid_t,
@@ -195,7 +190,6 @@ mod tests {
             monitor_simple(pid, Duration::from_secs(5), &OverflowFlags::default()).unwrap();
         assert_eq!(outcome.kill, KillOrigin::None);
         assert_eq!(outcome.exit_code, 0);
-        assert_eq!(outcome.residual_processes, 0);
     }
 
     /// A hanging child is killed by the wall watchdog: kill origin

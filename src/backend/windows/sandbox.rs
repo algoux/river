@@ -28,7 +28,7 @@ use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, validate};
 /// since our last sweep, so the check cannot be skipped — dirs abandoned
 /// by a *different* process must still be recovered (the interrupted-judger
 /// attack test depends on exactly that).
-
+///
 /// Windows sandbox.
 ///
 /// The sandbox filesystem model on Windows:
@@ -55,7 +55,7 @@ pub struct Sandbox {
     /// Internal safety ceilings (mechanism guarantees that stay in place
     /// when the caller passes `None` limits). Configurable so a deployment
     /// can tighten the defaults; never disableable.
-    pub ceilings: SafetyCeilings,
+    pub(crate) ceilings: SafetyCeilings,
 }
 
 #[pymethods]
@@ -142,6 +142,9 @@ impl Sandbox {
     #[pyo3(
         text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
+    // The signature mirrors the frozen Python contract (one parameter per
+    // run() keyword); collapsing it into a struct would hide that mapping.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         executable: PathBuf,

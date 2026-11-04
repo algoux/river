@@ -6,7 +6,6 @@ not surface as ERROR_SHARING_VIOLATION.
 Run: uv run python examples/concurrent_sandbox_probe.py
 """
 
-import os
 import sys
 import threading
 

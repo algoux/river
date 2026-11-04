@@ -15,7 +15,6 @@ import glob
 import os
 import statistics
 import sys
-import tempfile
 import threading
 import time
 
@@ -86,8 +85,8 @@ def main():
     # host, not of the sandbox.
     samples = []
     for i in range(11):
-        st = sb.run(EXE, ["-c", "import time\nt=time.perf_counter()\n"
-                          "while time.perf_counter()-t < 0.30: pass"],
+        st = sb.run(EXE, ["-c", ("import time\nt=time.perf_counter()\n"
+                                 "while time.perf_counter()-t < 0.30: pass")],
                     wall_time_limit_ms=30000)
         if i:  # skip the warm-up sample
             samples.append(st.wall_time_used_ms)

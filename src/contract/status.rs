@@ -31,9 +31,6 @@ pub struct Status {
     pub time_used_ms: u64,
     pub wall_time_used_ms: u64,
     pub memory_used_kb: u64,
-    /// Classified verdict — typed inside the crate, rendered as the frozen
-    /// string contract at the Python boundary.
-    pub verdict: Option<Verdict>,
     pub status: String,
     pub signal: i32,
     pub exit_code: i32,
@@ -53,7 +50,6 @@ impl Status {
         Status {
             status: verdict.as_str().to_string(),
             signal: verdict.synthesized_signal(),
-            verdict: Some(verdict),
             ..Default::default()
         }
     }
@@ -65,7 +61,6 @@ impl Status {
             status: Verdict::Se.as_str().to_string(),
             exit_code: -1,
             stderr: stderr.into_bytes(),
-            verdict: Some(Verdict::Se),
             ..Default::default()
         }
     }

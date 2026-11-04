@@ -73,12 +73,12 @@ def main() -> int:
             sys.executable,
             [
                 "-c",
-                "import socket\n"
-                "try:\n"
-                "    socket.create_connection(('1.1.1.1', 80), timeout=2)\n"
-                "    print('NETWORK')\n"
-                "except OSError:\n"
-                "    print('ISOLATED')\n",
+                ("import socket\n"
+                 "try:\n"
+                 "    socket.create_connection(('1.1.1.1', 80), timeout=2)\n"
+                 "    print('NETWORK')\n"
+                 "except OSError:\n"
+                 "    print('ISOLATED')\n"),
             ],
             wall_time_limit_ms=15000,
         )

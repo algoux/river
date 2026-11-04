@@ -12,9 +12,10 @@ Every probe is non-trivial: removing the mechanism under test (PDEATHSIG,
 the sweep, the per-run cgroup) must make the corresponding test fail.
 """
 
+from __future__ import annotations
+
 import glob
 import os
-import signal
 import subprocess
 import sys
 import tempfile

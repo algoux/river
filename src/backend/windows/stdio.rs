@@ -130,12 +130,11 @@ fn reader_thread(mut read: File, spec: ReaderSpec) -> Output {
             Ok(n) => {
                 let chunk = &buf[..n];
                 out.total += n as u64;
-                if let Some(f) = sink.as_mut() {
-                    if out.sink_error.is_none() {
-                        if let Err(e) = f.write_all(chunk) {
-                            out.sink_error = Some(e);
-                        }
-                    }
+                if let Some(f) = sink.as_mut()
+                    && out.sink_error.is_none()
+                    && let Err(e) = f.write_all(chunk)
+                {
+                    out.sink_error = Some(e);
                 }
                 match spec.limit {
                     None => out.data.extend_from_slice(chunk),

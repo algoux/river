@@ -27,18 +27,20 @@
 use std::ffi::OsStr;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
 use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 
 // windows-sys does not expose the userenv profile APIs; declare the three
 // functions we need directly (kernel32's LocalFree comes from windows-sys).
+#[allow(clippy::upper_case_acronyms)] // Windows API naming convention
 type HRESULT = i32;
+#[allow(clippy::upper_case_acronyms)] // Windows API naming convention
 type PCWSTR = *const u16;
+#[allow(clippy::upper_case_acronyms)] // Windows API naming convention
 type PSID = *mut core::ffi::c_void;
 
-const ERROR_ALREADY_EXISTS: u32 = 183;
 /// HRESULT form of ERROR_ALREADY_EXISTS (0x8007 | win32 code).
 const HRESULT_ALREADY_EXISTS: i32 = 0x8007_00B7u32 as i32;
 /// HRESULT form of ERROR_NOT_FOUND (profile does not exist yet).
@@ -62,6 +64,8 @@ unsafe extern "system" {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    /// Only used by the SID-text formatting in tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn ConvertSidToStringSidW(sid: PSID, stringsid: *mut *mut u16) -> i32;
 }
 
@@ -80,7 +84,6 @@ static PROFILE_CREATE_LOCK: Mutex<()> = Mutex::new(());
 /// Owned AppContainer SID (freed with `LocalFree`).
 pub(crate) struct AppContainer {
     sid: PSID,
-    name: String,
 }
 
 impl AppContainer {
@@ -96,13 +99,10 @@ impl AppContainer {
         // calling it concurrently corrupts the profile (observed:
         // ERROR_KEY_DELETED / ERROR_INVALIDARG / ERROR_FILE_NOT_FOUND), so
         // it runs exactly once per process, under a lock.
-        if profile_known_created(name) {
-            if let Some(sid) = derive_sid(name)? {
-                return Ok(AppContainer {
-                    sid,
-                    name: name.to_string(),
-                });
-            }
+        if profile_known_created(name)
+            && let Some(sid) = derive_sid(name)?
+        {
+            return Ok(AppContainer { sid });
             // The mapping vanished (profile deleted behind our back): fall
             // through and re-create it.
         }
@@ -115,6 +115,7 @@ impl AppContainer {
     }
 
     /// SID in the textual `S-1-...` form (used by tests and debugging).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn sid_string(&self) -> io::Result<String> {
         let mut wide: *mut u16 = std::ptr::null_mut();
         // SAFETY: SID is owned and valid; out-pointer valid.
@@ -127,12 +128,6 @@ impl AppContainer {
         // SAFETY: allocated by ConvertSidToStringSidW, freed with LocalFree.
         unsafe { LocalFree(wide as HLOCAL) };
         Ok(s)
-    }
-
-    /// Path of the profile's private storage (AppContainer data directory).
-    /// Useful to verify the profile exists.
-    pub(crate) fn profile_path(&self) -> Option<PathBuf> {
-        profile_path_for(&self.name)
     }
 }
 
@@ -206,16 +201,10 @@ fn create_profile(name: &str) -> io::Result<AppContainer> {
             }
         };
         mark_profile_created(name);
-        return Ok(AppContainer {
-            sid,
-            name: name.to_string(),
-        });
+        return Ok(AppContainer { sid });
     }
     mark_profile_created(name);
-    Ok(AppContainer {
-        sid,
-        name: name.to_string(),
-    })
+    Ok(AppContainer { sid })
 }
 
 /// Names of profiles this process has already created.
@@ -249,10 +238,11 @@ pub(crate) fn wide_of(path: &Path) -> Vec<u16> {
         .collect()
 }
 
-/// Read a NUL-terminated wide string into `String`.
+/// Read a NUL-terminated wide string into `String` (tests only).
 ///
 /// # Safety
 /// `ptr` must point to a NUL-terminated UTF-16 string.
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
     unsafe {
         let mut len = 0usize;
@@ -262,11 +252,6 @@ unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
         }
         String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
     }
-}
-
-fn profile_path_for(name: &str) -> Option<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA")?;
-    Some(Path::new(&base).join("Packages").join(name).join("AC"))
 }
 
 #[cfg(test)]

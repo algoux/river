@@ -341,8 +341,7 @@ mod tests {
     use super::*;
 
     fn tmp_file(name: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!("river-wd-test-{}-{name}", std::process::id()));
-        p
+        std::env::temp_dir().join(format!("river-wd-test-{}-{name}", std::process::id()))
     }
 
     #[test]

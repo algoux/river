@@ -1,8 +1,9 @@
 """Static type stubs for the `river` sandbox module."""
 
 import os
+import types
 from collections.abc import Buffer, Mapping, Sequence
-from typing import Literal, TypeAlias
+from typing import Literal, Self, TypeAlias
 
 __all__ = ["Sandbox", "Status", "capabilities", "doctor"]
 
@@ -11,10 +12,6 @@ _CopyInSource: TypeAlias = Buffer | _StrOrPath
 _Verdict: TypeAlias = Literal["AC", "TLE", "MLE", "OLE", "RE", "SE"]
 
 _Capabilities: TypeAlias = dict[str, object]  # see capabilities() below
-
-_ExcType: TypeAlias = type[BaseException] | None
-_ExcValue: TypeAlias = BaseException | None
-_Traceback: TypeAlias = object | None
 
 
 class Status:
@@ -77,13 +74,13 @@ class Sandbox:
         max_processes: int | None = None,
     ) -> None: ...
 
-    def __enter__(self) -> Sandbox: ...
+    def __enter__(self) -> Self: ...
 
     def __exit__(
         self,
-        exc_type: _ExcType,
-        exc_value: _ExcValue,
-        traceback: _Traceback,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: types.TracebackType | None,
     ) -> bool: ...
 
     def run(
@@ -119,7 +116,6 @@ def capabilities() -> _Capabilities:
     frozen; every run keeps its state in locals) — neither is a capability
     key.
     """
-    ...
 
 
 def doctor() -> dict[str, object]:
@@ -136,4 +132,3 @@ def doctor() -> dict[str, object]:
     `seccomp_actions` and `workdir_root`. `Sandbox(...)` runs the same
     checks and fails closed when `ok` is false.
     """
-    ...

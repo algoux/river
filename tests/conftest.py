@@ -10,6 +10,8 @@ needs its base prefix and `pyvenv.cfg` to be readable, see
 docs/windows-backend.md §9.3.13).
 """
 
+from __future__ import annotations
+
 import os
 import sys
 
