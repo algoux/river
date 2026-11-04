@@ -7,14 +7,13 @@ use pyo3::types::PyAny;
 use crate::platform::{RunSpec, parse_copy_in, validate};
 use crate::status::Status;
 
-/// macOS sandbox — **not implemented**.
+/// macOS sandbox — **not implemented yet**.
 ///
-/// The Windows backend is the only supported platform (see
-/// docs/windows-backend.md §9.4); this module exists so the crate keeps the
-/// platform split, and `run()` raises `NotImplementedError` rather than
-/// pretending to sandbox anything.
+/// The Windows backend is the current target; this module exists so the crate
+/// keeps the platform split, and `run()` raises `NotImplementedError` rather
+/// than pretending to sandbox anything.
 ///
-/// The intended design (not implemented): with `rootfs` the sandbox would
+/// The intended design (see DESIGN.md §1): with `rootfs` the sandbox would
 /// execute inside a sandbox-exec profile restricted to it, and paths in
 /// `runtimes` would be exposed read-only on top of it.
 #[pyclass(module = "river")]
@@ -121,11 +120,11 @@ impl Sandbox {
         };
         validate(&spec)?;
         let _ = spec.effective_wall_time_limit_ms();
-        // The macOS backend is explicitly out of scope (see
-        // docs/windows-backend.md §9.4). Fail loudly instead of returning an
-        // empty Status that would look like a silent no-op run.
+        // The macOS backend is not implemented yet (see DESIGN.md §1). Fail
+        // loudly instead of returning an empty Status that would look like a
+        // silent no-op run.
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "river currently supports Windows only; the macOS backend is not implemented",
+            "river currently supports Windows only; the macOS backend is not implemented yet",
         ))
     }
 

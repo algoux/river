@@ -45,10 +45,11 @@ class Sandbox:
         for the program by default);
       - everything else on the host is invisible to the sandboxed process.
 
-    Platform support: **Windows only**. On other platforms `run()` raises
-    `NotImplementedError`. `rootfs` is not supported on Windows either
-    (processes always resolve system DLLs from the real `System32`) — use
-    `runtimes` there instead.
+    Platform support: **Windows only** for now. On other platforms `run()`
+    raises `NotImplementedError` (the Linux/macOS backends are not implemented
+    yet). `rootfs` is not supported on Windows either (processes always
+    resolve system DLLs from the real `System32`) — use `runtimes` there
+    instead.
     """
 
     def __init__(
