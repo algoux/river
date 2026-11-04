@@ -23,6 +23,7 @@
 
 use std::fs;
 use std::io::{self, Write};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,6 +46,16 @@ pub(crate) fn cgroup_root() -> PathBuf {
 /// reclaimed by the next sweep).
 pub(crate) struct Cgroup {
     path: PathBuf,
+    /// Exclusive `flock` on the cgroup directory, held for the run's
+    /// lifetime — exactly the protocol the workdir uses with `.owner`.
+    /// `sweep_stale_cgroups` treats "lock acquirable" as "owner is gone";
+    /// without this the sweep would reclaim live groups (a run started by
+    /// another thread/process was killed within milliseconds — verified).
+    ///
+    /// `None` only when the filesystem rejects `flock`; the sweep then falls
+    /// back to the `/proc/<pid>` liveness check, which is safe for live
+    /// owners (the pid exists).
+    _owner: Option<fs::File>,
 }
 
 impl Cgroup {
@@ -76,7 +87,13 @@ impl Cgroup {
         }
         fs::create_dir(&path)?;
 
-        let cg = Cgroup { path };
+        // Take the ownership lock *before* writing any limit: a sweep must
+        // never see a half-initialised group without an owner.
+        let owner = lock_owner(&path).ok();
+        let cg = Cgroup {
+            path,
+            _owner: owner,
+        };
         write_file(&cg.file("memory.max"), &format!("{memory_limit_bytes}\n"))?;
         // Swap must be excluded from the limit: with `memory.swap.max=max`
         // (the default) a slow allocator can keep pushing pages to swap and
@@ -189,6 +206,10 @@ impl Cgroup {
 
 impl Drop for Cgroup {
     fn drop(&mut self) {
+        // Release the ownership lock first: a concurrent sweep may be
+        // waiting for it, and rmdir itself must not be blocked by our own
+        // open descriptor. A leftover directory is reclaimed by the sweep.
+        self._owner.take();
         // Best effort: rmdir fails while processes remain; the next sweep
         // (stage L5) reclaims abandoned directories.
         let _ = fs::remove_dir(&self.path);
@@ -326,7 +347,10 @@ pub(crate) fn sweep_stale_cgroups() {
         let Ok(pid) = pid.parse::<u32>() else {
             continue;
         };
-        let stale = Cgroup { path: entry.path() };
+        let stale = Cgroup {
+            path: entry.path(),
+            _owner: None,
+        };
         let free = lock_dir(&stale.path);
         match free {
             Some(true) => {}         // owner gone
@@ -353,6 +377,20 @@ pub(crate) fn sweep_stale_cgroups() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+/// Take the exclusive, non-blocking ownership lock on a cgroup directory.
+///
+/// The lock lives as long as the returned descriptor: it is released by the
+/// kernel when the judger dies (including SIGKILL), which is exactly the
+/// liveness signal the sweep consumes.
+fn lock_owner(path: &Path) -> io::Result<fs::File> {
+    let dir = fs::File::open(path)?;
+    let rc = unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(dir)
 }
 
 /// Try to take an exclusive, non-blocking flock on a directory fd.

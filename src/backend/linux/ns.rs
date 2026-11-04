@@ -653,16 +653,15 @@ unsafe fn clear_capabilities() -> libc::c_int {
 /// Returns the `errno` of the first failed `setrlimit` (0 on success).
 unsafe fn apply_rlimits(limits: &ChildLimits) -> libc::c_int {
     let mut failed = 0;
-    let mut set =
-        |resource: libc::__rlimit_resource_t, cur: libc::rlim_t, max: libc::rlim_t| {
-            let rl = libc::rlimit {
-                rlim_cur: cur,
-                rlim_max: max,
-            };
-            if libc::setrlimit(resource, &rl) != 0 && failed == 0 {
-                failed = errno();
-            }
+    let mut set = |resource: libc::__rlimit_resource_t, cur: libc::rlim_t, max: libc::rlim_t| {
+        let rl = libc::rlimit {
+            rlim_cur: cur,
+            rlim_max: max,
         };
+        if libc::setrlimit(resource, &rl) != 0 && failed == 0 {
+            failed = errno();
+        }
+    };
     set(libc::RLIMIT_CORE, 0, 0);
     set(libc::RLIMIT_NOFILE, limits.nofile, limits.nofile);
     set(libc::RLIMIT_FSIZE, limits.fsize_bytes, limits.fsize_bytes);

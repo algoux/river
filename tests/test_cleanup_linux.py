@@ -94,6 +94,91 @@ def test_stale_cgroup_from_a_dead_judger_is_swept():
     assert not os.path.exists(dead), "stale cgroup was not swept"
 
 
+def _run_cgroups() -> set[str]:
+    return set(glob.glob("/sys/fs/cgroup/river/run-*"))
+
+
+def test_sweep_does_not_kill_a_live_run_in_another_thread(sandbox, python_exe):
+    """Regression: a live cgroup must be flock-owned, so the sweep skips it.
+
+    Before the owner lock existed, `with river.Sandbox(): pass` in one thread
+    reclaimed every cgroup it could open — including the one of a run that was
+    still executing in another thread (observed: a 6s run died after ~30ms
+    with `RE`/`SE`).
+    """
+    import threading
+
+    result = {}
+
+    def go():
+        result["r"] = sandbox.run(
+            python_exe,
+            ["-c", "import time; time.sleep(3); print('slept')"],
+            time_limit_ms=20000,
+            wall_time_limit_ms=30000,
+        )
+
+    before = _run_cgroups()
+    thread = threading.Thread(target=go)
+    thread.start()
+    try:
+        assert _wait_until(lambda: bool(_run_cgroups() - before), 10), (
+            "the run never created a cgroup"
+        )
+        # __enter__ runs the stale-cgroup sweep: the live run must survive.
+        with river.Sandbox(runtimes=RUNTIMES):
+            pass
+        thread.join(60)
+        r = result["r"]
+        assert r.status == "AC", f"live run was disturbed: {r.status} {r.stderr[:400]}"
+        assert r.wall_time_used_ms >= 2500, (
+            f"live run was reaped early: {r.wall_time_used_ms}ms"
+        )
+    finally:
+        thread.join(5)
+
+
+def test_sweep_in_another_process_does_not_kill_a_live_run(tmp_path):
+    """Two judge processes share the cgroup tree: neither may reap the other.
+
+    The sweep must identify a live owner by the flock, not by "I could open
+    the directory" — otherwise every worker's `with Sandbox()` kills the runs
+    of every other worker.
+    """
+    script = tmp_path / "judger.py"
+    script.write_text(
+        "import sys\n"
+        "import river\n"
+        f"sb = river.Sandbox(runtimes={RUNTIMES!r})\n"
+        "with sb:\n"
+        "    r = sb.run(sys.executable,\n"
+        "               ['-c', 'import time; time.sleep(4); print(\"slept\")'],\n"
+        "               time_limit_ms=30000, wall_time_limit_ms=40000)\n"
+        "    print('RESULT', r.status, r.wall_time_used_ms, flush=True)\n"
+    )
+    before = _run_cgroups()
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert _wait_until(lambda: bool(_run_cgroups() - before), 15), (
+            "the child judger never created a cgroup"
+        )
+        # Our own sweep must leave the child's live run alone.
+        with river.Sandbox(runtimes=RUNTIMES):
+            pass
+        out, _ = proc.communicate(timeout=60)
+        line = [ln for ln in out.splitlines() if ln.startswith("RESULT")]
+        assert line, out
+        assert " AC " in line[0], f"live run in another process was killed: {line[0]}"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def test_hard_killed_judger_leaves_no_processes_and_is_reclaimed():
     marker = f"river-lifecycle-{os.getpid()}"
     judger = os.path.join(tempfile.gettempdir(), f"river-judger-{os.getpid()}.py")
