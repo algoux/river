@@ -70,8 +70,9 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 - `rootfs` —— Linux 专属：只读替换沙箱根的自包含根树（宿主绝对路径，
   非 `/`）；Windows/macOS 传入抛 `ValueError`
 - `runtimes` —— 只读运行时目录
-- `max_wall_secs` / `max_processes` —— 收紧（不可禁用）内部安全上限；
-  默认 24h 墙钟 / 64 存活进程。"不设限"只是调用方语义，机制永远存在。
+- `max_wall_secs` / `max_processes` —— **只能收紧**内部安全上限：
+  默认 24h 墙钟 / 64 存活进程；超过默认值的入参被夹到默认值，`0` 抛
+  `ValueError`。"不设限"只是调用方语义，机制永远存在。
 
 ### 2.2 run() 参数
 
@@ -109,7 +110,7 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 | `memory_used_kb` | 峰值内存（KB） |
 | `status` | `AC` / `TLE` / `MLE` / `OLE` / `RE` / `SE` |
 | `signal` | **合成值**：正常 0，沙箱强杀为 9（模仿 Linux 惯例便于移植） |
-| `exit_code` | 原始退出码；异常终止时为 NTSTATUS 值 |
+| `exit_code` | 原始退出码，**无符号**：Windows 异常终止透传完整 NTSTATUS（如 `0xC0000005`=3221225477）；`0xFFFFFFFF` 表示"没有退出码"（沙箱自身基础设施失败，`signal=0`） |
 | `oom_killed` | 是否被内核 OOM killer 收割（Linux：`memory.events` `oom_kill>0`；Windows 恒为 false） |
 | `stdout` / `stderr` | 截断后的输出 |
 | `stdout_truncated` / `stderr_truncated` | 各通道独立的内存采样截断标志 |
@@ -168,8 +169,11 @@ river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None
 
 - **身份与文件系统**：AppContainer。子进程在创建时携带 AppContainer SID，
   令牌无 capability 即默认断网；文件系统可见面由 ACL 显式授权。
-- **资源与进程**：Job Object。内存上限（commit 语义）、CPU 时间上限、存活
-  进程总数上限、`KILL_ON_JOB_CLOSE` 兜底。墙钟由看门狗保证。
+- **资源与进程**：Job Object。内存上限（commit 语义，逐进程 + 整树）、存活
+  进程总数上限、`KILL_ON_JOB_CLOSE` 兜底。**CPU 限额由 monitor 每 10ms 轮询
+  Job accounting 并主动 `TerminateJobObject`**（整树 user+kernel；不用
+  `JOB_OBJECT_LIMIT_JOB_TIME`：内核关 job 时不带 kill 来源，CPU 恰好等于限额
+  会被判成 AC）。墙钟由同一循环的看门狗保证。
 - **内核攻击面**：创建时 Mitigation Policy，禁用 win32k 系统调用与 DLL 注入式
   hook 扩展点。
 

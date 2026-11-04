@@ -100,7 +100,15 @@ judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以
 - 任何 `socket()`（`socketpair` 保留给本地 IPC）；`AF_VSOCK`
 - `io_uring_*`、`flock`、`ptrace`、`process_vm_*`、`pidfd_*`、`kcmp`
 - `mount*`/`pivot_root`/`chroot`/`unshare`/`setns`/`open_tree`/`fsmount`/
-  `mount_setattr`（**含 user namespace 创建**）
+  `mount_setattr`
+- **`clone` 的参数掩码**：仅当 flags（x86_64 arg0）不含任何
+  `CLONE_NEWNS/NEWUSER/NEWPID/NEWNET/NEWIPC/NEWUTS/NEWCGROUP` 时放行；否则
+  `clone(CLONE_NEWUSER)` 会拿到新 userns 里的 `CAP_SYS_ADMIN`，重新打开
+  allowlist 刻意关闭的内核面（旧实现无条件放行，实测能进真实的新 userns）。
+  **`clone3` 仍放行**：glibc ≥2.34 的 `pthread_create` 用它且遇到 `EPERM` 不
+  回落（只有 `ENOSYS` 回落），而 seccompiler 只有过滤器级 errno。残余风险由
+  `doctor()` 的 `userns_allowed`/`warnings` 报告；部署侧可置
+  `kernel.unprivileged_userns_clone=0`。
 - `bpf`/`perf_event_open`/`userfaultfd`/`mknod*`/模块加载/`reboot`/`kexec*`/
   `swapon*`/`clock_settime`/`sethostname`
 
@@ -199,7 +207,7 @@ Linux 样本上回归通过（1/8 限额 + 1MB 下限），OOM 事件命中时�
 |---|---|---|
 | 内存限额语义 | commit | RSS + page cache（`memory.swap.max=0`） |
 | OOM 证据 | 无（分配失败） | `memory.events` → `Status.oom_killed` |
-| CPU 限额执行 | Job CPU 限额 + 墙钟；判定按实测 CPU | 10ms `cpu.stat` 轮询主动杀 + `RLIMIT_CPU` |
+| CPU 限额执行 | 10ms Job accounting 轮询主动杀（整树 user+kernel） | 10ms `cpu.stat` 轮询主动杀 + `RLIMIT_CPU` |
 | 系统调用过滤 | win32k/mitigation policy | seccomp allowlist（默认 EPERM） |
 | 异常终止 exit_code | NTSTATUS (如 0xC0000005) | `128+sig`（如 139/137） |
 | 残余子孙判定 | Job 进程列表 | `cgroup.procs` + 100ms 宽限 |

@@ -25,8 +25,8 @@ AppContainer——不需要创建降权令牌，普通令牌即可。
 ### 资源与进程：Job Object
 
 ```
-JOB_OBJECT_LIMIT_PROCESS_MEMORY   内存上限（commit 语义，恒生效：用户限额或物理内存兜底）
-JOB_OBJECT_LIMIT_PROCESS_TIME     CPU 时间上限（粒度粗，作快速路径）
+JOB_OBJECT_LIMIT_PROCESS_MEMORY   内存上限（commit 语义，逐进程）
+JOB_OBJECT_LIMIT_JOB_MEMORY       整树 commit 上限（与 Linux memory.max 对齐）
 JOB_OBJECT_LIMIT_ACTIVE_PROCESS   存活进程总数上限（默认 64，含主进程）
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 兜底：judger 崩溃→句柄关闭→全家终止
 ```
@@ -39,7 +39,11 @@ AC）。
 > 限制存活进程数为 1 会让 `cmd /c findstr` 这类壳+子结构直接失败（实测
 > stderr "Not enough quota"），故放弃。
 
-墙钟由看门狗保证——Job 的 CPU 限制测不出 `Sleep` 型挂机。
+墙钟由看门狗保证——Job 的 CPU 限制测不出 `Sleep` 型挂机。**CPU 限额不由 Job
+内核限额承担**：`JOB_OBJECT_LIMIT_PROCESS_TIME` 是逐进程（fork 炸弹会成倍放大），
+`JOB_OBJECT_LIMIT_JOB_TIME` 杀 job 时又不带 kill 来源、CPU 恰好等于限额会被判成
+AC。monitor 因此每 10ms 轮询 Job accounting（整树 user+kernel），超限即
+`TerminateJobObject`（`KillOrigin::CpuLimit`，超调上界 ~10ms，与 Linux 同构）。
 
 ### 内核攻击面：创建时 Mitigation Policy
 
@@ -85,10 +89,10 @@ validate(spec)
 
 ## 4. 判定与测量
 
-- **双计时**：CPU 来自 **Job accounting**（统计整棵进程树），墙钟来自
-  `Instant`。TLE = 看门狗墙钟超限 ∪ 实测 CPU 超限（`Sleep` 挂机靠前者抓）。
-  Windows 8+ 上 `GetProcessTimes` 读**别的进程**恒为 0，CPU 时间必须以 Job
-  accounting 为来源。
+- **双计时**：CPU 来自 **Job accounting**（统计整棵进程树，user+kernel），墙钟来自
+  `Instant`。TLE = 看门狗墙钟超限 ∪ 实测 CPU 超限（`Sleep` 挂机靠前者抓），CPU
+  限额由 monitor 的 10ms 轮询主动执行。Windows 8+ 上 `GetProcessTimes` 读**别的
+  进程**恒为 0，CPU 时间必须以 Job accounting 为来源。
 - **内存**：Job 的 `PeakProcessMemoryUsed`（commit 语义）。
 - **MLE 优先于 RE**：强杀后以"内存超限证据"归类，而非看退出码。
 - **强杀路径**：TLE/MLE/OLE 统一 `TerminateJobObject` → signal 合成 9。
@@ -136,7 +140,7 @@ commit 限额让超额分配**失败**而非成功，因此峰值天然停在限
 |---|---|---|
 | 1 | 写系统临时目录 / 桌面 | 拒绝 |
 | 2 | 读写 cwd 外文件、遍历宿主盘 | 拒绝 |
-| 3 | 注册表读写 | 拒绝 |
+| 3 | 注册表写 | 拒绝；**读可见**（安装清单、`ProductId`、`HKCU\Environment`、`RecentDocs` 等属于已知信息暴露：AppContainer 未授权 capability 也仍可读系统注册表键，工程上无法在不改系统 ACL 的前提下按 key 收紧） |
 | 4 | 外网连接 / DNS | 拒绝 |
 | 5 | 派生子进程 | **允许但有界**（≤64 存活 + 残余检测判 `SE`） |
 | 6 | 死循环 / 挂机 / malloc 炸弹 / 输出喷泉 | TLE / TLE / MLE / OLE |

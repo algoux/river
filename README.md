@@ -44,7 +44,7 @@ Everything below is verified by the test suite
 | Identity | AppContainer (per-run profile slot `river.sandbox.<session>.<slot>`) |
 | Filesystem | private writable cwd per run; `runtimes` read-only via ACE grants |
 | Network | denied by default (no capability) |
-| Registry | denied (HKCU/HKLM) |
+| Registry | reads are visible (documented info exposure); writes denied (HKCU/HKLM) |
 | Kernel attack surface | win32k system calls + DLL-injection hook points disabled |
 | Process tree | Job Object: max 64 live processes, `KILL_ON_JOB_CLOSE` |
 | Residual children | killed + verdict `SE` (anti-cheat) |
@@ -66,6 +66,11 @@ the sandbox killed the process).
 
 - `rootfs` is not supported on Windows — use `runtimes`.
 - Network access cannot be allowed (always denied).
+- Registry **reads** are visible to the sandboxed program: an AppContainer
+  without capabilities can still read HKLM/HKCU keys (installed software,
+  `ProductId`, `HKCU\Environment`, `RecentDocs`). Writes are denied. Closing
+  this would need host-side ACL/capability changes, so treat the sandbox as
+  protecting files and processes, not registry metadata.
 - `copy_in` files are immutable in content for the program (a protected
   read-only DACL: the inherited write ACE would otherwise let the program
   clear the read-only attribute and rewrite its input). The program may still
@@ -193,6 +198,11 @@ uv run maturin develop
 uv run pytest                          # python suite (functional / attack / limits)
 cargo test --lib -- --test-threads=1   # rust unit tests
 ```
+
+On Windows, `cargo test --lib` links against the CPython DLL: put the
+interpreter's directory on `PATH` first (e.g.
+`$env:PATH = "$(Split-Path (python -c 'import sys; print(sys.executable)'));$env:PATH"`),
+otherwise the test binary exits with `STATUS_DLL_NOT_FOUND` (0xc0000135).
 
 On Linux the suite must run as root (`sudo -E uv run pytest`), because the
 sandbox itself needs `CAP_SYS_ADMIN`.

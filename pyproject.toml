@@ -4,13 +4,22 @@ build-backend = "maturin"
 
 [project]
 name = "river"
-requires-python = ">=3.8"
+description = "Sandbox for running untrusted executables with resource limits (Rust extension, Windows and Linux backends)"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+keywords = ["sandbox", "judge", "untrusted", "appcontainer", "seccomp", "cgroups"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
-    "Programming Language :: Python :: Implementation :: PyPy",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/algoux/river"
 
 [project.optional-dependencies]
 # S13 test suite (pytest three-pack: functional / attack / limits).
