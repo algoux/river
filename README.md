@@ -19,10 +19,14 @@ uv run ./examples/example.py
 
 ## Status
 
-| Area | Linux | macOS | Windows |
-|---|---|---|---|
-| Implementation | planned | planned | **done** (AppContainer + Job Object) |
-| Tests | — | — | 53 Rust unit tests + 59 pytest tests |
+Windows is the only supported platform; Linux/macOS support was explicitly
+ruled out. The Windows backend is **complete** (AppContainer + Job Object),
+and the current form of the project is final: further work is limited to bug
+fixes and documentation.
+
+| Area | Tests |
+|---|---|
+| Windows backend | 53 Rust unit tests + 59 pytest tests |
 
 ## Windows capability matrix
 
@@ -56,12 +60,15 @@ abnormal termination), `SE` (sandbox anomaly). `signal` is synthesized (`9`
 when the sandbox killed the process), `exit_code` is the raw code — an NTSTATUS
 on abnormal Windows termination.
 
-### Known limitations (Windows, first version)
+### Known limitations (Windows — final form, not a to-do list)
+
+These are the final behaviour; the corresponding features were explicitly
+ruled out (see [docs/windows-backend.md §9.4](docs/windows-backend.md)):
 
 - `rootfs` is not supported on Windows (processes always resolve system DLLs
   from the real `System32`) — use `runtimes` instead.
-- Network access cannot be allowed yet (always denied).
-- `copy_in` files are read-only for the program (no writable allowlist yet).
+- Network access cannot be allowed (always denied).
+- `copy_in` files are read-only for the program.
 - Memory limits apply to *commit*, not RSS — a large `malloc` that is never
   written does not trigger `MLE`.
 - Child processes are allowed by design (ordinary wrappers must work); the
@@ -70,9 +77,11 @@ on abnormal Windows termination.
   a 300ms program, but the host occasionally hiccups); allow 5-10% when
   using limits as thresholds.
 - Ordinary Win32 GUI programs can put windows on the user's desktop
-  (isolation via a private desktop is not implemented).
+  (no private-desktop isolation).
 - `ctypes` cannot be loaded inside the sandbox (a side effect of the win32k
   lockdown) — programs depending on ctypes/PowerShell/CLR fail at load time.
+- The internal safety ceilings are constants (wall ≤ 24h, memory ≤ physical
+  memory); they are not constructor parameters.
 
 ## Testing
 

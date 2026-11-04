@@ -38,15 +38,17 @@ class Status:
 class Sandbox:
     """Sandbox for running untrusted executables with resource limits.
 
-    Filesystem model (uniform across platforms):
+    Filesystem model:
       - a fresh private writable working directory per `run`;
       - each `runtimes` entry exposed read-only (+execute);
       - `copy_in` files provisioned into the working directory (read-only
         for the program by default);
       - everything else on the host is invisible to the sandboxed process.
 
-    `rootfs` is Linux/macOS only (chroot / sandbox-exec); passing it on
-    Windows raises `ValueError` — use `runtimes` there instead.
+    Platform support: **Windows only**. On other platforms `run()` raises
+    `NotImplementedError`. `rootfs` is not supported on Windows either
+    (processes always resolve system DLLs from the real `System32`) — use
+    `runtimes` there instead.
     """
 
     def __init__(

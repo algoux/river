@@ -7,11 +7,16 @@ use pyo3::types::PyAny;
 use crate::platform::{RunSpec, parse_copy_in, validate};
 use crate::status::Status;
 
-/// Linux sandbox.
+/// Linux sandbox — **not implemented**.
 ///
-/// When `rootfs` is given the sandbox `chroot`/`pivot_root`s into it before
-/// executing; paths in `runtimes` are bind-mounted read-only on top of it
-/// (or serve as the runtime environment on their own when `rootfs` is None).
+/// The Windows backend is the only supported platform (see
+/// docs/windows-backend.md §9.4); this module exists so the crate keeps the
+/// platform split, and `run()` raises `NotImplementedError` rather than
+/// pretending to sandbox anything.
+///
+/// The intended design (not implemented): with `rootfs` the sandbox would
+/// `chroot`/`pivot_root` into it before executing, and paths in `runtimes`
+/// would be bind-mounted read-only on top of it.
 #[pyclass(module = "river")]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
@@ -116,8 +121,12 @@ impl Sandbox {
         };
         validate(&spec)?;
         let _ = spec.effective_wall_time_limit_ms();
-        // TODO(linux): namespace/cgroup sandbox per DESIGN baseline.
-        Ok(Status::default())
+        // The Linux backend is explicitly out of scope (see
+        // docs/windows-backend.md §9.4). Fail loudly instead of returning an
+        // empty Status that would look like a silent no-op run.
+        Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "river currently supports Windows only; the Linux backend is not implemented",
+        ))
     }
 
     fn __repr__(&self) -> String {

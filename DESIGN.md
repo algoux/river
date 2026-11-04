@@ -1,12 +1,17 @@
 # river 设计文档
 
-river 是一个跨平台沙箱库（Python 扩展，Rust 实现），用于在受限环境中运行不受信任的
+river 是一个沙箱库（Python 扩展，Rust 实现），用于在受限环境中运行不受信任的
 可执行文件并采集资源用量与结果。对标 go-judge 的 `exec` 语义，但不做判题比对——
 比对/checker 永远是调用方（OJ 判题层）的职责。
 
+**平台范围：Windows 是唯一支持的平台**（Linux/macOS 后端已确认明确不做，
+见 docs/windows-backend.md §9.4）。本文档保留跨平台心智模型，是为了让
+API 契约（§2）与平台语义保持自洽——它是设计时的抽象，不是实现计划。
+
 ## 1. 统一的三平台心智模型
 
-所有平台共享同一个模型，平台差异只体现在实现机制上：
+模型本身跨平台统一，平台差异只体现在实现机制上（Windows 的实现见
+docs/windows-backend.md；Linux/macOS 仅保留设计语义，不实现）：
 
 ```
 私有可写 cwd     每次 run 新建的临时工作目录，块退出即销毁
@@ -15,7 +20,7 @@ river 是一个跨平台沙箱库（Python 扩展，Rust 实现），用于在�
 + env            增量合并进白名单基底（SystemRoot/TEMP/TMP 恒存在）
 ```
 
-| 能力 | Linux | macOS | Windows |
+| 能力 | Linux（未实现） | macOS（未实现） | Windows（已实现） |
 |---|---|---|---|
 | `rootfs` | ✅ chroot / pivot_root | ✅ sandbox-exec profile | ❌ 传入即 `ValueError` |
 | `runtimes` 实现 | 只读 bind mount | 只读 profile 扩展 | AppContainer + 只读 ACL |
@@ -36,7 +41,9 @@ JDK 等）通过 `runtimes` 授权直读 + `env` 注入 PATH 组合出来。
 river.Sandbox(rootfs=None, runtimes=None)
 ```
 
-- `rootfs: str | os.PathLike | None` —— 仅 Linux/macOS；Windows 传入抛 `ValueError`
+- `rootfs: str | os.PathLike | None` —— Windows 传入抛 `ValueError`（Windows
+  进程永远从真实 `System32` 加载系统 DLL，"另一份操作系统"的语义不成立；
+  该参数保留只为跨平台心智模型自洽，**不会**在本仓库实现）
 - `runtimes: Sequence[str | os.PathLike] | None` —— 只读运行时目录
 
 ### 2.2 run() 参数
@@ -89,11 +96,11 @@ river.Sandbox(rootfs=None, runtimes=None)
    （句柄直传，被测进程无按路径重开的权限）；bytes 起喂线程。
 2. **输出三机制分离**：`*_limit` 是击杀阈值（恒生效）、`*_file` 是完整留档
    （judger 从管道读全量落盘）、`r.stdout` 是截断采样。
-3. **copy_in 默认只读**：同卷硬链接优化只有在拒绝写 ACE 下才安全（否则被测
-   进程可篡改宿主源文件）；需要程序可写的文件走真拷贝（将来加白名单参数）。
+3. **copy_in 一律只读**：同卷硬链接优化只有在拒绝写 ACE 下才安全（否则被测
+   进程可篡改宿主源文件）。不做"可写白名单"——copy_in 一律只读是最终语义。
 4. **copy_in 不走 MoveFile**：移动保留源 ACL，拷贝继承目标目录 ACL；落盘后
    显式重置 ACL。
-5. **不做交互题**：实时双向管道（interactor）是独立模式，将来单列，不塞进 run 参数。
+5. **不做交互题**：实时双向管道（interactor）不塞进 run 参数，本仓库不做。
 6. **进程策略（分层）**：主进程是唯一的被评测对象；允许普通包装器
    （`cmd /c`、解释器辅助进程）派生，Job 内存活总数有上限（当前默认 64），
    fork 炸弹有界。**主进程退出即终止全部残余子孙**——程序不得把工作甩给
@@ -103,9 +110,11 @@ river.Sandbox(rootfs=None, runtimes=None)
    （spawn 失败、清理失败），(b) 主进程死后仍有存活子孙（防甩锅）。
    参数校验失败仍抛 Python 异常，不走 `SE`。
 
-## 4. 已知平台差异（文档化承诺）
+## 4. Windows 行为特性（文档化承诺）
 
-- **内存语义**：Windows 的 Job 内存限制约束 commit 而非 RSS；惰性提交意味着
+调用方按这些特性使用 API；它们是**最终行为**，不是待改进项。
+
+- **内存语义**：Job 内存限制约束 commit 而非 RSS；惰性提交意味着
   `malloc` 大块不写入不触发 MLE（与 Linux overcommit 行为相近）。
 - **计时抖动**：Windows 计时受调度/Defender/缺页影响大于 Linux，建议调用方
   放宽 5-10% 或取两次较优。实测基线（2026-11，Win11，8 路并发压力下）：
