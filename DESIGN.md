@@ -33,14 +33,27 @@ Windows 不支持 `rootfs`：Windows 进程永远从真实 `System32` 加载系�
 
 完整签名见 `river.pyi`，用法见 `examples/example.py`。
 
+### 2.0 能力内省
+
+```python
+river.capabilities()
+# {'platform': 'windows', 'rootfs': False, 'network_isolation': True,
+#  'concurrent_runs': True, 'default_max_processes': 64,
+#  'internal_wall_limit_secs': 86400}
+```
+
+调用方（OJ 调度层）据此程序化适配平台差异，无需 try/except 探测。
+
 ### 2.1 Sandbox 构造
 
 ```python
-river.Sandbox(rootfs=None, runtimes=None)
+river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)
 ```
 
 - `rootfs` —— Windows 传入抛 `ValueError`
 - `runtimes` —— 只读运行时目录
+- `max_wall_secs` / `max_processes` —— 收紧（不可禁用）内部安全上限；
+  默认 24h 墙钟 / 64 存活进程。"不设限"只是调用方语义，机制永远存在。
 
 ### 2.2 run() 参数
 
@@ -103,6 +116,17 @@ river.Sandbox(rootfs=None, runtimes=None)
    存活子孙。参数校验失败仍抛 Python 异常。
 8. **判定以证据优先**：沙箱强杀与限额证据的优先级高于进程的原始退出码
    （被强杀的进程退出码往往无意义）。
+
+### 3.1 分层架构（contract / backend）
+
+- `contract` —— 平台无关的冻结契约：`RunSpec` 校验、`RunEvidence → Verdict`
+  判定（纯函数 `classify`，唯一权威实现）、`Status` pyclass。平台后端只
+  上报观测证据（`RunEvidence`：kill 来源、退出码、残余进程数、CPU/内存
+  实测与有效限额），判定永远在契约层完成——"证据优先于退出码"只写一次、
+  测一次，Linux 落地时不会被平台机制带偏。
+- `backend` —— 平台机制（进程隔离、资源限制、stdio）。Windows 的
+  AppContainer / Job Object / Mitigation Policy 是这些机制的实现，不是
+  判定逻辑的一部分。`river.capabilities()` 由后端提供能力矩阵。
 
 ## 4. Windows 实现要点
 

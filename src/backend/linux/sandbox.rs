@@ -4,18 +4,18 @@ use std::path::PathBuf;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use crate::platform::{RunSpec, parse_copy_in, validate};
-use crate::status::Status;
+use crate::contract::{RunSpec, parse_copy_in, validate};
+use crate::contract::status::Status;
 
-/// macOS sandbox — **not implemented yet**.
+/// Linux sandbox — **not implemented yet**.
 ///
 /// The Windows backend is the current target; this module exists so the crate
 /// keeps the platform split, and `run()` raises `NotImplementedError` rather
 /// than pretending to sandbox anything.
 ///
 /// The intended design (see DESIGN.md §1): with `rootfs` the sandbox would
-/// execute inside a sandbox-exec profile restricted to it, and paths in
-/// `runtimes` would be exposed read-only on top of it.
+/// `chroot`/`pivot_root` into it before executing, and paths in `runtimes`
+/// would be bind-mounted read-only on top of it.
 #[pyclass(module = "river")]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
@@ -39,7 +39,7 @@ impl Sandbox {
     }
 
     /// Exit protocol: no leftover sandboxed processes, temporary working
-    /// directories removed, profiles/tokens released. Always returns `false`.
+    /// directories removed, mounts/tokens released. Always returns `false`.
     fn __exit__(
         &self,
         _exc_type: &Bound<'_, PyAny>,
@@ -120,11 +120,11 @@ impl Sandbox {
         };
         validate(&spec)?;
         let _ = spec.effective_wall_time_limit_ms();
-        // The macOS backend is not implemented yet (see DESIGN.md §1). Fail
+        // The Linux backend is not implemented yet (see DESIGN.md §1). Fail
         // loudly instead of returning an empty Status that would look like a
         // silent no-op run.
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "river currently supports Windows only; the macOS backend is not implemented yet",
+            "river currently supports Windows only; the Linux backend is not implemented yet",
         ))
     }
 

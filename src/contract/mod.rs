@@ -1,12 +1,17 @@
-#[cfg(target_os = "linux")]
-pub mod linux;
-#[cfg(target_os = "macos")]
-pub mod macos;
-#[cfg(target_os = "windows")]
-pub mod windows;
+//! The frozen, platform-neutral API contract.
+//!
+//! Everything in this module is pure data + pure functions: argument
+//! validation, evidence-driven verdict classification, and the `Status`
+//! pyclass. Platform backends depend on this module; this module never
+//! depends on a backend. That inversion is what keeps the semantics written
+//! (and unit-tested) exactly once across platforms.
+
+pub mod status;
+pub mod verdict;
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -26,8 +31,8 @@ pub(crate) enum CopyInSource {
 /// - `copy_in` keys: paths relative to the sandbox working directory
 ///
 /// Limit semantics: `None` means *no caller-imposed limit*. Backends must
-/// still enforce internal safety ceilings (configurable at Sandbox
-/// construction) so that unlimited runs cannot take down the host.
+/// still enforce internal safety ceilings (see [`SafetyCeilings`]) so that
+/// unlimited runs cannot take down the host.
 pub(crate) struct RunSpec {
     pub executable: PathBuf,
     pub args: Vec<String>,
@@ -49,10 +54,34 @@ impl RunSpec {
     /// Effective wall clock limit: explicit value, else `2 * time_limit + 1000ms`
     /// when a CPU time limit is set, else `None` (unlimited).
     pub(crate) fn effective_wall_time_limit_ms(&self) -> Option<u64> {
-        self.wall_time_limit_ms.or_else(|| {
-            self.time_limit_ms
-                .map(|t| t.saturating_mul(2).saturating_add(1000))
-        })
+        self.wall_time_limit_ms
+            .or_else(|| {
+                self.time_limit_ms
+                    .map(|t| t.saturating_mul(2).saturating_add(1000))
+            })
+    }
+}
+
+/// Internal safety ceilings: the *mechanism* guarantees that stay in place
+/// even when the caller passes `None` (i.e. "no caller-imposed limit").
+/// "Unlimited" is a caller-side semantic, never a missing mechanism
+/// (DESIGN.md §2.2).
+#[derive(Clone, Copy)]
+pub(crate) struct SafetyCeilings {
+    /// Wall-clock ceiling applied to a run whose effective wall limit is
+    /// `None`. Default: 24 hours.
+    pub wall_limit: Duration,
+    /// Cap on simultaneously alive processes per run (main process
+    /// included). Default: 64.
+    pub max_processes: u32,
+}
+
+impl Default for SafetyCeilings {
+    fn default() -> Self {
+        SafetyCeilings {
+            wall_limit: Duration::from_secs(24 * 3600),
+            max_processes: 64,
+        }
     }
 }
 
@@ -96,4 +125,47 @@ pub(crate) fn validate(spec: &RunSpec) -> PyResult<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec() -> RunSpec {
+        RunSpec {
+            executable: PathBuf::from("prog"),
+            args: vec![],
+            cwd: None,
+            env: None,
+            time_limit_ms: None,
+            wall_time_limit_ms: None,
+            memory_limit_kb: None,
+            stdin: None,
+            stdin_file: None,
+            copy_in: None,
+            stdout_limit_kb: None,
+            stderr_limit_kb: None,
+            stdout_file: None,
+            stderr_file: None,
+        }
+    }
+
+    #[test]
+    fn wall_limit_defaults_to_2x_cpu_plus_1s() {
+        let mut s = spec();
+        s.time_limit_ms = Some(1000);
+        assert_eq!(s.effective_wall_time_limit_ms(), Some(3000));
+        s.wall_time_limit_ms = Some(500);
+        assert_eq!(s.effective_wall_time_limit_ms(), Some(500));
+        s.time_limit_ms = None;
+        s.wall_time_limit_ms = None;
+        assert_eq!(s.effective_wall_time_limit_ms(), None);
+    }
+
+    #[test]
+    fn ceilings_have_safe_defaults() {
+        let c = SafetyCeilings::default();
+        assert_eq!(c.wall_limit, Duration::from_secs(24 * 3600));
+        assert_eq!(c.max_processes, 64);
+    }
 }

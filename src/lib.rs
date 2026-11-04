@@ -1,18 +1,61 @@
-mod platform;
-mod status;
+//! river — sandbox for untrusted executables, as a Python extension in Rust.
+//!
+//! Layout (design §architecture):
+//! - [`contract`] — the frozen, platform-neutral API contract: `RunSpec`
+//!   validation, `RunEvidence` → `Verdict` classification (a pure function),
+//!   and the `Status` pyclass. No platform code may leak in here; platform
+//!   backends *translate their mechanisms into evidence*.
+//! - [`backend`] — platform backends. Each backend implements the mechanisms
+//!   (process isolation, resource limits, stdio) and reports its findings as
+//!   [`contract::verdict::RunEvidence`]; the verdict itself is always
+//!   synthesized by the shared contract so the "evidence beats exit code"
+//!   rule is written and tested exactly once.
 
-#[pyo3::pymodule]
+mod backend;
+mod contract;
+
+use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+/// Platform capability matrix for the running interpreter (introspection for
+/// the caller / OJ scheduler layer, so it never needs try/except probing).
+///
+/// Keys (frozen contract):
+/// - `platform`: `"windows" | "linux" | "macos"`
+/// - `rootfs`: whether `Sandbox(rootfs=...)` is supported
+/// - `network_isolation`: whether network access is denied inside the sandbox
+/// - `concurrent_runs`: whether one `Sandbox` may be used from several threads
+/// - `default_max_processes`: default live-process cap per run
+/// - `internal_wall_limit_secs`: the safety wall-clock ceiling for
+///   caller-unlimited runs
+#[pyfunction]
+fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    let caps = backend::capabilities();
+    let dict = PyDict::new(py);
+    dict.set_item("platform", caps.platform)?;
+    dict.set_item("rootfs", caps.rootfs)?;
+    dict.set_item("network_isolation", caps.network_isolation)?;
+    dict.set_item("concurrent_runs", caps.concurrent_runs)?;
+    dict.set_item("default_max_processes", caps.default_max_processes)?;
+    dict.set_item("internal_wall_limit_secs", caps.internal_wall_limit_secs)?;
+    Ok(dict.unbind())
+}
+
+#[pymodule]
 mod river {
+    #[pymodule_export]
+    use super::capabilities;
+
     #[cfg(target_os = "linux")]
     #[pymodule_export]
-    use super::platform::linux::Sandbox;
+    use super::backend::linux::Sandbox;
     #[cfg(target_os = "macos")]
     #[pymodule_export]
-    use super::platform::macos::Sandbox;
+    use super::backend::macos::Sandbox;
     #[cfg(target_os = "windows")]
     #[pymodule_export]
-    use super::platform::windows::Sandbox;
+    use super::backend::windows::Sandbox;
 
     #[pymodule_export]
-    use super::status::Status;
+    use super::contract::status::Status;
 }

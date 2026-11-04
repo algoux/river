@@ -41,8 +41,8 @@ pub(crate) fn mitigation_policies_ext_only() -> u64 {
     MITIGATION_POLICY_EXTENSION_POINT_DISABLE_ALWAYS_ON
 }
 
-use crate::platform::windows::job::{Job, wait_process_exit};
-use crate::platform::windows::stdio::StdioSet;
+use crate::backend::windows::job::{Job, wait_process_exit};
+use crate::backend::windows::stdio::StdioSet;
 
 /// Silence the Windows "crash" dialog for sandboxed children.
 ///
@@ -141,10 +141,118 @@ fn to_wide(s: &str) -> Vec<u16> {
 ///
 /// A null `appcontainer_sid` spawns with the judger token — only the
 /// mitigation policies are applied (used to isolate policy effects in tests).
-pub(crate) struct SpawnSecurity {
+/// Security configuration for a sandboxed spawn: the AppContainer identity
+/// the child adopts (if any), the mitigation policies, and the whitelisted
+/// environment block it sees.
+///
+/// A null `appcontainer_sid` spawns with the judger token — only the
+/// mitigation policies are applied (used to isolate policy effects in
+/// tests); prefer the constructors below over hand-building the struct.
+pub(crate) struct SpawnProfile {
     pub appcontainer_sid: *mut core::ffi::c_void,
     pub env_block: Vec<u16>,    // UTF-16 "K=V\0" pairs, double-NUL terminated
     pub mitigation_policy: u64, // MITIGATION_POLICY attribute word
+}
+
+impl SpawnProfile {
+    /// The production profile: AppContainer identity + kernel attack-surface
+    /// policies + whitelisted environment.
+    pub(crate) fn sandboxed(
+        appcontainer_sid: *mut core::ffi::c_void,
+        env_block: Vec<u16>,
+    ) -> Self {
+        SpawnProfile {
+            appcontainer_sid,
+            env_block,
+            mitigation_policy: mitigation_policies(),
+        }
+    }
+
+    /// A judger-token child with chosen policies (test isolation only).
+    #[cfg(test)]
+    pub(crate) fn test_only(mitigation_policy: u64, env_block: Vec<u16>) -> Self {
+        SpawnProfile {
+            appcontainer_sid: std::ptr::null_mut(),
+            env_block,
+            mitigation_policy,
+        }
+    }
+
+    pub(crate) fn has_appcontainer(&self) -> bool {
+        !self.appcontainer_sid.is_null()
+    }
+}
+
+/// RAII wrapper around a `PROC_THREAD_ATTRIBUTE` list.
+///
+/// Every `add_*` call fails closed: on error the list stays valid and the
+/// error is returned, and `Drop` always calls
+/// `DeleteProcThreadAttributeList` exactly once (the hand-rolled cleanup
+/// this replaces could leak the list on a mid-way `return Err`).
+struct AttributeList {
+    buf: Vec<u8>,
+    initialized: bool,
+}
+
+impl AttributeList {
+    fn new(count: u32) -> io::Result<Self> {
+        let mut size = 0usize;
+        // SAFETY: first call with a null list only queries the required size.
+        unsafe {
+            InitializeProcThreadAttributeList(std::ptr::null_mut(), count, 0, &mut size);
+        }
+        let mut list = AttributeList {
+            buf: vec![0u8; size],
+            initialized: false,
+        };
+        // SAFETY: buffer holds `size` bytes for the attribute list.
+        let ok = unsafe {
+            InitializeProcThreadAttributeList(list.buf.as_mut_ptr() as *mut _, count, 0, &mut size)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        list.initialized = true;
+        Ok(list)
+    }
+
+    fn add(
+        &mut self,
+        attribute: usize,
+        value: *mut core::ffi::c_void,
+        size: usize,
+    ) -> io::Result<()> {
+        // SAFETY: list is initialized; `value` points at `size` bytes of
+        // attribute data that stay valid through the CreateProcessW call.
+        let ok = unsafe {
+            UpdateProcThreadAttribute(
+                self.buf.as_mut_ptr() as *mut _,
+                0,
+                attribute,
+                value,
+                size,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn as_ptr(&mut self) -> *mut core::ffi::c_void {
+        self.buf.as_mut_ptr() as *mut _
+    }
+}
+
+impl Drop for AttributeList {
+    fn drop(&mut self) {
+        if self.initialized {
+            // SAFETY: the list was initialized and is deleted exactly once.
+            unsafe { DeleteProcThreadAttributeList(self.buf.as_mut_ptr() as *mut _) };
+        }
+    }
 }
 
 /// Build a UTF-16 environment block (sorted, case-insensitive on the name —
@@ -202,17 +310,19 @@ impl Drop for SuspendedGuard {
 /// `stdio_set`. The child is suspended and job-assigned on success; the
 /// judger-side duplicates of the child-facing stdio handles are closed here.
 ///
-/// When `security` is given, the child becomes an AppContainer at creation
-/// time (`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`) and only the three
-/// std handles are inheritable (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), and it
-/// runs with the whitelisted environment block instead of the judger's env.
+/// When `profile` is given, the child gets the mitigation policies always;
+/// with an AppContainer identity it additionally becomes an AppContainer at
+/// creation time (`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`), only the
+/// three std handles are inheritable (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`),
+/// and it runs with the whitelisted environment block instead of the
+/// judger's env.
 pub(crate) fn spawn_bare(
     executable: &Path,
     args: &[String],
     job: &Job,
     stdio_set: &mut StdioSet,
     cwd: Option<&Path>,
-    security: Option<&SpawnSecurity>,
+    profile: Option<&SpawnProfile>,
 ) -> io::Result<SpawnedChild> {
     let (child_stdin, child_stdout, child_stderr) = stdio_set.take_child_ends()?;
 
@@ -225,8 +335,8 @@ pub(crate) fn spawn_bare(
         to_wide(&line)
     };
 
-    let mut si = STARTUPINFOW {
-        cb: if security.is_some() {
+    let si = STARTUPINFOW {
+        cb: if profile.is_some() {
             std::mem::size_of::<STARTUPINFOEXW>() as u32
         } else {
             std::mem::size_of::<STARTUPINFOW>() as u32
@@ -247,9 +357,9 @@ pub(crate) fn spawn_bare(
 
     let cwd_wide = cwd.map(|c| to_wide(&c.display().to_string()));
 
-    // Attribute list for the sandboxed spawn (SECURITY_CAPABILITIES +
-    // HANDLE_LIST). Built only when an AppContainer identity is requested.
-    let mut attr_buf: Vec<u8> = Vec::new();
+    // Attribute list for the sandboxed spawn: HANDLE_LIST (only with an
+    // AppContainer identity) + SECURITY_CAPABILITIES (same) + MITIGATION_POLICY.
+    let mut attr_list = None;
     let mut sec_caps = SECURITY_CAPABILITIES {
         AppContainerSid: std::ptr::null_mut(),
         Capabilities: std::ptr::null_mut(),
@@ -261,90 +371,44 @@ pub(crate) fn spawn_bare(
         child_stdout.as_raw_handle() as *mut core::ffi::c_void,
         child_stderr.as_raw_handle() as *mut core::ffi::c_void,
     ];
-    if security.is_some() {
-        let policies = security.unwrap().mitigation_policy;
-        let has_ac = security
-            .map(|s| !s.appcontainer_sid.is_null())
-            .unwrap_or(false);
+    if let Some(profile) = profile {
+        let has_ac = profile.has_appcontainer();
         let attr_count = if has_ac { 3 } else { 1 };
-        let mut size = 0usize;
-        // SAFETY: first call with a null list only queries the required size.
-        unsafe {
-            InitializeProcThreadAttributeList(std::ptr::null_mut(), attr_count as u32, 0, &mut size);
-        }
-        attr_buf = vec![0u8; size];
-        let list = attr_buf.as_mut_ptr() as *mut core::ffi::c_void;
-        // SAFETY: buffer holds `size` bytes for the attribute list.
-        let ok = unsafe { InitializeProcThreadAttributeList(list, attr_count as u32, 0, &mut size) };
-        if ok == 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let mut attrs = AttributeList::new(attr_count)?;
+
         // Only the three std handles are inherited into the child.
-        // SAFETY: list is initialized; value points at a 3-handle array.
         if has_ac {
-            let ok = unsafe {
-                UpdateProcThreadAttribute(
-                    list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-                    handles.as_ptr() as *mut _,
-                    std::mem::size_of::<[*mut core::ffi::c_void; 3]>(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
+            attrs.add(
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                handles.as_ptr() as *mut _,
+                std::mem::size_of::<[*mut core::ffi::c_void; 3]>(),
+            )?;
+            sec_caps.AppContainerSid = profile.appcontainer_sid;
+            attrs.add(
+                PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                &mut sec_caps as *mut _ as *mut _,
+                std::mem::size_of::<SECURITY_CAPABILITIES>(),
+            )?;
         }
-        if let Some(sec) = security {
-            if has_ac {
-                sec_caps.AppContainerSid = sec.appcontainer_sid;
-                // SAFETY: list is initialized; value points at a valid struct.
-                let ok = unsafe {
-                    UpdateProcThreadAttribute(
-                        list,
-                        0,
-                        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
-                        &mut sec_caps as *mut _ as *mut _,
-                        std::mem::size_of::<SECURITY_CAPABILITIES>(),
-                        std::ptr::null_mut(),
-                        std::ptr::null(),
-                    )
-                };
-                if ok == 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            // Kernel attack surface: win32k syscalls + DLL-injection hook
-            // extension points are disabled for the child's lifetime.
-            // SAFETY: list is initialized; value points at the policy word.
-            let ok = unsafe {
-                UpdateProcThreadAttribute(
-                    list,
-                    0,
-                    PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
-                    &policies as *const u64 as *mut _,
-                    std::mem::size_of::<u64>(),
-                    std::ptr::null_mut(),
-                    std::ptr::null(),
-                )
-            };
-            if ok == 0 {
-                return Err(io::Error::last_os_error());
-            }
-        }
-        si_ex.lpAttributeList = list;
+        // Kernel attack surface: win32k syscalls + DLL-injection hook
+        // extension points are disabled for the child's lifetime.
+        attrs.add(
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY as usize,
+            &profile.mitigation_policy as *const u64 as *mut _,
+            std::mem::size_of::<u64>(),
+        )?;
+        si_ex.lpAttributeList = attrs.as_ptr();
+        attr_list = Some(attrs); // Drop deletes the list after CreateProcessW
     }
 
     let flags = CREATE_SUSPENDED
-        | if security.is_some() {
+        | if profile.is_some() {
             EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
         } else {
             0
         };
-    let env_ptr = security
-        .map(|s| s.env_block.as_ptr() as *const core::ffi::c_void)
+    let env_ptr = profile
+        .map(|p| p.env_block.as_ptr() as *const core::ffi::c_void)
         .unwrap_or(std::ptr::null());
 
     // SAFETY: pointers are valid; stdio handles are inheritable (S1) and,
@@ -372,10 +436,10 @@ pub(crate) fn spawn_bare(
     } else {
         None
     };
-    if !attr_buf.is_empty() {
-        // SAFETY: the list was initialized above (non-empty buffer).
-        unsafe { DeleteProcThreadAttributeList(attr_buf.as_mut_ptr() as *mut _) };
-    }
+    // The attribute list may be deleted now that CreateProcessW returned
+    // (RAII: `attr_list` drops here, `DeleteProcThreadAttributeList` runs
+    // exactly once, also on the error path).
+    drop(attr_list);
     if let Some(e) = create_err {
         return Err(e);
     }
@@ -408,15 +472,15 @@ pub(crate) fn spawn_bare(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::windows::job::{JobLimits, brief_pause};
-    use crate::platform::windows::stdio::StdinSource;
+    use crate::backend::windows::job::{JobLimits, brief_pause};
+    use crate::backend::windows::stdio::StdinSource;
     use std::time::Instant;
 
     fn limits() -> JobLimits {
         JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         }
     }
 
@@ -457,8 +521,8 @@ mod tests {
         limits: &JobLimits,
     ) -> io::Result<(
         u32,
-        crate::platform::windows::stdio::Output,
-        crate::platform::windows::stdio::Output,
+        crate::backend::windows::stdio::Output,
+        crate::backend::windows::stdio::Output,
     )> {
         let job = Job::new(limits)?;
         let mut set = StdioSet::new(stdin, None, None, None, None)?;
@@ -554,9 +618,9 @@ mod tests {
     /// whitelisted environment (cmd needs SystemRoot to even start).
     #[test]
     fn appcontainer_child_writes_cwd_but_not_c_root() {
-        use crate::platform::windows::acl;
-        use crate::platform::windows::token::AppContainer;
-        use crate::platform::windows::workdir::WorkDir;
+        use crate::backend::windows::acl;
+        use crate::backend::windows::token::AppContainer;
+        use crate::backend::windows::workdir::WorkDir;
         use std::path::PathBuf;
 
         let ac = AppContainer::create_or_open().unwrap();
@@ -585,17 +649,13 @@ mod tests {
                 "marker-visible".to_string(),
             ),
         ];
-        let security = SpawnSecurity {
-            appcontainer_sid: ac.sid(),
-            env_block: env_block(&env_vars),
-            mitigation_policy: mitigation_policies(),
-        };
+        let security = SpawnProfile::sandboxed(ac.sid(), env_block(&env_vars));
 
         let comspec = PathBuf::from(std::env::var("ComSpec").unwrap());
         let run = |args: &[&str]| -> io::Result<(
             u32,
-            crate::platform::windows::stdio::Output,
-            crate::platform::windows::stdio::Output,
+            crate::backend::windows::stdio::Output,
+            crate::backend::windows::stdio::Output,
         )> {
             let job = Job::new(&limits())?;
             let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
@@ -657,10 +717,9 @@ mod tests {
     /// delta comes from the policies, not from some environmental accident.
     #[test]
     fn mitigation_policies_are_enforced_by_the_kernel() -> io::Result<()> {
-        use crate::platform::windows::acl;
-        use crate::platform::windows::token::AppContainer;
-        use crate::platform::windows::workdir::WorkDir;
-        use std::path::PathBuf;
+        use crate::backend::windows::acl;
+        use crate::backend::windows::token::AppContainer;
+        use crate::backend::windows::workdir::WorkDir;
 
         const ERROR_ACCESS_DISABLED_BY_POLICY: u32 = 1260;
 
@@ -758,11 +817,11 @@ mod tests {
 
         let run = |args: &[&str],
                    cwd: Option<&std::path::Path>,
-                   security: Option<&SpawnSecurity>|
+                   security: Option<&SpawnProfile>|
           -> io::Result<(
             u32,
-            crate::platform::windows::stdio::Output,
-            crate::platform::windows::stdio::Output,
+            crate::backend::windows::stdio::Output,
+            crate::backend::windows::stdio::Output,
         )> {
             let job = Job::new(&limits())?;
             let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
@@ -798,11 +857,7 @@ mod tests {
             ("TEMP".to_string(), tmp.display().to_string()),
             ("TMP".to_string(), tmp.display().to_string()),
         ];
-        let security = SpawnSecurity {
-            appcontainer_sid: ac.sid(),
-            env_block: env_block(&env_vars),
-            mitigation_policy: mitigation_policies(),
-        };
+        let security = SpawnProfile::sandboxed(ac.sid(), env_block(&env_vars));
 
         // Policy-isolated child A (judger token, EXTENSION_POINT policy only,
         // no AppContainer): the child's own kernel mitigation state must show
@@ -811,14 +866,16 @@ mod tests {
         // policy, so the kernel-applied state is the verified contract; the
         // policy blocks AppInit DLLs / Winsock LSPs / global-hook /
         // legacy-IME extension points for the child's lifetime.)
-        let ext_only = SpawnSecurity {
-            appcontainer_sid: std::ptr::null_mut(),
-            env_block: env_block(&[(
+        let system_root_env = || {
+            env_block(&[(
                 "SystemRoot".to_string(),
                 std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
-            )]),
-            mitigation_policy: mitigation_policies_ext_only(),
+            )])
         };
+        let ext_only = SpawnProfile::test_only(
+            mitigation_policies_ext_only(),
+            system_root_env(),
+        );
         let (code, out, _) = run(&["query"], Some(work.path()), Some(&ext_only))?;
         assert_eq!(
             code, 0,
@@ -828,14 +885,7 @@ mod tests {
         // Policy-isolated child B (judger token, full policies, no AC): user32
         // cannot even initialize under win32k lockdown — LoadLibraryA fails
         // with DLL_INIT_FAILED (or the syscall with DISABLED_BY_POLICY).
-        let full_no_ac = SpawnSecurity {
-            appcontainer_sid: std::ptr::null_mut(),
-            env_block: env_block(&[(
-                "SystemRoot".to_string(),
-                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
-            )]),
-            mitigation_policy: mitigation_policies(),
-        };
+        let full_no_ac = SpawnProfile::test_only(mitigation_policies(), system_root_env());
         let (code, out, _) = run(&["win32k"], Some(work.path()), Some(&full_no_ac))?;
         assert!(
             code != 0 && code != 7,

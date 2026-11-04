@@ -505,9 +505,10 @@ with sb:
             )
             judger.wait()
 
-    # No per-run directory may be left behind (the sweep in Sandbox.__new__
-    # recovers it).
-    river.Sandbox()
+    # No per-run directory may be left behind (the lazy sweep triggered by
+    # entering the sandbox context recovers it).
+    with river.Sandbox():
+        pass
     leaked = set(glob.glob(os.path.join(tempfile.gettempdir(), "river-*"))) - before
     assert leaked == set(), f"residual working directories: {leaked}"
 

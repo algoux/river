@@ -22,7 +22,7 @@ use windows_sys::Win32::Storage::FileSystem::{
     INVALID_FILE_ATTRIBUTES, RemoveDirectoryW,
 };
 
-use crate::platform::CopyInSource;
+use crate::contract::CopyInSource;
 
 /// Root for per-run working directories.
 fn workdir_root() -> PathBuf {

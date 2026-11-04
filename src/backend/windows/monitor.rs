@@ -14,32 +14,20 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT, HANDLE};
 use windows_sys::Win32::System::Threading::{WaitForMultipleObjects, WaitForSingleObject};
 
-use crate::platform::windows::job::Job;
-use crate::platform::windows::spawn::SpawnedChild;
-
-/// Internal safety ceiling applied when no wall limit is configured.
-pub(crate) const SAFETY_WALL_LIMIT: Duration = Duration::from_secs(24 * 3600);
+use crate::backend::windows::job::Job;
+use crate::backend::windows::spawn::SpawnedChild;
+use crate::contract::verdict::KillOrigin;
+use crate::contract::SafetyCeilings;
 
 /// Exit code used when the sandbox kills the process tree.
 pub(crate) const KILL_EXIT_CODE: u32 = 1;
-
-/// Why the run ended the way it did.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum KillReason {
-    /// The process exited on its own.
-    None,
-    /// Wall clock limit exceeded; the job was terminated by us.
-    WallTimeout,
-    /// A stdout/stderr channel produced more than its kill threshold; the
-    /// reader thread fired the overflow event and we terminated the job.
-    OutputLimit,
-}
 
 pub(crate) struct RunOutcome {
     pub exit_code: u32,
     pub cpu_time_ms: u64,
     pub wall_time_ms: u64,
-    pub kill_reason: KillReason,
+    /// Why (and whether) the sandbox ended the run itself.
+    pub kill: KillOrigin,
     /// Processes still alive in the job after the main process exited.
     /// Non-zero means the program handed its work to a child that outlived
     /// it; the sandbox killed those children and the verdict becomes `SE`
@@ -60,31 +48,31 @@ pub(crate) fn monitor(
     wall_limit: Option<Duration>,
     overflow_event: Option<HANDLE>,
 ) -> io::Result<RunOutcome> {
-    let limit = wall_limit.unwrap_or(SAFETY_WALL_LIMIT);
+    let limit = wall_limit.unwrap_or_else(|| SafetyCeilings::default().wall_limit);
     let started = Instant::now();
     child.resume()?;
 
     let handle = child.process.as_raw_handle() as _;
-    let kill_reason = if let Some(ev) = overflow_event {
+    let kill = if let Some(ev) = overflow_event {
         // Wait on {process, overflow event} so an output fountain is reaped
         // mid-run instead of being flagged only after it exits.
-        let mut handles = [handle, ev];
+        let handles = [handle, ev];
         const EV_SIGNAL: u32 = WAIT_OBJECT_0 + 1;
         match unsafe {
             WaitForMultipleObjects(2, handles.as_ptr(), 0 /* any */, limit_ms(&limit))
         } {
-            WAIT_OBJECT_0 => KillReason::None,
+            WAIT_OBJECT_0 => KillOrigin::None,
             EV_SIGNAL => {
                 job.terminate(KILL_EXIT_CODE)?;
                 // SAFETY: handle still valid; the job kill guarantees signaling.
                 unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-                KillReason::OutputLimit
+                KillOrigin::OutputLimit
             }
             WAIT_TIMEOUT => {
                 job.terminate(KILL_EXIT_CODE)?;
                 // SAFETY: handle still valid; the job kill guarantees signaling.
                 unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-                KillReason::WallTimeout
+                KillOrigin::WallTimeout
             }
             _ => return Err(io::Error::last_os_error()),
         }
@@ -92,12 +80,12 @@ pub(crate) fn monitor(
         // SAFETY: process handle is owned and valid.
         let wait = unsafe { WaitForSingleObject(handle, limit_ms(&limit)) };
         if wait == WAIT_OBJECT_0 {
-            KillReason::None
+            KillOrigin::None
         } else if wait == WAIT_TIMEOUT {
             job.terminate(KILL_EXIT_CODE)?;
             // SAFETY: handle still valid; the job kill guarantees signaling.
             unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-            KillReason::WallTimeout
+            KillOrigin::WallTimeout
         } else {
             return Err(io::Error::last_os_error());
         }
@@ -136,7 +124,7 @@ pub(crate) fn monitor(
         exit_code,
         cpu_time_ms,
         wall_time_ms: wall.as_millis() as u64,
-        kill_reason,
+        kill,
         residual_processes,
     })
 }
@@ -145,10 +133,11 @@ pub(crate) fn monitor(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use crate::platform::windows::verdict::{SIGKILL, classify_with_evidence, ntstatus_name};
-    use crate::platform::windows::job::JobLimits;
-    use crate::platform::windows::spawn::spawn_bare;
-    use crate::platform::windows::stdio::{StdinSource, StdioSet};
+    use crate::backend::windows::ntstatus::{is_ntstatus, ntstatus_name};
+    use crate::contract::verdict::{RunEvidence, Verdict, classify};
+    use crate::backend::windows::job::JobLimits;
+    use crate::backend::windows::spawn::spawn_bare;
+    use crate::backend::windows::stdio::{StdinSource, StdioSet};
     use std::path::Path;
 
     fn run_monitored(
@@ -159,7 +148,7 @@ mod tests {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })?;
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None)?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -173,7 +162,7 @@ mod tests {
     fn wall_time_exceeds_cpu_time_for_sleeping_process() {
         // ping waits ~2s (mostly idle) between two probes
         let o = run_monitored("ping", &["/n", "2", "127.0.0.1"], None).unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert_eq!(o.exit_code, 0);
         assert!(o.wall_time_ms >= 900, "wall {}ms", o.wall_time_ms);
         assert!(
@@ -188,7 +177,7 @@ mod tests {
     fn cpu_time_is_measured_for_busy_process() {
         // cmd for-loop burning CPU
         let o = run_monitored("cmd", &["/c", "for /l %i in (1,1,2000000) do @rem"], None).unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert!(o.cpu_time_ms > 0, "cpu {}ms", o.cpu_time_ms);
     }
 
@@ -210,7 +199,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert!(
             o.cpu_time_ms > 50,
             "busy process reported {}ms of CPU",
@@ -228,7 +217,7 @@ mod tests {
     #[test]
     fn a_sleeping_process_reports_almost_no_cpu_time() {
         let o = run_monitored("ping", &["/n", "2", "127.0.0.1"], None).unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert!(o.wall_time_ms >= 900, "wall {}ms", o.wall_time_ms);
         assert!(
             o.cpu_time_ms < o.wall_time_ms / 2,
@@ -249,7 +238,7 @@ mod tests {
     fn a_self_exiting_program_has_no_residual_children() {
         for _ in 0..20 {
             let o = run_monitored("cmd", &["/c", "echo hi"], None).unwrap();
-            assert_eq!(o.kill_reason, KillReason::None);
+            assert_eq!(o.kill, KillOrigin::None);
             assert_eq!(o.exit_code, 0);
             assert_eq!(
                 o.residual_processes, 0,
@@ -267,7 +256,7 @@ mod tests {
             Some(Duration::from_millis(300)),
         )
         .unwrap();
-        assert_eq!(o.kill_reason, KillReason::WallTimeout);
+        assert_eq!(o.kill, KillOrigin::WallTimeout);
         assert!(started.elapsed() < Duration::from_secs(5));
         // The job kill uses our exit code.
         assert_eq!(o.exit_code, KILL_EXIT_CODE);
@@ -280,7 +269,7 @@ mod tests {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
@@ -290,7 +279,7 @@ mod tests {
             .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
         let outcome = monitor(&child, &job, None, None).unwrap();
-        assert_eq!(outcome.kill_reason, KillReason::None);
+        assert_eq!(outcome.kill, KillOrigin::None);
         assert!(
             outcome.residual_processes > 0,
             "expected a residual descendant, got {}",
@@ -327,7 +316,7 @@ mod tests {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: Some(cpu_limit),
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None).unwrap();
@@ -343,17 +332,15 @@ mod tests {
             "cpu {}ms over limit {cpu_limit}ms",
             outcome.cpu_time_ms
         );
-        let v = classify_with_evidence(
-            &outcome.kill_reason,
-            outcome.exit_code,
-            outcome.residual_processes,
-            Some(u64::from(cpu_limit)),
-            outcome.cpu_time_ms,
-            None,
-            0,
-        );
-        assert_eq!(v.status, "TLE");
-        assert_eq!(v.signal, SIGKILL);
+        let evidence = RunEvidence {
+            kill: outcome.kill,
+            exit_code: outcome.exit_code,
+            residual_processes: outcome.residual_processes,
+            cpu_time_limit_ms: Some(u64::from(cpu_limit)),
+            cpu_time_used_ms: outcome.cpu_time_ms,
+            ..Default::default()
+        };
+        assert_eq!(classify(&evidence), Verdict::Tle);
     }
 
     #[test]
@@ -365,7 +352,7 @@ mod tests {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(mem_limit),
             cpu_time_limit_ms: None,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
         let work = tempfile_dir("river-s9-mle");
@@ -392,17 +379,16 @@ mod tests {
             peak + mem_limit as u64 / 8 >= mem_limit as u64,
             "peak {peak} should pin at the {mem_limit}-byte commit cap"
         );
-        let v = classify_with_evidence(
-            &outcome.kill_reason,
-            outcome.exit_code,
-            outcome.residual_processes,
-            None,
-            outcome.cpu_time_ms,
-            Some(mem_limit as u64),
-            peak,
-        );
-        assert_eq!(v.status, "MLE");
-        assert_eq!(v.signal, SIGKILL);
+        let evidence = RunEvidence {
+            kill: outcome.kill,
+            exit_code: outcome.exit_code,
+            residual_processes: outcome.residual_processes,
+            cpu_time_limit_ms: None,
+            cpu_time_used_ms: outcome.cpu_time_ms,
+            memory_limit_bytes: Some(mem_limit as u64),
+            peak_memory_bytes: peak,
+        };
+        assert_eq!(classify(&evidence), Verdict::Mle);
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -411,12 +397,11 @@ mod tests {
         // A process that floods stdout past its kill threshold must be
         // reaped mid-run by the monitor (not merely flagged at exit) and
         // classified OLE with signal 9; capture stays truncated at the limit.
-        use crate::platform::windows::verdict::OLE;
         let out_limit = 4096u64;
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
             cpu_time_limit_ms: None,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
         let mut set = StdioSet::new(
@@ -435,21 +420,20 @@ mod tests {
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
         let outcome = monitor(&child, &job, None, Some(ev)).unwrap();
         let (out, _err) = set.finish().unwrap();
-        assert_eq!(outcome.kill_reason, KillReason::OutputLimit);
+        assert_eq!(outcome.kill, KillOrigin::OutputLimit);
         assert!(outcome.wall_time_ms < 20_000, "fountain reaped mid-run");
         assert!(out.truncated);
         assert_eq!(out.data.len() as u64, out_limit);
-        let v = classify_with_evidence(
-            &outcome.kill_reason,
-            outcome.exit_code,
-            outcome.residual_processes,
-            None,
-            outcome.cpu_time_ms,
-            None,
-            0,
-        );
-        assert_eq!(v.status, OLE);
-        assert_eq!(v.signal, SIGKILL);
+        let evidence = RunEvidence {
+            kill: outcome.kill,
+            exit_code: outcome.exit_code,
+            residual_processes: outcome.residual_processes,
+            cpu_time_used_ms: outcome.cpu_time_ms,
+            ..Default::default()
+        };
+        let v = classify(&evidence);
+        assert_eq!(v, Verdict::Ole);
+        assert_eq!(v.synthesized_signal(), 9);
     }
 
     #[test]
@@ -462,18 +446,16 @@ mod tests {
             "fn main() { unsafe { std::ptr::null_mut::<u8>().write_volatile(1) } }",
         );
         let o = run_monitored(&av.display().to_string(), &[], None).unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert_eq!(o.exit_code, 0xC000_0005, "access violation exit code");
-        let v = classify_with_evidence(
-            &o.kill_reason,
-            o.exit_code,
-            o.residual_processes,
-            None,
-            o.cpu_time_ms,
-            None,
-            0,
-        );
-        assert_eq!(v.status, "RE");
+        let evidence = RunEvidence {
+            kill: o.kill,
+            exit_code: o.exit_code,
+            residual_processes: o.residual_processes,
+            cpu_time_used_ms: o.cpu_time_ms,
+            ..Default::default()
+        };
+        assert_eq!(classify(&evidence), Verdict::Re);
         assert_eq!(ntstatus_name(o.exit_code), Some("STATUS_ACCESS_VIOLATION"));
 
         // NOTE: plain infinite recursion is *optimized away* by LLVM at -O
@@ -491,22 +473,20 @@ mod tests {
              fn main() { std::hint::black_box(rec(1)); }",
         );
         let o = run_monitored(&so.display().to_string(), &[], None).unwrap();
-        assert_eq!(o.kill_reason, KillReason::None);
+        assert_eq!(o.kill, KillOrigin::None);
         assert!(
-            crate::platform::windows::verdict::is_ntstatus(o.exit_code),
+            is_ntstatus(o.exit_code),
             "stack overflow must end as NTSTATUS, got {:#x}",
             o.exit_code
         );
-        let v = classify_with_evidence(
-            &o.kill_reason,
-            o.exit_code,
-            o.residual_processes,
-            None,
-            o.cpu_time_ms,
-            None,
-            0,
-        );
-        assert_eq!(v.status, "RE");
+        let evidence = RunEvidence {
+            kill: o.kill,
+            exit_code: o.exit_code,
+            residual_processes: o.residual_processes,
+            cpu_time_used_ms: o.cpu_time_ms,
+            ..Default::default()
+        };
+        assert_eq!(classify(&evidence), Verdict::Re);
         let _ = std::fs::remove_dir_all(&work);
     }
 
@@ -535,7 +515,7 @@ mod tests {
                     // Half the threads run a fast program, half a killed one.
                     if i % 2 == 0 {
                         let o = run_monitored("cmd", &["/c", "echo hi"], None).unwrap();
-                        assert_eq!(o.kill_reason, KillReason::None);
+                        assert_eq!(o.kill, KillOrigin::None);
                         assert_eq!(o.exit_code, 0);
                         assert_eq!(o.residual_processes, 0);
                         assert!(o.wall_time_ms < 30_000);
@@ -546,7 +526,7 @@ mod tests {
                             Some(Duration::from_millis(300)),
                         )
                         .unwrap();
-                        assert_eq!(o.kill_reason, KillReason::WallTimeout);
+                        assert_eq!(o.kill, KillOrigin::WallTimeout);
                     }
                 })
             })

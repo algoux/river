@@ -6,20 +6,26 @@ use std::time::Duration;
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
-use crate::platform::windows::acl;
-use crate::platform::windows::job::{Job, JobLimits, physical_memory_bytes};
-use crate::platform::windows::monitor::monitor;
-use crate::platform::windows::spawn::{
-    SpawnSecurity, env_block, mitigation_policies, spawn_bare, with_silent_crash_dialog,
-};
-use crate::platform::windows::stdio::{StdinSource, StdioSet};
-use crate::platform::windows::token::AppContainer;
-use crate::platform::windows::verdict::{
-    SE, SIG_NONE, Verdict, classify_with_evidence,
-};
-use crate::platform::windows::workdir::{WorkDir, sweep_stale_workdirs};
-use crate::platform::{RunSpec, parse_copy_in, validate};
-use crate::status::Status;
+use crate::backend::windows::acl;
+use crate::backend::windows::job::{Job, JobLimits, physical_memory_bytes};
+use crate::backend::windows::monitor::monitor;
+use crate::backend::windows::spawn::{SpawnProfile, env_block, spawn_bare, with_silent_crash_dialog};
+use crate::backend::windows::stdio::{StdinSource, StdioSet};
+use crate::backend::windows::token::AppContainer;
+use crate::backend::windows::workdir::{WorkDir, sweep_stale_workdirs};
+use crate::contract::status::Status;
+use crate::contract::verdict::{RunEvidence, classify};
+use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, validate};
+
+/// Recover working directories abandoned by a *dead* judger process (its
+/// sandboxed processes died with KILL_ON_JOB_CLOSE, but the per-run dirs
+/// have no process to drop them). Never touches live owners.
+///
+/// Runs on every `__enter__`/`__exit__` (not in `__new__`, which therefore
+/// has no side effects): another judger process may have been hard-killed
+/// since our last sweep, so the check cannot be skipped — dirs abandoned
+/// by a *different* process must still be recovered (the interrupted-judger
+/// attack test depends on exactly that).
 
 /// Windows sandbox.
 ///
@@ -33,41 +39,58 @@ use crate::status::Status;
 ///
 /// `rootfs` is not supported on Windows (Windows processes always resolve
 /// system DLLs from the real `System32`): passing it raises `ValueError`.
+/// See `river.capabilities()` for the programmatic capability matrix.
 ///
 /// Concurrency (S12): the class is `frozen` — it holds no mutable state
-/// (only the configured `runtimes`), and every run keeps all of its state in
-/// locals. `run()` may therefore be called concurrently from several Python
-/// threads on the same `Sandbox`; per-run resources (job, working directory,
-/// stdio) are independent.
+/// (only the configured `runtimes` and the safety ceilings), and every run
+/// keeps all of its state in locals. `run()` may therefore be called
+/// concurrently from several Python threads on the same `Sandbox`; per-run
+/// resources (job, working directory, stdio) are independent.
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
+    /// Internal safety ceilings (mechanism guarantees that stay in place
+    /// when the caller passes `None` limits). Configurable so a deployment
+    /// can tighten the defaults; never disableable.
+    pub ceilings: SafetyCeilings,
 }
 
 #[pymethods]
 impl Sandbox {
     #[new]
-    #[pyo3(signature = (rootfs=None, runtimes=None))]
-    #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
-    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> PyResult<Self> {
+    #[pyo3(signature = (rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None))]
+    #[pyo3(text_signature = "(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)")]
+    fn new(
+        rootfs: Option<PathBuf>,
+        runtimes: Option<Vec<PathBuf>>,
+        max_wall_secs: Option<u64>,
+        max_processes: Option<u32>,
+    ) -> PyResult<Self> {
         if rootfs.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "rootfs is not supported on Windows; use runtimes=[...] to expose \
-                 read-only runtime directories instead",
+                 read-only runtime directories instead (check river.capabilities())",
             ));
         }
-        // Recover working directories abandoned by a hard-killed judger (its
-        // sandboxed processes died with KILL_ON_JOB_CLOSE, but the per-run
-        // dirs have no process to drop them). Never touches live owners.
-        sweep_stale_workdirs();
+        let mut ceilings = SafetyCeilings::default();
+        if let Some(secs) = max_wall_secs {
+            ceilings.wall_limit = Duration::from_secs(secs.max(1));
+        }
+        if let Some(n) = max_processes {
+            ceilings.max_processes = n.max(1);
+        }
         Ok(Self {
             rootfs: None,
             runtimes: runtimes.unwrap_or_default(),
+            ceilings,
         })
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        // Defensive net: sweep dirs abandoned by a *different*, hard-killed
+        // judger process. Cheap after the first call (one atomic load).
+        sweep_stale_workdirs();
         slf
     }
 
@@ -75,9 +98,7 @@ impl Sandbox {
     /// per-run RAII guards — the `Job` (KILL_ON_JOB_CLOSE kills any still
     /// alive processes), the `WorkDir` (removed on drop, reparse-safe), and
     /// the stdio handles — so a normal block exit has nothing left to do.
-    /// As a defensive net, a stale-directory sweep runs here too, covering
-    /// dirs abandoned by a *different*, hard-killed judger process. Always
-    /// returns `false` (never suppresses block exceptions).
+    /// Always returns `false` (never suppresses block exceptions).
     fn __exit__(
         &self,
         _exc_type: &Bound<'_, PyAny>,
@@ -158,7 +179,7 @@ impl Sandbox {
         };
         validate(&spec)?;
 
-        // --- translate the frozen contract into P1/P2 primitives ----------
+        // --- translate the frozen contract into backend primitives --------
         let stdin_src = match (&spec.stdin, &spec.stdin_file) {
             (Some(bytes), _) => StdinSource::Bytes(bytes.clone()),
             (None, Some(path)) => StdinSource::File(path.clone()),
@@ -167,11 +188,14 @@ impl Sandbox {
         let limits = JobLimits {
             memory_limit_bytes: spec.memory_limit_kb.map(|kb| kb.saturating_mul(1024)),
             cpu_time_limit_ms: spec.time_limit_ms,
-            max_processes: crate::platform::windows::job::DEFAULT_MAX_PROCESSES,
+            max_processes: self.ceilings.max_processes,
         };
+        // Wall limit: user value, the 2x+1s default for CPU-limited runs, or
+        // the configured safety ceiling for "unlimited" runs.
         let wall_limit = spec
             .effective_wall_time_limit_ms()
-            .map(Duration::from_millis);
+            .map(Duration::from_millis)
+            .unwrap_or(self.ceilings.wall_limit);
         // Effective limits the job enforces (user limit or safety ceiling);
         // the verdict compares measurements against these (S9 evidence).
         let memory_limit_bytes = limits.memory_limit_bytes.unwrap_or_else(physical_memory_bytes);
@@ -227,11 +251,7 @@ impl Sandbox {
             for (k, v) in &env_map {
                 env_vars.push((k.clone(), v.clone()));
             }
-            let security = SpawnSecurity {
-                appcontainer_sid: sid,
-                env_block: env_block(&env_vars),
-                mitigation_policy: mitigation_policies(),
-            };
+            let profile = SpawnProfile::sandboxed(sid, env_block(&env_vars));
 
             // The process starts inside the working directory; an explicit
             // `cwd` (relative to it) is applied below when supported.
@@ -260,7 +280,7 @@ impl Sandbox {
                     &job,
                     &mut set,
                     cwd_path.as_deref(),
-                    Some(&security),
+                    Some(&profile),
                 )
             })?;
             // S10: the reader threads fire the overflow event past an output
@@ -269,7 +289,7 @@ impl Sandbox {
             let outcome = monitor(
                 &child,
                 &job,
-                wall_limit,
+                Some(wall_limit),
                 Some(set.overflow_event_handle()),
             )?;
             let peak_bytes = job.peak_process_memory_used()?;
@@ -279,45 +299,59 @@ impl Sandbox {
 
         match result {
             Ok((outcome, peak_bytes, out, err)) => {
-                // Evidence-priority verdict (S9): sandbox kills and limit
-                // evidence outrank the raw exit code of a killed process.
-                let verdict: Verdict = classify_with_evidence(
-                    &outcome.kill_reason,
-                    outcome.exit_code,
-                    outcome.residual_processes,
+                // Evidence-priority verdict (S9): the backend reports what it
+                // observed; the contract classifies it — sandbox kills and
+                // limit evidence outrank the raw exit code of a killed process.
+                let evidence = RunEvidence {
+                    kill: outcome.kill,
+                    exit_code: outcome.exit_code,
+                    residual_processes: outcome.residual_processes,
                     cpu_time_limit_ms,
-                    outcome.cpu_time_ms,
-                    Some(memory_limit_bytes),
-                    peak_bytes,
-                );
-                Ok(Status {
-                    time_used_ms: outcome.cpu_time_ms,
-                    wall_time_used_ms: outcome.wall_time_ms,
-                    memory_used_kb: peak_bytes / 1024,
-                    status: verdict.status.to_string(),
-                    signal: verdict.signal,
-                    exit_code: outcome.exit_code as i32,
-                    stdout: out.data,
-                    stderr: err.data,
-                    stdout_truncated: out.truncated,
-                    stderr_truncated: err.truncated,
-                })
+                    cpu_time_used_ms: outcome.cpu_time_ms,
+                    memory_limit_bytes: Some(memory_limit_bytes),
+                    peak_memory_bytes: peak_bytes,
+                };
+                let mut status = Status::from_verdict(classify(&evidence));
+                status.time_used_ms = outcome.cpu_time_ms;
+                status.wall_time_used_ms = outcome.wall_time_ms;
+                status.memory_used_kb = peak_bytes / 1024;
+                status.exit_code = outcome.exit_code as i32;
+                status.stdout = out.data;
+                status.stderr = err.data;
+                status.stdout_truncated = out.truncated;
+                status.stderr_truncated = err.truncated;
+                Ok(status)
             }
             Err(e) => {
                 // Infra failure: report as SE per the frozen contract
                 // (validation errors raise; runtime failures surface here).
-                Ok(Status {
-                    status: SE.to_string(),
-                    signal: SIG_NONE,
-                    exit_code: -1,
-                    stderr: e.to_string().into_bytes(),
-                    ..Default::default()
-                })
+                Ok(Status::infra_se(e.to_string()))
             }
         }
     }
 
     fn __repr__(&self) -> String {
-        format!("Sandbox(runtimes=[{}])", self.runtimes.len())
+        format!(
+            "Sandbox(runtimes=[{}], max_wall_secs={}, max_processes={})",
+            self.runtimes.len(),
+            self.ceilings.wall_limit.as_secs(),
+            self.ceilings.max_processes
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The sandboxed spawn profile always carries the full mitigation set.
+    #[test]
+    fn sandboxed_profile_carries_mitigations() {
+        let p = SpawnProfile::sandboxed(std::ptr::null_mut(), Vec::new());
+        assert_eq!(
+            p.mitigation_policy,
+            crate::backend::windows::spawn::mitigation_policies()
+        );
+        assert!(!p.has_appcontainer());
     }
 }

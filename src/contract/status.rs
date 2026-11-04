@@ -1,6 +1,8 @@
 use pyo3::prelude::*;
 
-/// Result of [`Sandbox.run`][crate::Sandbox::run].
+use super::verdict::Verdict;
+
+/// Result of `Sandbox.run`.
 ///
 /// Field units (part of the frozen API contract, mirrored in field names):
 /// - `time_used_ms` / `wall_time_used_ms`: milliseconds (CPU time / wall
@@ -14,8 +16,10 @@ use pyo3::prelude::*;
 ///   - `RE`  : non-zero exit code / abnormal termination
 ///   - `SE`  : sandbox internal error (spawn failure, cleanup failure, ...)
 /// - `signal`: synthesized value; `0` for normal exit, `9` when the sandbox
-///   killed the process (TLE / MLE / OLE). Windows has no signals; this field
-///   mimics the Linux convention for caller portability.
+///   killed the process (TLE / MLE / OLE / residual-SE). Windows has no
+///   signals; this field mimics the Linux convention for caller
+///   portability. (An infrastructure `SE` — spawn/cleanup failure — reports
+///   `0`: nothing was killed.)
 /// - `exit_code`: raw process exit code. Abnormal terminations surface as
 ///   NTSTATUS values on Windows (e.g. `0xC0000005` access violation).
 /// - `stdout` / `stderr`: captured output, truncated to the respective limit.
@@ -27,6 +31,9 @@ pub struct Status {
     pub time_used_ms: u64,
     pub wall_time_used_ms: u64,
     pub memory_used_kb: u64,
+    /// Classified verdict — typed inside the crate, rendered as the frozen
+    /// string contract at the Python boundary.
+    pub verdict: Option<Verdict>,
     pub status: String,
     pub signal: i32,
     pub exit_code: i32,
@@ -34,6 +41,30 @@ pub struct Status {
     pub stderr: Vec<u8>,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+}
+
+impl Status {
+    /// Build a Status from a classified verdict (the normal path).
+    pub(crate) fn from_verdict(verdict: Verdict) -> Self {
+        Status {
+            status: verdict.as_str().to_string(),
+            signal: verdict.synthesized_signal(),
+            verdict: Some(verdict),
+            ..Default::default()
+        }
+    }
+
+    /// Build an infrastructure-failure `SE` (spawn/cleanup error): the
+    /// sandbox's own machinery failed, nothing was killed, `signal` stays 0.
+    pub(crate) fn infra_se(stderr: String) -> Self {
+        Status {
+            status: Verdict::Se.as_str().to_string(),
+            exit_code: -1,
+            stderr: stderr.into_bytes(),
+            verdict: Some(Verdict::Se),
+            ..Default::default()
+        }
+    }
 }
 
 #[pymethods]

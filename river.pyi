@@ -4,11 +4,13 @@ import os
 from collections.abc import Buffer, Mapping, Sequence
 from typing import Literal, TypeAlias
 
-__all__ = ["Sandbox", "Status"]
+__all__ = ["Sandbox", "Status", "capabilities"]
 
 _StrOrPath: TypeAlias = str | os.PathLike[str]
 _CopyInSource: TypeAlias = Buffer | _StrOrPath
 _Verdict: TypeAlias = Literal["AC", "TLE", "MLE", "OLE", "RE", "SE"]
+
+_Capabilities: TypeAlias = dict[str, object]  # see capabilities() below
 
 _ExcType: TypeAlias = type[BaseException] | None
 _ExcValue: TypeAlias = BaseException | None
@@ -45,17 +47,25 @@ class Sandbox:
         for the program by default);
       - everything else on the host is invisible to the sandboxed process.
 
+    Internal safety ceilings (mechanism guarantees that stay in place when
+    a run passes `None` limits) default to a 24h wall clock and 64 live
+    processes; `max_wall_secs` / `max_processes` may tighten (never
+    disable) them per Sandbox. Check `river.capabilities()` for the
+    platform capability matrix instead of probing with try/except.
+
     Platform support: **Windows only** for now. On other platforms `run()`
-    raises `NotImplementedError` (the Linux/macOS backends are not implemented
-    yet). `rootfs` is not supported on Windows either (processes always
-    resolve system DLLs from the real `System32`) — use `runtimes` there
-    instead.
+    raises `NotImplementedError` (the Linux/macOS backends are not
+    implemented yet). `rootfs` is not supported on Windows either (processes
+    always resolve system DLLs from the real `System32`) — use `runtimes`
+    there instead.
     """
 
     def __init__(
         self,
         rootfs: _StrOrPath | None = None,
         runtimes: Sequence[_StrOrPath] | None = None,
+        max_wall_secs: int | None = None,
+        max_processes: int | None = None,
     ) -> None: ...
 
     def __enter__(self) -> Sandbox: ...
@@ -84,3 +94,17 @@ class Sandbox:
         stdout_file: _StrOrPath | None = None,
         stderr_file: _StrOrPath | None = None,
     ) -> Status: ...
+
+
+def capabilities() -> _Capabilities:
+    """Capability matrix of the running backend (frozen keys):
+
+    - `platform`: `"windows" | "linux" | "macos"`
+    - `rootfs`: whether `Sandbox(rootfs=...)` is supported
+    - `network_isolation`: whether network access is denied in the sandbox
+    - `concurrent_runs`: whether one `Sandbox` may run on several threads
+    - `default_max_processes`: default live-process cap per run
+    - `internal_wall_limit_secs`: safety wall-clock ceiling for
+      caller-unlimited runs
+    """
+    ...

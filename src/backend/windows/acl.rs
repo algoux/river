@@ -81,7 +81,7 @@ pub(crate) fn grant(path: &Path, sid: PSID, rights: u32) -> io::Result<()> {
         return Ok(());
     }
 
-    let wide = crate::platform::windows::token::wide_of(path);
+    let wide = crate::backend::windows::token::wide_of(path);
     let (dacl, sd) = read_dacl(&wide)?;
 
     let mut trustee: TRUSTEE_W = unsafe { std::mem::zeroed() };
@@ -169,7 +169,7 @@ fn read_dacl(wide: &[u16]) -> io::Result<(*mut ACL, PSECURITY_DESCRIPTOR)> {
 /// True when `path`'s DACL already carries an ACCESS_ALLOWED ACE with exactly
 /// `rights` for `sid` (the idempotency check).
 fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> {
-    let wide = crate::platform::windows::token::wide_of(path);
+    let wide = crate::backend::windows::token::wide_of(path);
     let (dacl, sd) = read_dacl(&wide)?;
 
     let mut found = false;
@@ -204,7 +204,7 @@ fn ace_already_present(path: &Path, sid: PSID, rights: u32) -> io::Result<bool> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::windows::token::AppContainer;
+    use crate::backend::windows::token::AppContainer;
 
     #[test]
     fn grant_is_idempotent_and_precise() {
@@ -246,7 +246,7 @@ mod tests {
     }
 
     fn ace_count(path: &Path) -> io::Result<u16> {
-        let wide = crate::platform::windows::token::wide_of(path);
+        let wide = crate::backend::windows::token::wide_of(path);
         let (dacl, sd) = read_dacl(&wide)?;
         let count = if dacl.is_null() { 0 } else { unsafe { (*dacl).AceCount } };
         // SAFETY: allocated by GetNamedSecurityInfoW.
