@@ -319,7 +319,9 @@ impl Sandbox {
                 Some(wall_limit),
                 Some(set.overflow_event_handle()),
             )?;
-            let peak_bytes = job.peak_process_memory_used()?;
+            let peak_bytes = job
+                .peak_process_memory_used()?
+                .max(job.peak_job_memory_used()?);
             // copy_out: collect the products while the Job Object has
             // already reaped the tree, before the workdir disappears.
             let collected = match &copy_out {

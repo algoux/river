@@ -13,12 +13,12 @@ use std::time::Duration;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-    JOB_OBJECT_LIMIT_PROCESS_TIME, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
-    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
-    TerminateJobObject,
+    JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
+    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject, TerminateJobObject,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
@@ -83,8 +83,18 @@ impl Job {
         li.ActiveProcessLimit = limits.max_processes.max(1);
 
         let mem = limits.effective_memory_bytes();
+        // Per-process limit: the MLE semantics (peak single process vs the
+        // limit) are measured against this.
         li.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_MEMORY;
         basic.ProcessMemoryLimit = mem as usize;
+        // Tree-level limit (option A semantics: the user limit is the whole
+        // tree's budget, matching the Linux cgroup `memory.max` semantics).
+        // Without it, N descendants each get their own full budget and the
+        // tree's total commit reaches N x limit (verified: 8 children held
+        // 18 MiB each under a 20 MiB per-process limit — 208 MiB peak tree
+        // commit, ~10x the limit).
+        li.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        basic.JobMemoryLimit = mem as usize;
 
         if let Some(ms) = limits.cpu_time_limit_ms {
             li.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
@@ -123,6 +133,19 @@ impl Job {
 
     /// Peak committed memory of the job's process tree, in bytes.
     pub(crate) fn peak_process_memory_used(&self) -> io::Result<u64> {
+        Ok(self.job_memory_info()?.0)
+    }
+
+    /// Peak total commit of the whole tree (JobMemoryLimit accounting), in
+    /// bytes. Feeds the MLE evidence when the *tree* pinned the limit even
+    /// though no single process did.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn peak_job_memory_used(&self) -> io::Result<u64> {
+        Ok(self.job_memory_info()?.1)
+    }
+
+    /// (PeakProcessMemoryUsed, PeakJobMemoryUsed) in bytes.
+    fn job_memory_info(&self) -> io::Result<(u64, u64)> {
         let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         // SAFETY: handle owned; out-struct sized correctly.
         let ok = unsafe {
@@ -137,7 +160,10 @@ impl Job {
         if ok == 0 {
             Err(io::Error::last_os_error())
         } else {
-            Ok(info.PeakProcessMemoryUsed as u64)
+            Ok((
+                info.PeakProcessMemoryUsed as u64,
+                info.PeakJobMemoryUsed as u64,
+            ))
         }
     }
 
