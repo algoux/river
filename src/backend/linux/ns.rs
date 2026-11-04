@@ -605,7 +605,10 @@ pub(crate) struct ChildLimits {
 /// Zero every capability set (permitted/effective/inheritable). `setuid`
 /// already clears them, but the program must not depend on that implicit
 /// behaviour (and bounding/ambient sets must not be inherited either).
-unsafe fn clear_capabilities() {
+///
+/// Returns the `errno` of a failed `capset` (0 on success): a program whose
+/// capabilities could not be dropped must not run.
+unsafe fn clear_capabilities() -> libc::c_int {
     // Kernel uapi layout (`include/uapi/linux/capability.h`); libc does not
     // export these on every version.
     #[repr(C)]
@@ -630,30 +633,43 @@ unsafe fn clear_capabilities() {
         inheritable: 0,
     };
     let data = [zero, zero];
-    libc::syscall(
+    let rc = libc::syscall(
         libc::SYS_capset,
         &mut header as *mut CapHeader,
         data.as_ptr(),
     );
+    if rc != 0 { errno() } else { 0 }
 }
 
 /// Set the rlimits that bound a single file write, descriptor count, core
-/// dump and CPU backstop. Best effort: a refused limit must not abort the
-/// run (the cgroup limits remain authoritative).
-unsafe fn apply_rlimits(limits: &ChildLimits) {
-    let set = |resource: libc::__rlimit_resource_t, cur: libc::rlim_t, max: libc::rlim_t| {
-        let rl = libc::rlimit {
-            rlim_cur: cur,
-            rlim_max: max,
+/// dump and CPU backstop.
+///
+/// These are part of the sandbox guarantee, so a refused limit is fatal for
+/// the run: RLIMIT_CORE=0 must hold (a core dump into the writable cwd would
+/// bypass the product model), and RLIMIT_FSIZE is the only per-file disk
+/// bound. The cgroup limits stay authoritative for memory/processes, but
+/// "best effort" would silently weaken the mechanism (fail-closed rule).
+///
+/// Returns the `errno` of the first failed `setrlimit` (0 on success).
+unsafe fn apply_rlimits(limits: &ChildLimits) -> libc::c_int {
+    let mut failed = 0;
+    let mut set =
+        |resource: libc::__rlimit_resource_t, cur: libc::rlim_t, max: libc::rlim_t| {
+            let rl = libc::rlimit {
+                rlim_cur: cur,
+                rlim_max: max,
+            };
+            if libc::setrlimit(resource, &rl) != 0 && failed == 0 {
+                failed = errno();
+            }
         };
-        libc::setrlimit(resource, &rl);
-    };
     set(libc::RLIMIT_CORE, 0, 0);
     set(libc::RLIMIT_NOFILE, limits.nofile, limits.nofile);
     set(libc::RLIMIT_FSIZE, limits.fsize_bytes, limits.fsize_bytes);
     if let Some(secs) = limits.cpu_secs {
         set(libc::RLIMIT_CPU, secs, secs.saturating_add(1));
     }
+    failed
 }
 
 /// The supervisor half of spawn. **Never returns.**
@@ -929,8 +945,14 @@ unsafe fn supervise(
         if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
             fail(3, errno());
         }
-        clear_capabilities();
-        apply_rlimits(&limits);
+        let cap_err = clear_capabilities();
+        if cap_err != 0 {
+            fail(3, cap_err);
+        }
+        let rlimit_err = apply_rlimits(&limits);
+        if rlimit_err != 0 {
+            fail(3, rlimit_err);
+        }
         if let Some(prog) = seccomp {
             if crate::backend::linux::seccomp::apply(prog) != 0 {
                 fail(3, errno());
