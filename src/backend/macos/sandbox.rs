@@ -25,9 +25,14 @@ pub struct Sandbox {
 #[pymethods]
 impl Sandbox {
     #[new]
-    #[pyo3(signature = (rootfs=None, runtimes=None))]
-    #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
-    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> Self {
+    #[pyo3(signature = (rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None))]
+    #[pyo3(text_signature = "(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)")]
+    fn new(
+        rootfs: Option<PathBuf>,
+        runtimes: Option<Vec<PathBuf>>,
+        _max_wall_secs: Option<u64>,
+        _max_processes: Option<u32>,
+    ) -> Self {
         Self {
             rootfs,
             runtimes: runtimes.unwrap_or_default(),
@@ -96,7 +101,7 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
-        copy_out: Option<HashMap<String, String>>,
+        copy_out: Option<HashMap<String, PathBuf>>,
         copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,

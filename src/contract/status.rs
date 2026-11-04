@@ -20,8 +20,10 @@ use super::verdict::Verdict;
 ///   signals; this field mimics the Linux convention for caller
 ///   portability. (An infrastructure `SE` — spawn/cleanup failure — reports
 ///   `0`: nothing was killed.)
-/// - `exit_code`: raw process exit code. Abnormal terminations surface as
-///   NTSTATUS values on Windows (e.g. `0xC0000005` access violation).
+/// - `exit_code`: raw process exit code, **unsigned** (Windows NTSTATUS
+///   values such as `0xC0000005` are the full 32-bit value, e.g.
+///   `3221225477`). `u32::MAX` means "no exit code": the sandbox's own
+///   machinery failed before/while spawning (infrastructure `SE`).
 /// - `stdout` / `stderr`: captured output, truncated to the respective limit.
 ///   Check `stdout_truncated` / `stderr_truncated` to know whether bytes were
 ///   dropped.
@@ -33,7 +35,7 @@ pub struct Status {
     pub memory_used_kb: u64,
     pub status: String,
     pub signal: i32,
-    pub exit_code: i32,
+    pub exit_code: u32,
     /// The kernel OOM killer reaped a task in the sandbox cgroup during the
     /// run (`memory.events` `oom_kill` > 0). Linux-only; always false on
     /// Windows (where the memory cap makes allocations fail instead).
@@ -59,11 +61,12 @@ impl Status {
     }
 
     /// Build an infrastructure-failure `SE` (spawn/cleanup error): the
-    /// sandbox's own machinery failed, nothing was killed, `signal` stays 0.
+    /// sandbox's own machinery failed, nothing was killed, `signal` stays 0
+    /// and `exit_code` is `u32::MAX` ("no exit code").
     pub(crate) fn infra_se(stderr: String) -> Self {
         Status {
             status: Verdict::Se.as_str().to_string(),
-            exit_code: -1,
+            exit_code: u32::MAX,
             stderr: stderr.into_bytes(),
             ..Default::default()
         }
@@ -102,9 +105,10 @@ impl Status {
         self.signal
     }
 
-    /// Raw process exit code (NTSTATUS on abnormal Windows terminations).
+    /// Raw process exit code (unsigned; NTSTATUS on abnormal Windows
+    /// terminations, `u32::MAX` for an infrastructure `SE`).
     #[getter]
-    fn exit_code(&self) -> i32 {
+    fn exit_code(&self) -> u32 {
         self.exit_code
     }
 

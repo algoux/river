@@ -124,11 +124,22 @@ impl Sandbox {
         // seccomp) must surface here, not as a silent per-run degradation.
         crate::backend::linux::preflight().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
         let mut ceilings = SafetyCeilings::default();
+        // "Tighten only": a caller value can lower a ceiling, never raise it.
         if let Some(secs) = max_wall_secs {
-            ceilings.wall_limit = Duration::from_secs(secs.max(1));
+            if secs == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "max_wall_secs must be >= 1",
+                ));
+            }
+            ceilings.wall_limit = Duration::from_secs(secs.min(ceilings.wall_limit.as_secs()));
         }
         if let Some(n) = max_processes {
-            ceilings.max_processes = n.max(1);
+            if n == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "max_processes must be >= 1",
+                ));
+            }
+            ceilings.max_processes = n.min(ceilings.max_processes);
         }
         Ok(Self {
             rootfs,
@@ -211,7 +222,7 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
-        copy_out: Option<HashMap<String, String>>,
+        copy_out: Option<HashMap<String, PathBuf>>,
         copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,
@@ -420,6 +431,7 @@ impl Sandbox {
                     exit_code: outcome.exit_code,
                     residual_processes: residual,
                     oom_killed,
+                    output_limit_hit: overflowed,
                     cpu_time_limit_ms,
                     cpu_time_used_ms: cpu_used_ms,
                     memory_limit_bytes: Some(memory_limit_bytes),
@@ -429,7 +441,7 @@ impl Sandbox {
                 status.time_used_ms = cpu_used_ms;
                 status.wall_time_used_ms = outcome.wall_time_ms;
                 status.memory_used_kb = peak_bytes / 1024;
-                status.exit_code = outcome.exit_code as i32;
+                status.exit_code = outcome.exit_code;
                 status.oom_killed = oom_killed;
                 status.stdout = out.data;
                 status.stderr = err.data;

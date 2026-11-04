@@ -12,7 +12,7 @@ What is *not* here on purpose:
 - platform-behavior calibration (memory = commit vs RSS, timing jitter) —
   documented in DESIGN.md §5, not contractual.
 
-Run: `uv run pytest tests/conformance.py -q`
+Run: `uv run pytest tests/test_conformance.py -q`
 """
 
 import pytest
@@ -54,6 +54,37 @@ def test_capabilities_values_are_well_typed():
     assert caps["default_max_processes"] > 0
     assert isinstance(caps["internal_wall_limit_secs"], int)
     assert caps["internal_wall_limit_secs"] > 0
+
+
+def test_ceilings_can_only_be_tightened():
+    """`max_*` lowers a mechanism ceiling; it can never disable it.
+
+    Larger values are clamped to the internal defaults, zero is rejected
+    (silently turning it into 1 s / 1 process hides the mistake).
+    """
+    import pytest
+
+    caps = river.capabilities()
+    loose = river.Sandbox(max_wall_secs=10**9, max_processes=10**6)
+    assert f"max_wall_secs={caps['internal_wall_limit_secs']}" in repr(loose)
+    assert f"max_processes={caps['default_max_processes']}" in repr(loose)
+    tight = river.Sandbox(max_wall_secs=5, max_processes=2)
+    assert "max_wall_secs=5" in repr(tight)
+    assert "max_processes=2" in repr(tight)
+    with pytest.raises(ValueError):
+        river.Sandbox(max_wall_secs=0)
+    with pytest.raises(ValueError):
+        river.Sandbox(max_processes=0)
+
+
+def test_infrastructure_failure_is_se_without_an_exit_code(sandbox, tmp_path):
+    """A spawn failure is `SE` with the unsigned "no exit code" sentinel."""
+    missing = tmp_path / "does-not-exist"
+    r = sandbox.run(str(missing), [])
+    assert r.status == "SE", r.status
+    assert r.signal == 0
+    assert r.exit_code == 0xFFFFFFFF, hex(r.exit_code)
+    assert r.stderr, "the failure reason must be reported on stderr"
 
 
 def test_one_sandbox_may_be_used_from_several_threads(sandbox, python_exe):

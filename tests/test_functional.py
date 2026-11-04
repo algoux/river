@@ -137,6 +137,42 @@ def test_profile_state_does_not_survive_between_runs(sandbox, python_exe):
 
 @pytest.mark.skipif(
     not sys.platform.startswith("win"),
+    reason="Windows environment whitelist",
+)
+def test_path_is_available_to_the_program(sandbox, python_exe):
+    """`PATH` must point at the system directories.
+
+    Without it `cmd /c hostname`, batch wrappers and many runtimes fail to
+    find their own tools ("'hostname' is not recognized..."), which made the
+    Windows backend behave differently from Linux. `where.exe` / `whoami.exe`
+    cannot start inside the AppContainer for unrelated reasons, so the probe
+    uses a console tool that does (`hostname`), plus the raw variable.
+    """
+    cmd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "cmd.exe")
+    r = sandbox.run(cmd, ["/c", "hostname"])
+    assert r.status == "AC", (r.status, r.stderr)
+    assert r.stdout.strip(), r.stdout
+
+    r = sandbox.run(cmd, ["/c", "echo %PATH%"])
+    assert r.status == "AC", r.stderr
+    assert b"system32" in r.stdout.lower(), r.stdout
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
+    reason="Windows doctor() self-check",
+)
+def test_doctor_reports_the_windows_mechanisms():
+    facts = river.doctor()
+    assert facts["platform"] == "windows"
+    assert facts["ok"] is True, facts.get("errors")
+    assert facts["app_container"] is True
+    assert facts["job_object"] is True
+    assert facts["errors"] == []
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
     reason="Windows directory copy_in uses an inheritable protected DACL",
 )
 def test_directory_copy_in_is_immutable_and_cleaned_up(sandbox, python_exe, tmp_path):
@@ -357,6 +393,18 @@ def test_copy_out_recovers_products(sandbox, python_exe, tmp_path):
     assert r.status == "AC", r
     assert dst_file.read_text() == "hello-product"
     assert (dst_dir / "nested" / "x.bin").read_bytes() == b"\x01\x02"
+
+
+def test_copy_out_accepts_path_like_destinations(sandbox, python_exe, tmp_path):
+    """`copy_out` values accept `os.PathLike` as the stub promises."""
+    dst = tmp_path / "out" / "answer.txt"
+    r = sandbox.run(
+        python_exe,
+        ["-c", "open('answer.txt', 'w').write('via-path')"],
+        copy_out={"answer.txt": dst},
+    )
+    assert r.status == "AC", r
+    assert dst.read_text() == "via-path"
 
 
 def test_copy_out_missing_source_is_skipped(sandbox, python_exe, tmp_path):

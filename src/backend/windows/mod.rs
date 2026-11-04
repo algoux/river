@@ -18,21 +18,58 @@ use crate::contract::SafetyCeilings;
 
 pub use sandbox::Sandbox;
 
-/// Environment facts. The doctor is primarily a Linux deployment tool; the
-/// Windows backend reports the basics so `river.doctor()` stays callable.
+/// Environment facts and a real self-check.
+///
+/// Unlike the Linux backend this cannot probe for "missing mechanisms" (the
+/// AppContainer / Job Object APIs are part of Windows), but it does exercise
+/// the machinery the sandbox depends on: a throwaway AppContainer profile
+/// (created and deleted), a Job Object with limits, and a writable workdir.
 pub(crate) fn doctor() -> Vec<(&'static str, DoctorValue)> {
+    let mut errors: Vec<String> = Vec::new();
+
+    let profile_ok = match token::profile_check() {
+        Ok(()) => true,
+        Err(e) => {
+            errors.push(format!("AppContainer profile check failed: {e}"));
+            false
+        }
+    };
+    let job_ok = match job::Job::new(&job::JobLimits {
+        memory_limit_bytes: Some(64 * 1024 * 1024),
+        max_processes: 8,
+    }) {
+        Ok(_) => true,
+        Err(e) => {
+            errors.push(format!("Job Object check failed: {e}"));
+            false
+        }
+    };
+    let workdir_root = std::env::temp_dir();
+    let workdir_ok = probe_workdir(&workdir_root).is_ok();
+    if !workdir_ok {
+        errors.push(format!(
+            "workdir root {} is not writable",
+            workdir_root.display()
+        ));
+    }
+
     vec![
         ("platform", DoctorValue::Str("windows".into())),
-        ("ok", DoctorValue::Bool(true)),
-        ("errors", DoctorValue::List(Vec::new())),
+        ("app_container", DoctorValue::Bool(profile_ok)),
+        ("job_object", DoctorValue::Bool(job_ok)),
         (
-            "note",
-            DoctorValue::Str(
-                "doctor() reports Linux backend facts; the Windows backend is not instrumented"
-                    .into(),
-            ),
+            "workdir_root",
+            DoctorValue::Str(workdir_root.display().to_string()),
         ),
+        ("ok", DoctorValue::Bool(errors.is_empty())),
+        ("errors", DoctorValue::List(errors)),
     ]
+}
+
+fn probe_workdir(root: &std::path::Path) -> std::io::Result<()> {
+    let dir = root.join(format!("river-doctor-{}", std::process::id()));
+    std::fs::create_dir(&dir)?;
+    std::fs::remove_dir(&dir)
 }
 
 /// Capability matrix of the Windows backend.

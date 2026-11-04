@@ -255,7 +255,10 @@ impl StdioSet {
                 out_read,
                 ReaderSpec {
                     limit: stdout_limit,
-                    capture_ceiling: stdout_limit.unwrap_or(ceilings.capture_limit_bytes),
+                    capture_ceiling: crate::contract::capture_ceiling(
+                        stdout_limit,
+                        ceilings.capture_limit_bytes,
+                    ),
                     sink_ceiling: ceilings.sink_limit_bytes,
                     sink: stdout_file,
                     overflow_event: Some(ev),
@@ -270,7 +273,10 @@ impl StdioSet {
                 err_read,
                 ReaderSpec {
                     limit: stderr_limit,
-                    capture_ceiling: stderr_limit.unwrap_or(ceilings.capture_limit_bytes),
+                    capture_ceiling: crate::contract::capture_ceiling(
+                        stderr_limit,
+                        ceilings.capture_limit_bytes,
+                    ),
                     sink_ceiling: ceilings.sink_limit_bytes,
                     sink: stderr_file,
                     overflow_event: Some(ev),

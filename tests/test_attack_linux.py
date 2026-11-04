@@ -17,7 +17,8 @@ Surface under test:
   9. the program cannot mount / cannot write system dirs
  10. syscalls that need privileges fail (setuid, mknod)
  11. privilege fences: no_new_privs, empty capabilities, nosuid/nodev binds,
-     user-namespace creation denied by seccomp
+     user-namespace creation denied for `unshare` and `clone(CLONE_NEW*)`
+     (`clone3` remains open for glibc; doctor() warns about it)
  12. host metadata does not leak (hostname, /etc)
  13. limit enforcement: active CPU kill, OOM-killed flag, file-size bound
  14. host executables outside every runtime are bind-injected and run
@@ -451,9 +452,9 @@ def test_setuid_binaries_are_neutralized_by_nosuid(sandbox, python_exe):
     assert "SETUID_PRESENT" in out or "NO_SETUID" in out
 
 
-def test_user_namespace_creation_is_denied(sandbox, python_exe):
+def test_user_namespace_creation_is_denied(sandbox, python_exe, tmp_path):
     # seccomp denies unshare/setns, so a nested userns (and the extra kernel
-    # attack surface it opens) is unreachable.
+    # attack surface it opens) is unreachable via unshare...
     r = _probe(
         sandbox,
         python_exe,
@@ -466,6 +467,49 @@ def test_user_namespace_creation_is_denied(sandbox, python_exe):
     code = int(r.stdout.split()[0])
     assert code != 0, r.stdout
     assert b"Operation not permitted" in r.stdout or b"EPERM" in r.stdout
+
+    # ...and the `clone` flag path must be filtered as well (it used to be
+    # allowed unconditionally: clone(CLONE_NEWUSER) landed in a real new
+    # user namespace, while plain clone for threads/subprocesses must keep
+    # working).
+    import shutil
+    import subprocess
+
+    if shutil.which("gcc") is None:
+        pytest.skip("gcc not installed: cannot build the clone probe")
+    src = tmp_path / "clone_probe.c"
+    exe = tmp_path / "clone_probe"
+    src.write_text(
+        "#define _GNU_SOURCE\n"
+        "#include <errno.h>\n"
+        "#include <sched.h>\n"
+        "#include <stdio.h>\n"
+        "#include <stdlib.h>\n"
+        "#include <sys/wait.h>\n"
+        "#include <unistd.h>\n"
+        "static int child(void *arg) { (void)arg; return 0; }\n"
+        "int main(void) {\n"
+        "  char *stack = malloc(1 << 20);\n"
+        "  errno = 0;\n"
+        "  int ns = clone(child, stack + (1 << 20), CLONE_NEWUSER | SIGCHLD, 0);\n"
+        "  if (ns < 0) printf(\"userns-denied errno=%d\\n\", errno);\n"
+        "  else { waitpid(ns, 0, 0); printf(\"userns-ALLOWED\\n\"); }\n"
+        "  errno = 0;\n"
+        "  int plain = clone(child, stack + (1 << 20), SIGCHLD, 0);\n"
+        "  if (plain < 0) printf(\"plain-denied errno=%d\\n\", errno);\n"
+        "  else { waitpid(plain, 0, 0); printf(\"plain-ok\\n\"); }\n"
+        "  return 0;\n"
+        "}\n"
+    )
+    build = subprocess.run(
+        ["gcc", "-O0", "-o", str(exe), str(src)], capture_output=True, text=True
+    )
+    assert build.returncode == 0, build.stderr
+    r = sandbox.run(str(exe), [], time_limit_ms=10000)
+    out = r.stdout.decode()
+    assert r.status == "AC", r.stderr[:400]
+    assert "userns-denied" in out and "errno=1" in out, out
+    assert "plain-ok" in out, out
 
 
 def test_seccomp_denies_keyctl_and_io_uring(sandbox, python_exe):
@@ -593,10 +637,20 @@ def test_doctor_reports_ok():
     facts = river.doctor()
     assert facts["platform"] == "linux"
     assert facts["ok"] is True, facts.get("errors")
-    for key in ("kernel", "cgroup_root", "seccomp", "memory_peak", "memory_swap_max"):
+    for key in (
+        "kernel",
+        "cgroup_root",
+        "seccomp",
+        "memory_peak",
+        "memory_swap_max",
+        "userns_allowed",
+        "apparmor_userns_restrict",
+        "warnings",
+    ):
         assert key in facts, key
     assert facts["seccomp"] is True
     assert facts["memory_swap_max"] is True
+    assert isinstance(facts["warnings"], list)
 
 
 def test_copy_out_never_follows_symlinks(sandbox, python_exe, tmp_path):

@@ -54,6 +54,37 @@ fn build() -> Result<Program, String> {
             SeccompRule::new(vec![always.clone()]).map_err(|e| format!("seccomp rule: {e:?}"))?;
         rules.entry(*syscall as i64).or_default().push(rule);
     }
+
+    // `clone` is allowed only when **no** namespace-creation flag is set
+    // (x86_64 passes the flags in arg0). Otherwise a program could do
+    // `clone(CLONE_NEWUSER)` and get CAP_SYS_ADMIN inside a fresh user
+    // namespace, re-opening kernel surface the allowlist deliberately
+    // closed (`unshare` is denied outright, but clone was allowed
+    // unconditionally — verified: the child landed in a distinct userns).
+    //
+    // `clone3` is intentionally still allowed: glibc >= 2.34 uses it for
+    // pthread_create and does **not** fall back when it returns EPERM (only
+    // ENOSYS), and seccompiler has a single filter-wide errno. That leaves
+    // the clone3 userns path open; `doctor()` reports it as a warning and
+    // deployments can disable unprivileged user namespaces host-side.
+    let namespace_flags = (libc::CLONE_NEWNS
+        | libc::CLONE_NEWUSER
+        | libc::CLONE_NEWPID
+        | libc::CLONE_NEWNET
+        | libc::CLONE_NEWIPC
+        | libc::CLONE_NEWUTS
+        | libc::CLONE_NEWCGROUP) as u64;
+    let no_new_namespace = SeccompCondition::new(
+        0,
+        SeccompCmpArgLen::Dword,
+        SeccompCmpOp::MaskedEq(namespace_flags),
+        0,
+    )
+    .map_err(|e| format!("seccomp clone condition: {e:?}"))?;
+    let clone_rule = SeccompRule::new(vec![no_new_namespace])
+        .map_err(|e| format!("seccomp clone rule: {e:?}"))?;
+    rules.insert(libc::SYS_clone as i64, vec![clone_rule]);
+
     let filter = SeccompFilter::new(
         rules,
         SeccompAction::Errno(libc::EPERM as u32),
@@ -92,7 +123,9 @@ pub(crate) fn apply(program: &Program) -> libc::c_int {
 #[cfg(target_arch = "x86_64")]
 const ALLOW: &[libc::c_long] = &[
     // --- process / signals ------------------------------------------------
-    libc::SYS_clone,
+    // NOTE: `clone` is not in this list; it is added with an argument
+    // condition in `build()` (no CLONE_NEW* flags). `clone3` stays here —
+    // see the rationale in `build()`.
     libc::SYS_clone3,
     libc::SYS_fork,
     libc::SYS_vfork,

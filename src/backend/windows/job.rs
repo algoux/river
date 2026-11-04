@@ -14,17 +14,14 @@ use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
     JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
-    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
-    JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-    SetInformationJobObject, TerminateJobObject,
+    JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JobObjectBasicAccountingInformation, JobObjectBasicProcessIdList,
+    JobObjectExtendedLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+    TerminateJobObject,
 };
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-
-/// 100ns ticks per millisecond (Win32 time limit units).
-const TICKS_PER_MS: u64 = 10_000;
 
 pub(crate) fn physical_memory_bytes() -> u64 {
     let mut status = MEMORYSTATUSEX {
@@ -45,8 +42,6 @@ pub(crate) struct Job {
 pub(crate) struct JobLimits {
     /// None = no caller limit; the physical-memory safety ceiling applies.
     pub memory_limit_bytes: Option<u64>,
-    /// None = no CPU time limit.
-    pub cpu_time_limit_ms: Option<u64>,
     /// Cap on concurrently alive processes in the job (main process
     /// included). The main process is the only *judged* process; descendants
     /// are tolerated up to this cap so ordinary wrappers (`cmd /c`,
@@ -96,10 +91,11 @@ impl Job {
         li.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
         basic.JobMemoryLimit = mem as usize;
 
-        if let Some(ms) = limits.cpu_time_limit_ms {
-            li.LimitFlags |= JOB_OBJECT_LIMIT_PROCESS_TIME;
-            li.PerProcessUserTimeLimit = ms.saturating_mul(TICKS_PER_MS) as _;
-        }
+        // No CPU limit is set on the job: `JOB_OBJECT_LIMIT_PROCESS_TIME` is
+        // per process (a fork bomb multiplies it) and `JOB_OBJECT_LIMIT_JOB_TIME`
+        // kills without a `KillOrigin`, which would let a CPU-limit kill pass
+        // as `AC`. The monitor polls `cpu_time_ms()` every 10 ms and calls
+        // `TerminateJobObject` itself (same contract as the Linux backend).
 
         // SAFETY: handle owned by `job`; info struct sized correctly.
         let ok = unsafe {

@@ -21,6 +21,35 @@ def test_cpu_limit_produces_tle(sandbox, python_exe):
     assert r.signal == 9
 
 
+def test_cpu_limit_applies_to_the_whole_process_tree(sandbox, python_exe):
+    """The CPU budget is the tree's, not one process' allowance.
+
+    Four children each burn ~1s of CPU under a 500ms limit. A per-process
+    limit would kill each child individually and still let the parent print
+    `COMPLETED`; a tree-level limit must reap the whole job before that line
+    is reached (Windows used to set only the per-process job limit, Linux
+    already accounted the cgroup).
+    """
+    code = (
+        "import subprocess, sys\n"
+        "kid = ('import time\\n"
+        "t = time.process_time()\\n"
+        "while time.process_time() - t < 1.0: pass')\n"
+        "kids = [subprocess.Popen([sys.executable, '-c', kid]) for _ in range(4)]\n"
+        "for k in kids: k.wait()\n"
+        "print('COMPLETED')\n"
+    )
+    r = sandbox.run(
+        python_exe,
+        ["-c", code],
+        time_limit_ms=500,
+        wall_time_limit_ms=20000,
+    )
+    assert r.status == "TLE", (r.status, r.stderr[:300])
+    assert b"COMPLETED" not in r.stdout, r.stdout
+    assert r.wall_time_used_ms < 5000, r.wall_time_used_ms
+
+
 def test_wall_limit_catches_a_sleeping_program(sandbox, python_exe):
     # The CPU limit cannot see a sleeping program; the wall watchdog must.
     r = sandbox.run(

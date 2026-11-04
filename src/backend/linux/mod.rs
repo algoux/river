@@ -60,6 +60,31 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
+    // User namespaces: `clone` is filtered (no CLONE_NEW* flags), but
+    // `clone3` cannot be argument-inspected without breaking glibc's
+    // pthread_create (EPERM is not an ENOSYS fallback). Warn unless the
+    // host explicitly disables unprivileged creation. The AppArmor sysctl is
+    // reported as a fact but is *not* treated as a guarantee: on Ubuntu
+    // 24.04 with apparmor_restrict_unprivileged_userns=1 the sandboxed
+    // process still created a userns (verified), so only the kernel knob
+    // being 0 is trusted.
+    let userns_sysctl = std::fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone")
+        .ok()
+        .map(|s| s.trim() == "1");
+    let apparmor_restrict =
+        std::fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+            .ok()
+            .map(|s| s.trim() == "1");
+    let userns_allowed = userns_sysctl != Some(false);
+    let mut warnings = Vec::new();
+    if userns_allowed {
+        warnings.push(
+            "clone3 can still create an unprivileged user namespace (glibc pthread_create \
+             needs clone3); set kernel.unprivileged_userns_clone=0 if this matters"
+                .to_string(),
+        );
+    }
+
     let mut out: Vec<(&'static str, DoctorValue)> = vec![
         ("platform", DoctorValue::Str("linux".into())),
         ("kernel", DoctorValue::Str(kernel)),
@@ -83,6 +108,12 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
         ),
         ("seccomp", DoctorValue::Bool(seccomp_ok)),
         ("seccomp_actions", DoctorValue::Str(seccomp_actions)),
+        ("userns_allowed", DoctorValue::Bool(userns_allowed)),
+        (
+            "apparmor_userns_restrict",
+            DoctorValue::Bool(apparmor_restrict.unwrap_or(false)),
+        ),
+        ("warnings", DoctorValue::List(warnings)),
         (
             "workdir_root",
             DoctorValue::Str(std::env::temp_dir().display().to_string()),

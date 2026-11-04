@@ -490,7 +490,6 @@ mod tests {
     fn limits() -> JobLimits {
         JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         }
     }
@@ -572,7 +571,6 @@ mod tests {
         // A tight cap (2) must stop a process that keeps spawning children.
         let tight = JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: None,
             max_processes: 2,
         };
         let job = Job::new(&tight).unwrap();

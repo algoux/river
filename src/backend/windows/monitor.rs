@@ -1,11 +1,14 @@
-//! Wait loop, wall-clock watchdog and time measurement for one run.
+//! Wait loop, wall-clock watchdog, CPU-limit enforcement and time
+//! measurement for one run.
 //!
-//! CPU time comes from `GetProcessTimes` (kernel + user of the process;
-//! with the one-process job limit there are no children to account for).
-//! Wall time comes from `Instant` (QPC-backed on Windows). A run whose wall
-//! limit is `None` still gets the 24h internal safety ceiling
-//! (DESIGN.md §2.2: "unlimited" is caller semantics, never a missing
-//! mechanism).
+//! CPU time comes from the **job accounting** (`Job::cpu_time_ms`: user +
+//! kernel of the whole tree), never from `GetProcessTimes` — on Windows 8+
+//! another process' per-process times read back as 0. A CPU limit is
+//! enforced by polling that accounting every 10 ms and terminating the job,
+//! the same contract as the Linux backend's `cpu.stat` poll. Wall time comes
+//! from `Instant` (QPC-backed). A run whose wall limit is `None` still gets
+//! the 24h internal safety ceiling (DESIGN.md §2.2: "unlimited" is caller
+//! semantics, never a missing mechanism).
 
 use std::io;
 use std::os::windows::io::AsRawHandle;
@@ -36,58 +39,85 @@ pub(crate) struct RunOutcome {
 }
 
 fn limit_ms(limit: &Duration) -> u32 {
-    limit.as_millis().min(u32::MAX as u128) as u32
+    // `u32::MAX` is `INFINITE` for the wait APIs: never produce it from a
+    // computed duration (a 49.7-day wall limit would disable the watchdog).
+    limit.as_millis().min((u32::MAX - 1) as u128) as u32
 }
 
-/// Resume the child, wait up to `wall_limit` (None = safety ceiling) for
-/// either the process to exit or an output channel to overflow its kill
-/// threshold, kill on timeout/overflow, and collect timing.
+/// How often the job's CPU accounting is polled while a CPU limit is set.
+/// Overshoot of the limit is bounded by this interval (the same contract as
+/// the Linux `cpu.stat` poll).
+const CPU_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+fn wait_forever(handle: HANDLE) {
+    // SAFETY: the process handle is owned and valid; INFINITE is fine here
+    // because the job termination above guarantees the process signals.
+    unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
+}
+
+/// Resume the child, wait up to `wall_limit` (None = safety ceiling) for the
+/// process to exit, an output channel to overflow, or the tree's CPU time to
+/// pass `cpu_limit_ms`, kill on any of those, and collect timing.
+///
+/// CPU is enforced by polling the job accounting (user + kernel of the whole
+/// tree), not by `JOB_OBJECT_LIMIT_JOB_TIME`: a kernel job-time kill carries
+/// no `KillOrigin`, and the recorded CPU can sit exactly at the limit, which
+/// would classify a CPU-limit kill as `AC`.
 pub(crate) fn monitor(
     child: &SpawnedChild,
     job: &Job,
     wall_limit: Option<Duration>,
     overflow_event: Option<HANDLE>,
+    cpu_limit_ms: Option<u64>,
 ) -> io::Result<RunOutcome> {
     let limit = wall_limit.unwrap_or_else(|| SafetyCeilings::default().wall_limit);
     let started = Instant::now();
     child.resume()?;
 
     let handle = child.process.as_raw_handle() as _;
-    let kill = if let Some(ev) = overflow_event {
-        // Wait on {process, overflow event} so an output fountain is reaped
-        // mid-run instead of being flagged only after it exits.
-        let handles = [handle, ev];
-        const EV_SIGNAL: u32 = WAIT_OBJECT_0 + 1;
-        match unsafe {
-            WaitForMultipleObjects(2, handles.as_ptr(), 0 /* any */, limit_ms(&limit))
-        } {
-            WAIT_OBJECT_0 => KillOrigin::None,
-            EV_SIGNAL => {
-                job.terminate(KILL_EXIT_CODE)?;
-                // SAFETY: handle still valid; the job kill guarantees signaling.
-                unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-                KillOrigin::OutputLimit
-            }
+    let mut handles = vec![handle];
+    if let Some(event) = overflow_event {
+        handles.push(event);
+    }
+    let overflow_index = overflow_event.map(|_| 1usize);
+
+    let kill = loop {
+        let elapsed = started.elapsed();
+        if elapsed >= limit {
+            job.terminate(KILL_EXIT_CODE)?;
+            wait_forever(handle);
+            break KillOrigin::WallTimeout;
+        }
+        let remaining = limit - elapsed;
+        // With a CPU limit, wake up every 10 ms to read the job accounting;
+        // otherwise block until the process/overflow event or the deadline.
+        let wait_ms = if cpu_limit_ms.is_some() {
+            limit_ms(&remaining.min(CPU_POLL_INTERVAL))
+        } else {
+            limit_ms(&remaining)
+        };
+        // SAFETY: handles are valid (process handle owned; event owned by
+        // StdioSet, which outlives this call).
+        let rc =
+            unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, wait_ms) };
+        match rc {
+            WAIT_OBJECT_0 => break KillOrigin::None,
             WAIT_TIMEOUT => {
+                if let Some(cpu_limit) = cpu_limit_ms
+                    && job.cpu_time_ms()? > cpu_limit
+                {
+                    job.terminate(KILL_EXIT_CODE)?;
+                    wait_forever(handle);
+                    break KillOrigin::CpuLimit;
+                }
+                continue;
+            }
+            rc if overflow_index.is_some_and(|index| rc == WAIT_OBJECT_0 + index as u32) => {
                 job.terminate(KILL_EXIT_CODE)?;
-                // SAFETY: handle still valid; the job kill guarantees signaling.
-                unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-                KillOrigin::WallTimeout
+                wait_forever(handle);
+                break KillOrigin::OutputLimit;
             }
             _ => return Err(io::Error::last_os_error()),
-        }
-    } else {
-        // SAFETY: process handle is owned and valid.
-        let wait = unsafe { WaitForSingleObject(handle, limit_ms(&limit)) };
-        if wait == WAIT_OBJECT_0 {
-            KillOrigin::None
-        } else if wait == WAIT_TIMEOUT {
-            job.terminate(KILL_EXIT_CODE)?;
-            // SAFETY: handle still valid; the job kill guarantees signaling.
-            unsafe { WaitForSingleObject(handle, 0xFFFF_FFFF) };
-            KillOrigin::WallTimeout
-        } else {
-            return Err(io::Error::last_os_error());
         }
     };
 
@@ -156,13 +186,12 @@ mod tests {
     ) -> io::Result<RunOutcome> {
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })?;
         let mut set = StdioSet::new(StdinSource::Null, None, None, None, None, test_ceilings())?;
         let argvec: Vec<String> = args.iter().map(|s| s.to_string()).collect();
         let child = spawn_bare(Path::new(exe), &argvec, &job, &mut set, None, None)?;
-        let outcome = monitor(&child, &job, wall_limit, None)?;
+        let outcome = monitor(&child, &job, wall_limit, None, None)?;
         set.finish()?;
         Ok(outcome)
     }
@@ -272,7 +301,6 @@ mod tests {
         // the child must be reported as residual and killed, not left behind.
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
@@ -283,7 +311,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
-        let outcome = monitor(&child, &job, None, None).unwrap();
+        let outcome = monitor(&child, &job, None, None, None).unwrap();
         assert_eq!(outcome.kill, KillOrigin::None);
         assert!(
             outcome.residual_processes > 0,
@@ -319,12 +347,11 @@ mod tests {
 
     #[test]
     fn cpu_limit_kill_is_tle_evidence() {
-        // The job's PROCESS_TIME limit terminates the busy process; the
+        // The monitor polls the job accounting and terminates the tree; the
         // verdict must come from the CPU evidence, not the exit code.
         let cpu_limit = 500;
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: Some(cpu_limit),
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
@@ -335,8 +362,9 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
-        let outcome = monitor(&child, &job, None, None).unwrap();
+        let outcome = monitor(&child, &job, None, None, Some(cpu_limit)).unwrap();
         set.finish().unwrap();
+        assert_eq!(outcome.kill, KillOrigin::CpuLimit);
         assert!(
             outcome.cpu_time_ms > cpu_limit,
             "cpu {}ms over limit {cpu_limit}ms",
@@ -361,7 +389,6 @@ mod tests {
         let mem_limit = 32 * 1024 * 1024;
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(mem_limit),
-            cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
@@ -382,8 +409,14 @@ mod tests {
         let child = spawn_bare(&probe, &[], &job, &mut set, None, None).unwrap();
         // Wall watchdog as a backstop: whichever comes first (heap abort or
         // watchdog kill), the evidence must classify MLE.
-        let outcome =
-            monitor(&child, &job, Some(std::time::Duration::from_secs(15)), None).unwrap();
+        let outcome = monitor(
+            &child,
+            &job,
+            Some(std::time::Duration::from_secs(15)),
+            None,
+            None,
+        )
+        .unwrap();
         set.finish().unwrap();
         let peak = job.peak_process_memory_used().unwrap();
         assert!(
@@ -396,6 +429,7 @@ mod tests {
             residual_processes: outcome.residual_processes,
             // Windows memory caps make allocations fail; no OOM-kill counter.
             oom_killed: false,
+            output_limit_hit: false,
             cpu_time_limit_ms: None,
             cpu_time_used_ms: outcome.cpu_time_ms,
             memory_limit_bytes: Some(mem_limit),
@@ -413,7 +447,6 @@ mod tests {
         let out_limit = 4096u64;
         let job = Job::new(&JobLimits {
             memory_limit_bytes: Some(512 * 1024 * 1024),
-            cpu_time_limit_ms: None,
             max_processes: crate::contract::SafetyCeilings::default().max_processes,
         })
         .unwrap();
@@ -435,7 +468,7 @@ mod tests {
         .map(|s| s.to_string())
         .collect();
         let child = spawn_bare(Path::new("cmd"), &args, &job, &mut set, None, None).unwrap();
-        let outcome = monitor(&child, &job, None, Some(ev)).unwrap();
+        let outcome = monitor(&child, &job, None, Some(ev), None).unwrap();
         let (out, _err) = set.finish().unwrap();
         assert_eq!(outcome.kill, KillOrigin::OutputLimit);
         assert!(outcome.wall_time_ms < 20_000, "fountain reaped mid-run");

@@ -10,8 +10,11 @@ Checklist mapping:
   1. write C:\\Windows\\Temp / desktop      -> denied
   2. read/write outside cwd, walk C:\\        -> denied
   3. registry write (HKCU/HKLM)              -> denied
+     (registry *reads* are visible to an AppContainer — a documented
+      information exposure, not asserted as desired behavior here)
   4. outbound socket                         -> denied
-  5. spawn a child process                   -> denied
+  5. spawn a child process                   -> allowed but bounded (<=64 live;
+                                                residual children -> SE)
   6. resource exhaustion                     -> TLE/MLE/OLE
   7. win32k / UI calls                       -> denied
   8. open another process / window messages  -> denied

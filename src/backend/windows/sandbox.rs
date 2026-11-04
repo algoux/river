@@ -19,16 +19,6 @@ use crate::contract::status::Status;
 use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
 use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, parse_copy_out, validate};
 
-/// Recover working directories abandoned by a *dead* judger process (its
-/// sandboxed processes died with KILL_ON_JOB_CLOSE, but the per-run dirs
-/// have no process to drop them). Never touches live owners.
-///
-/// Runs on every `__enter__`/`__exit__` (not in `__new__`, which therefore
-/// has no side effects): another judger process may have been hard-killed
-/// since our last sweep, so the check cannot be skipped — dirs abandoned
-/// by a *different* process must still be recovered (the interrupted-judger
-/// attack test depends on exactly that).
-///
 /// Windows sandbox.
 ///
 /// The sandbox filesystem model on Windows:
@@ -76,11 +66,24 @@ impl Sandbox {
             ));
         }
         let mut ceilings = SafetyCeilings::default();
+        // "Tighten only": a caller value can lower a ceiling, never raise it
+        // (the mechanism guarantee must not be disableable). Zero is rejected
+        // instead of silently becoming 1s/1 process.
         if let Some(secs) = max_wall_secs {
-            ceilings.wall_limit = Duration::from_secs(secs.max(1));
+            if secs == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "max_wall_secs must be >= 1",
+                ));
+            }
+            ceilings.wall_limit = Duration::from_secs(secs.min(ceilings.wall_limit.as_secs()));
         }
         if let Some(n) = max_processes {
-            ceilings.max_processes = n.max(1);
+            if n == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "max_processes must be >= 1",
+                ));
+            }
+            ceilings.max_processes = n.min(ceilings.max_processes);
         }
         Ok(Self {
             rootfs: None,
@@ -159,7 +162,7 @@ impl Sandbox {
         stdin: Option<Vec<u8>>,
         stdin_file: Option<PathBuf>,
         copy_in: Option<HashMap<String, Py<PyAny>>>,
-        copy_out: Option<HashMap<String, String>>,
+        copy_out: Option<HashMap<String, PathBuf>>,
         copy_out_limit_kb: Option<u64>,
         stdout_limit_kb: Option<u64>,
         stderr_limit_kb: Option<u64>,
@@ -201,7 +204,6 @@ impl Sandbox {
         };
         let limits = JobLimits {
             memory_limit_bytes: spec.memory_limit_kb.map(|kb| kb.saturating_mul(1024)),
-            cpu_time_limit_ms: spec.time_limit_ms,
             max_processes: self.ceilings.max_processes,
         };
         // Wall limit: user value, the 2x+1s default for CPU-limited runs, or
@@ -216,7 +218,7 @@ impl Sandbox {
         let memory_limit_bytes = limits
             .memory_limit_bytes
             .unwrap_or_else(physical_memory_bytes);
-        let cpu_time_limit_ms = limits.cpu_time_limit_ms;
+        let cpu_time_limit_ms = spec.time_limit_ms;
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
         let exe = spec.executable.clone();
@@ -268,13 +270,19 @@ impl Sandbox {
             // Whitelisted environment: base + caller overrides (incremental
             // merge). TEMP/TMP point into the private cwd. LOCALAPPDATA is
             // REQUIRED for an AppContainer spawn: without it CreateProcessW
-            // fails with ERROR_ENVVAR_NOT_FOUND (203).
+            // fails with ERROR_ENVVAR_NOT_FOUND (203). PATH is a fixed system
+            // PATH: without it `cmd /c whoami`, batch wrappers and most
+            // runtimes cannot find their own tools (the Linux backend has
+            // always provided PATH).
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
+            let system_root =
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
             let mut env_vars: Vec<(String, String)> = vec![
+                ("SystemRoot".to_string(), system_root.clone()),
                 (
-                    "SystemRoot".to_string(),
-                    std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+                    "PATH".to_string(),
+                    format!(r"{system_root}\system32;{system_root}"),
                 ),
                 (
                     "LOCALAPPDATA".to_string(),
@@ -336,6 +344,7 @@ impl Sandbox {
                 &job,
                 Some(wall_limit),
                 Some(set.overflow_event_handle()),
+                cpu_time_limit_ms,
             )?;
             let peak_bytes = job
                 .peak_process_memory_used()?
@@ -347,11 +356,23 @@ impl Sandbox {
                 None => crate::backend::windows::workdir::Collected::default(),
             };
             let (out, err) = set.finish()?;
-            Ok((outcome, peak_bytes, out, err, collected.quota_exceeded))
+            // Post-run output evidence: a fast writer can exit before the
+            // monitor observes the reader's flag, so the completed channel
+            // totals get the last word (the Linux backend does the same).
+            let output_limit_hit = stdout_limit.is_some_and(|limit| out.total > limit)
+                || stderr_limit.is_some_and(|limit| err.total > limit);
+            Ok((
+                outcome,
+                peak_bytes,
+                out,
+                err,
+                collected.quota_exceeded,
+                output_limit_hit,
+            ))
         });
 
         match result {
-            Ok((outcome, peak_bytes, out, err, quota_exceeded)) => {
+            Ok((outcome, peak_bytes, out, err, quota_exceeded, output_limit_hit)) => {
                 // Evidence-priority verdict (contract layer): the backend reports what it
                 // observed; the contract classifies it — sandbox kills and
                 // limit evidence outrank the raw exit code of a killed process.
@@ -367,6 +388,7 @@ impl Sandbox {
                     // Windows memory caps make allocations fail (commit
                     // semantics); there is no kernel OOM-kill counter.
                     oom_killed: false,
+                    output_limit_hit,
                     cpu_time_limit_ms,
                     cpu_time_used_ms: outcome.cpu_time_ms,
                     memory_limit_bytes: Some(memory_limit_bytes),
@@ -376,7 +398,7 @@ impl Sandbox {
                 status.time_used_ms = outcome.cpu_time_ms;
                 status.wall_time_used_ms = outcome.wall_time_ms;
                 status.memory_used_kb = peak_bytes / 1024;
-                status.exit_code = outcome.exit_code as i32;
+                status.exit_code = outcome.exit_code;
                 status.stdout = out.data;
                 status.stderr = err.data;
                 status.stdout_truncated = out.truncated;

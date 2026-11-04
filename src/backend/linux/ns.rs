@@ -82,11 +82,28 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        // Error path in the caller: same as disarm, but never block.
+        // Error path in the caller: the monitor never reaped the supervisor,
+        // so its process group (the program tree) is still alive and no
+        // watchdog will enforce limits any more. Kill it, reap it, then stop
+        // the watchdog. A blocking waitpid is safe after SIGKILL (and returns
+        // ECHILD immediately when the monitor already reaped it).
         if self.watchdog > 0 {
-            unsafe { libc::kill(self.watchdog, libc::SIGKILL) };
+            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
             let mut status = 0;
-            unsafe { libc::waitpid(self.watchdog, &mut status, libc::WNOHANG) };
+            loop {
+                let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if rc == self.pid {
+                    break;
+                }
+                if unsafe { errno() } == libc::EINTR {
+                    continue;
+                }
+                break; // ECHILD: already reaped by the monitor
+            }
+            unsafe { libc::kill(self.watchdog, libc::SIGKILL) };
+            let mut wstatus = 0;
+            unsafe { libc::waitpid(self.watchdog, &mut wstatus, 0) };
+            self.watchdog = 0;
         }
     }
 }
@@ -901,7 +918,12 @@ unsafe fn supervise(
     if libc::chdir(c"/".as_ptr()) != 0 {
         fail(3, errno());
     }
-    libc::umount2(c"/.oldroot".as_ptr(), libc::MNT_DETACH);
+    // Detach the old root. Failing open here would leave the host tree
+    // reachable at /.oldroot, so a failure aborts the run instead of being
+    // ignored.
+    if libc::umount2(c"/.oldroot".as_ptr(), libc::MNT_DETACH) != 0 {
+        fail(3, errno());
+    }
     libc::rmdir(c"/.oldroot".as_ptr());
 
     // Setup complete: the parent may now trust the namespace.

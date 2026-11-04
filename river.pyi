@@ -20,14 +20,18 @@ class Status:
     Units are part of the API contract and mirrored in field names:
     `time_used_ms` / `wall_time_used_ms` are milliseconds (CPU / wall clock),
     `memory_used_kb` is kilobytes (peak committed memory of the process tree).
+
+    `SE` has two shapes: a residual-descendant kill reports `signal=9` with
+    the process' own exit code, while an infrastructure failure (spawn or
+    cleanup error) reports `signal=0` and `exit_code=0xFFFFFFFF`.
     """
 
     time_used_ms: int
     wall_time_used_ms: int
     memory_used_kb: int
     status: _Verdict
-    signal: int  # 0 normally, 9 when killed by the sandbox (TLE/MLE/OLE)
-    exit_code: int  # raw exit code; NTSTATUS on abnormal Windows termination
+    signal: int  # 0 normally, 9 when killed by the sandbox (TLE/MLE/OLE/SE)
+    exit_code: int  # unsigned raw exit code; 0xFFFFFFFF = no exit code (infra SE)
     oom_killed: bool  # Linux only: kernel OOM killer reaped a sandbox task
     stdout: bytes  # truncated to stdout_limit_kb (or the internal capture ceiling)
     stderr: bytes  # truncated to stderr_limit_kb (or the internal capture ceiling)
@@ -51,7 +55,8 @@ class Sandbox:
     a run passes `None` limits) default to a 24h wall clock, 64 live
     processes, a 64 MiB per-channel memory-capture ceiling and a 1 GiB
     per-channel file-sink ceiling; `max_wall_secs` / `max_processes` may
-    tighten (never disable) the first two per Sandbox. Check
+    tighten (never disable) the first two per Sandbox — larger values are
+    clamped to the defaults and `0` raises `ValueError`. Check
     `river.capabilities()` for the platform capability matrix instead of
     probing with try/except.
 
@@ -143,9 +148,12 @@ def doctor() -> dict[str, object]:
     - `platform`: `"windows" | "linux" | "macos"`
     - `ok`: whether every required mechanism is available
     - `errors`: list of blocking problems (empty when `ok`)
+    - `warnings`: list of non-blocking caveats (may be non-empty when `ok`)
 
     Linux also reports `kernel`, `cgroup_root`, `cgroups_v2`, `controllers`,
     `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
-    `seccomp_actions` and `workdir_root`. `Sandbox(...)` runs the same
-    checks and fails closed when `ok` is false.
+    `seccomp_actions`, `userns_allowed`, `apparmor_userns_restrict` and
+    `workdir_root`. Windows reports `app_container`, `job_object` and
+    `workdir_root`. `Sandbox(...)` runs the same checks and fails closed when
+    `ok` is false.
     """

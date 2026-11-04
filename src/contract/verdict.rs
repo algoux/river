@@ -65,6 +65,13 @@ pub(crate) struct RunEvidence {
     /// run (`memory.events` `oom_kill` > 0). Linux-only signal; always false
     /// on Windows.
     pub oom_killed: bool,
+    /// A stdout/stderr channel produced more than its **caller** kill
+    /// threshold, measured after the process ended. The mid-run kill is
+    /// reported as [`KillOrigin::OutputLimit`], but a fast writer can exit
+    /// before the monitor observes the reader's flag — this post-run
+    /// observation has the last word (Linux reads it from `StdioSet::finish`,
+    /// Windows from the same completed `Output` values).
+    pub output_limit_hit: bool,
     pub cpu_time_limit_ms: Option<u64>,
     pub cpu_time_used_ms: u64,
     pub memory_limit_bytes: Option<u64>,
@@ -145,10 +152,15 @@ pub(crate) fn classify(evidence: &RunEvidence) -> Verdict {
     //    mid-run); a copy_out quota stop is the file-output analogue (the
     //    sandbox measured the collected bytes itself). Both are direct
     //    observations — they outrank the inferred memory/time evidence below.
-    if matches!(
-        evidence.kill,
-        KillOrigin::OutputLimit | KillOrigin::CopyOutQuota
-    ) {
+    //    `output_limit_hit` is the same observation taken after the run, so
+    //    a writer that exited before the monitor noticed still classifies
+    //    as OLE instead of AC.
+    if evidence.output_limit_hit
+        || matches!(
+            evidence.kill,
+            KillOrigin::OutputLimit | KillOrigin::CopyOutQuota
+        )
+    {
         return Verdict::Ole;
     }
     // 3. Memory: an OOM kill is direct kernel evidence, and an abnormal end
@@ -260,6 +272,17 @@ mod tests {
         // The program exited 0, but it produced more collected output than
         // allowed: the quota evidence beats the exit code.
         let v = classify_ev(ev(KillOrigin::CopyOutQuota, 0));
+        assert_eq!(v, Verdict::Ole);
+        assert_eq!(v.synthesized_signal(), 9);
+    }
+
+    #[test]
+    fn post_run_output_evidence_upgrades_clean_exit_to_ole() {
+        // A fast writer can exit 0 before the monitor observes the reader's
+        // overflow flag; the post-run observation must still classify OLE.
+        let mut e = ev(KillOrigin::None, 0);
+        e.output_limit_hit = true;
+        let v = classify_ev(e);
         assert_eq!(v, Verdict::Ole);
         assert_eq!(v.synthesized_signal(), 9);
     }

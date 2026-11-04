@@ -64,7 +64,15 @@ pub(crate) fn monitor(
             break;
         }
         if rc < 0 {
-            return Err(io::Error::last_os_error());
+            // A signal (e.g. SIGCHLD of an unrelated child) can interrupt the
+            // wait; retrying is required, otherwise the run would be reported
+            // as an infrastructure error while the program keeps running
+            // without a watchdog.
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
         }
         // Still running: check the sandbox-kill conditions.
         if overflow.any() {
@@ -128,10 +136,18 @@ fn finish_killed(
     if rc != 0 {
         unsafe { libc::kill(pid, libc::SIGKILL) };
     }
-    let got = unsafe { libc::wait4(pid, status, 0, rusage) };
-    if got != pid {
-        return Err(io::Error::last_os_error());
-    }
+    let got = loop {
+        let got = unsafe { libc::wait4(pid, status, 0, rusage) };
+        if got == pid {
+            break got;
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(err);
+    };
+    debug_assert_eq!(got, pid);
     Ok(Outcome {
         kill,
         exit_code: decode_exit_code(*status),

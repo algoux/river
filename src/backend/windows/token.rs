@@ -65,6 +65,7 @@ unsafe extern "system" {
         appcontainername: PCWSTR,
         appcontainersid: *mut PSID,
     ) -> HRESULT;
+    fn DeleteAppContainerProfile(appcontainername: PCWSTR) -> HRESULT;
 }
 
 #[link(name = "advapi32")]
@@ -323,6 +324,21 @@ fn query_user_sid() -> io::Result<Vec<u8>> {
     // SAFETY: handle was opened above and is closed exactly once.
     unsafe { CloseHandle(token) };
     result
+}
+
+/// Self-check for `river.doctor()`: create a throwaway profile, then delete
+/// it. Proves both the mutating profile API and the profile folder work
+/// without leaving anything behind.
+pub(crate) fn profile_check() -> io::Result<()> {
+    const NAME: &str = "river.sandbox.doctor";
+    let _profile = AppContainer::create_or_open_named(NAME)?;
+    let wide = to_wide(NAME);
+    // SAFETY: wide is NUL-terminated; the profile was just created/opened.
+    let hr = unsafe { DeleteAppContainerProfile(wide.as_ptr()) };
+    if hr != 0 && hr != HRESULT_PROFILE_NOT_FOUND {
+        return Err(io::Error::from_raw_os_error(hr as i32));
+    }
+    Ok(())
 }
 
 /// Read a NUL-terminated wide string into `String` (tests only).

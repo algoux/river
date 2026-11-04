@@ -29,7 +29,11 @@ pub(crate) fn capabilities() -> Capabilities {
     {
         linux::capabilities()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::capabilities()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         Capabilities {
             platform: "unsupported",
@@ -57,7 +61,11 @@ pub(crate) fn doctor() -> Vec<(&'static str, DoctorValue)> {
     {
         windows::doctor()
     }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    #[cfg(target_os = "macos")]
+    {
+        macos::doctor()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
     {
         vec![
             ("platform", DoctorValue::Str("unsupported".into())),
@@ -66,6 +74,7 @@ pub(crate) fn doctor() -> Vec<(&'static str, DoctorValue)> {
                 "errors",
                 DoctorValue::List(vec!["backend not implemented".into()]),
             ),
+            ("warnings", DoctorValue::List(Vec::new())),
         ]
     }
 }

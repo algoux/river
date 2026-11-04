@@ -136,6 +136,16 @@ impl From<SafetyCeilings> for StdioCeilings {
     }
 }
 
+/// Effective per-channel memory-capture cap: the caller's kill threshold,
+/// but never above the internal ceiling. A caller that passes a 1 GiB
+/// `stdout_limit_kb` still gets its output killed at 1 GiB, while the judger
+/// only buffers `capture_ceiling_bytes` (the rest is counted, not kept).
+pub(crate) fn capture_ceiling(user_limit: Option<u64>, capture_ceiling_bytes: u64) -> u64 {
+    user_limit.map_or(capture_ceiling_bytes, |limit| {
+        limit.min(capture_ceiling_bytes)
+    })
+}
+
 /// Parse the raw `copy_in` mapping (`sandbox-relative path -> bytes | host
 /// path`, the latter also accepting a host *directory*).
 pub(crate) fn parse_copy_in(
@@ -160,13 +170,13 @@ pub(crate) fn parse_copy_in(
 
 /// Parse the raw `copy_out` mapping (`sandbox-relative path -> host path`).
 /// The destination must be a host path (a file, or a directory when the
-/// source is a directory).
-pub(crate) fn parse_copy_out(map: &HashMap<String, String>) -> PyResult<Vec<CopyOutEntry>> {
+/// source is a directory). Accepts `str` and `os.PathLike`.
+pub(crate) fn parse_copy_out(map: &HashMap<String, PathBuf>) -> PyResult<Vec<CopyOutEntry>> {
     Ok(map
         .iter()
         .map(|(src, dst)| CopyOutEntry {
             src_rel: src.clone(),
-            dst_host: PathBuf::from(dst),
+            dst_host: dst.clone(),
         })
         .collect())
 }
@@ -289,6 +299,18 @@ mod tests {
                 "{key:?} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn capture_ceiling_never_exceeds_the_internal_cap() {
+        const CAP: u64 = 64 * 1024 * 1024;
+        // No caller limit: the internal cap applies.
+        assert_eq!(capture_ceiling(None, CAP), CAP);
+        // A small caller limit is honored exactly.
+        assert_eq!(capture_ceiling(Some(1024), CAP), 1024);
+        // A huge caller limit still buffers only the internal cap (the kill
+        // threshold itself is enforced elsewhere).
+        assert_eq!(capture_ceiling(Some(1024 * 1024 * 1024), CAP), CAP);
     }
 
     #[test]

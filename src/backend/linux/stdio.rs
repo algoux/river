@@ -123,14 +123,20 @@ impl StdioSet {
                 ChannelPipe {
                     read_end: stdout_read,
                     limit: stdout_limit_bytes,
-                    capture_ceiling: stdout_limit_bytes.unwrap_or(ceilings.capture_limit_bytes),
+                    capture_ceiling: crate::contract::capture_ceiling(
+                        stdout_limit_bytes,
+                        ceilings.capture_limit_bytes,
+                    ),
                     sink_ceiling: ceilings.sink_limit_bytes,
                     archive: open_archive(stdout_file)?,
                 },
                 ChannelPipe {
                     read_end: stderr_read,
                     limit: stderr_limit_bytes,
-                    capture_ceiling: stderr_limit_bytes.unwrap_or(ceilings.capture_limit_bytes),
+                    capture_ceiling: crate::contract::capture_ceiling(
+                        stderr_limit_bytes,
+                        ceilings.capture_limit_bytes,
+                    ),
                     sink_ceiling: ceilings.sink_limit_bytes,
                     archive: open_archive(stderr_file)?,
                 },

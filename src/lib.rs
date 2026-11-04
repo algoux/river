@@ -40,9 +40,11 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// Kernel / cgroup / seccomp / filesystem facts for deployment diagnosis.
 ///
 /// Returns a dict with `platform`, `ok`, `errors` (list of blocking
-/// problems), and platform-specific keys (Linux: `kernel`, `cgroup_root`,
-/// `cgroups_v2`, `controllers`, `memory_peak`, `memory_swap_max`,
-/// `cgroup_kill`, `seccomp`, `seccomp_actions`, `workdir_root`).
+/// problems), `warnings` (list of non-blocking caveats) and
+/// platform-specific keys (Linux: `kernel`, `cgroup_root`, `cgroups_v2`,
+/// `controllers`, `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
+/// `seccomp_actions`, `userns_allowed`, `workdir_root`; Windows:
+/// `app_container`, `job_object`, `workdir_root`).
 ///
 /// `Sandbox(...)` runs the same checks and fails closed when `ok` is false.
 #[pyfunction]
