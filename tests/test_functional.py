@@ -9,6 +9,7 @@ Covers the sandbox's normal-operation surface:
 """
 
 import os
+import sys
 
 import pytest
 
@@ -191,6 +192,10 @@ def test_stderr_limit_is_independent(sandbox, python_exe):
     assert not r.stdout_truncated
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("win"),
+    reason="rootfs is rejected on Windows only; Linux supports it",
+)
 def test_rootfs_is_rejected_on_windows():
     with pytest.raises(ValueError):
         river.Sandbox(rootfs="/tmp")

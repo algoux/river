@@ -22,9 +22,9 @@ pub(crate) fn capabilities() -> Capabilities {
     let ceilings = SafetyCeilings::default();
     Capabilities {
         platform: "linux",
-        // The per-run tmpfs root is the sandbox filesystem (DESIGN §1); a
-        // caller-supplied rootfs image is not implemented yet.
-        rootfs: false,
+        // A caller-supplied rootfs directory replaces the tmpfs root: it is
+        // bind-mounted read-only and the program is pivoted into it.
+        rootfs: true,
         default_max_processes: ceilings.max_processes,
         internal_wall_limit_secs: ceilings.wall_limit.as_secs(),
     }

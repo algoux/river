@@ -11,8 +11,9 @@ import river
 #   + copy_in（每 run 投放的私有文件）
 #   + env（增量合并进白名单基底：SystemRoot/LOCALAPPDATA/TEMP/TMP）
 #
-# rootfs 仅 Linux/macOS 支持（chroot/sandbox-exec）；Windows 上传入即报错
-# —— Windows 进程永远从真实 System32 加载系统 DLL，rootfs 语义不成立，
+# rootfs 仅 Linux 支持：以只读 overlayfs 替换沙箱根（宿主 rootfs 树永不被
+# 写入），executable 坐标系变为 rootfs 内路径。Windows 上传入即报错——
+# Windows 进程永远从真实 System32 加载系统 DLL，rootfs 语义不成立，
 # 运行时环境一律通过 runtimes 提供。
 
 PYTHON = sys.executable  # 演示用：以本机 Python 作为被测运行时
@@ -22,7 +23,7 @@ base = getattr(sys, "base_prefix", os.path.dirname(PYTHON))
 RUNTIMES = sorted({os.path.dirname(PYTHON), sys.prefix, base})
 
 sandbox = river.Sandbox(
-    rootfs=None,  # str | None，Linux/macOS 专属
+    rootfs=None,  # str | None，Linux 专属：只读替换沙箱根
     runtimes=RUNTIMES,  # list[str] | None，只读暴露给沙箱
 )
 

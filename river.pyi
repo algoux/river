@@ -52,15 +52,21 @@ class Sandbox:
     platform capability matrix instead of probing with try/except.
 
     Platform support: **Windows and Linux** are implemented (macOS is not
-    yet). `rootfs` is not supported on Windows (processes always resolve
-    system DLLs from the real `System32`) nor on Linux — use
-    `runtimes` there instead.
+    yet). `rootfs` is supported on Linux only: it replaces the sandbox root
+    with a caller-supplied read-only root tree (see below). It is not
+    supported on Windows (processes always resolve system DLLs from the real
+    `System32`) or macOS.
 
     Linux specifics: the process runs as `nobody` inside mount/pid/net/ipc/
     uts/cgroup namespaces under a seccomp allowlist with `no_new_privs`;
-    network access is always denied (empty network namespace); `executable`
-    is a host path — if it is not already visible through `runtimes`/the
-    system dirs it is bind-mounted read-only at `/cwd/.river/<name>`.
+    network access is always denied (empty network namespace). Without
+    `rootfs`, `executable` is a host path — if it is not already visible
+    through `runtimes`/the system dirs it is bind-mounted read-only at
+    `/cwd/.river/<name>`; with `rootfs`, `executable` is a path *inside the
+    rootfs* and the host system dirs are not merged in (the rootfs must be
+    self-contained; it is mounted read-only via overlayfs — the host tree is
+    never written — with `runtimes` layered on top, and the only writable
+    place stays `/cwd`).
     Construction fails closed when cgroups v2, `memory.peak`,
     `memory.swap.max` or seccomp are unavailable (see `doctor()`); the
     backend must run as root.

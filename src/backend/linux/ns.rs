@@ -4,7 +4,8 @@
 //! judger (python) --fork--> A (supervisor, still root)
 //!                            ├─ setsid            (own process group = kill domain)
 //!                            ├─ unshare(NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS)
-//!                            ├─ build tmpfs root + bind mounts, pivot_root
+//!                            ├─ build tmpfs root (+rootfs overlay) + bind
+//!                            │   mounts, pivot_root
 //!                            ├─ report "ok" on the ready pipe
 //!                            └─ fork B, close ready pipe, wait4(B), _exit(code)
 //!                                B: PDEATHSIG, fresh /proc, uid drop to nobody,
@@ -37,10 +38,11 @@ use std::path::{Path, PathBuf};
 use super::mount;
 use super::stdio::StdioSet;
 
-/// System directories always exposed read-only inside the sandbox: the
-/// dynamic loader, libc and a shell must be reachable for ordinary programs
-/// to start at all. This mirrors the Windows backend's "System32 is always
-/// readable" rule (DESIGN §4).
+/// System directories always exposed read-only inside the sandbox **when no
+/// rootfs is given**: the dynamic loader, libc and a shell must be reachable
+/// for ordinary programs to start at all. This mirrors the Windows backend's
+/// "System32 is always readable" rule (DESIGN §4). With a caller-supplied
+/// rootfs these are *not* mounted — the rootfs must be self-contained.
 const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
 /// Nobody uid/gid (Debian/Ubuntu convention; also the kernel's overflow
@@ -90,6 +92,14 @@ struct MountPlan {
     dev_dir: CString,
     cwd_dir: CString,
     workdir: CString,
+    /// Overlayfs setup for a caller-supplied rootfs (`rootfs=`): the mount
+    /// options string `lowerdir=<rootfs>,upperdir=<tmpfs>,workdir=<tmpfs>`.
+    /// The host rootfs is the read-only lower layer — it is *never* written
+    /// (no mountpoint dirs have to be created inside it); everything else
+    /// (missing mountpoints like `/cwd`, `/proc`, `/dev`, runtime bind
+    /// targets) is provisioned into the per-run upper layer. `None` when no
+    /// rootfs was given (plain tmpfs root + system-dir binds).
+    rootfs_overlay: Option<CString>,
     /// (host source, absolute path inside the sandbox) read-only directory
     /// binds.
     binds: Vec<(CString, CString)>,
@@ -108,6 +118,7 @@ struct MountPlan {
 impl MountPlan {
     fn build(
         workdir: &Path,
+        rootfs: Option<&Path>,
         runtimes: &[PathBuf],
         executable: &Path,
         cwd_rel: Option<&str>,
@@ -126,9 +137,54 @@ impl MountPlan {
         let cwd_dir = cstr(&root_path.join("cwd"))?;
         let workdir_c = cstr(workdir)?;
 
-        // Binds: system dirs first, then caller runtimes, deduped by the
-        // sandbox path. A runtime that is a prefix of another is fine —
-        // the deeper mount lands on top.
+        // Caller-supplied rootfs: overlayfs with the host tree as the
+        // read-only lower layer and per-run tmpfs upper/work dirs. Overlayfs
+        // (rather than a plain bind) means the sandbox never has to create
+        // mountpoint directories *inside* the caller's tree — with a plain
+        // read-only bind, a rootfs lacking `/cwd` or `/proc` could not be
+        // used at all. The overlay is remounted read-only after the
+        // mountpoints exist (supervise); the upper layer is per-run and
+        // discarded with the workdir, so the host rootfs stays untouched.
+        let rootfs_overlay = match rootfs {
+            Some(fs) => {
+                // Paths are embedded in a comma-separated mount(8)-style
+                // options string; refuse the characters that would break it.
+                let bad = |p: &Path, what: &str| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "rootfs {what} must not contain commas or colons: {}",
+                            p.display()
+                        ),
+                    )
+                };
+                let fs_str = fs.to_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 rootfs path")
+                })?;
+                if fs_str.contains(',') || fs_str.contains(':') {
+                    return Err(bad(fs, "path"));
+                }
+                let upper = workdir.join("upper");
+                let work = workdir.join("ovl-work");
+                if upper.to_str().map(|s| s.contains(',') || s.contains(':')) == Some(true)
+                    || work.to_str().map(|s| s.contains(',') || s.contains(':')) == Some(true)
+                {
+                    return Err(bad(&upper, "workdir path"));
+                }
+                std::fs::create_dir_all(&upper)?;
+                std::fs::create_dir_all(&work)?;
+                Some(CString::new(format!(
+                    "lowerdir={fs_str},upperdir={},workdir={}",
+                    upper.display(),
+                    work.display()
+                ))?)
+            }
+            None => None,
+        };
+
+        // Binds: system dirs first (no rootfs), then caller runtimes,
+        // deduped by the sandbox path. A runtime that is a prefix of another
+        // is fine — the deeper mount lands on top.
         let mut binds: Vec<(CString, CString)> = Vec::new();
         let mut seen: Vec<String> = Vec::new();
         let mut push_bind = |src: &Path, abs: &str| -> io::Result<()> {
@@ -141,14 +197,17 @@ impl MountPlan {
             seen.push(abs.to_string());
             Ok(())
         };
-        for dir in SYSTEM_DIRS {
-            let p = Path::new(dir);
-            if p.exists() {
-                push_bind(p, dir)?;
+        if rootfs.is_none() {
+            for dir in SYSTEM_DIRS {
+                let p = Path::new(dir);
+                if p.exists() {
+                    push_bind(p, dir)?;
+                }
             }
         }
-        // Run the caller runtimes last so they can shadow a system path if a
-        // deployment deliberately supplies its own tree at the same path.
+        // Run the caller runtimes last so they can shadow a system path (or
+        // a rootfs path) if a deployment deliberately supplies its own tree
+        // at the same path.
         for rt in runtimes {
             let abs = rt.to_str().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 runtime path")
@@ -170,37 +229,53 @@ impl MountPlan {
             push_bind(rt, abs)?;
         }
 
-        // Executable injection: the contract says `executable` is a host
-        // path. If that path is already visible through a directory bind it
-        // is exec'd as-is; otherwise it is bind-mounted (read-only) at
-        // `/cwd/.river/<name>` and executed from there.
-        if executable.is_absolute() && !executable.exists() {
-            return Err(io::Error::from_raw_os_error(libc::ENOENT));
-        }
-        let visible =
-            !executable.is_absolute() || seen.iter().any(|abs| executable.starts_with(abs));
-        let (file_binds, exec_path) = if visible {
+        // Executable coordinate systems: without a rootfs the contract says
+        // `executable` is a host path — if it is not visible through a
+        // directory bind it is bind-mounted (read-only) at `/cwd/.river/<name>`
+        // and exec'd from there. With a rootfs, `executable` is a path inside
+        // the rootfs (e.g. `/usr/bin/python3`) and is exec'd as-is; a missing
+        // binary surfaces as the exec failure (ENOENT → run error), and no
+        // host injection is attempted.
+        let (file_binds, exec_path) = if rootfs.is_some() {
+            if !executable.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "executable must be an absolute path inside the rootfs: {}",
+                        executable.display()
+                    ),
+                ));
+            }
             (Vec::new(), cstr(executable)?)
         } else {
-            let name = executable
-                .file_name()
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
-            let sandbox = format!(
-                "/cwd/.river/{}",
-                name.to_str().ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 executable name")
-                })?
-            );
-            let host_dst = format!("{}{}", root.to_str().unwrap(), sandbox);
-            let dir = format!("{}{}", root.to_str().unwrap(), "/cwd/.river");
-            (
-                vec![(
-                    cstr(executable)?,
-                    CString::new(dir).unwrap(),
-                    CString::new(host_dst).unwrap(),
-                )],
-                CString::new(sandbox).unwrap(),
-            )
+            if executable.is_absolute() && !executable.exists() {
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            let visible =
+                !executable.is_absolute() || seen.iter().any(|abs| executable.starts_with(abs));
+            if visible {
+                (Vec::new(), cstr(executable)?)
+            } else {
+                let name = executable
+                    .file_name()
+                    .ok_or_else(|| io::Error::from_raw_os_error(libc::ENOENT))?;
+                let sandbox = format!(
+                    "/cwd/.river/{}",
+                    name.to_str().ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "non-UTF8 executable name")
+                    })?
+                );
+                let host_dst = format!("{}{}", root.to_str().unwrap(), sandbox);
+                let dir = format!("{}{}", root.to_str().unwrap(), "/cwd/.river");
+                (
+                    vec![(
+                        cstr(executable)?,
+                        CString::new(dir).unwrap(),
+                        CString::new(host_dst).unwrap(),
+                    )],
+                    CString::new(sandbox).unwrap(),
+                )
+            }
         };
 
         let preferred = match cwd_rel {
@@ -214,6 +289,7 @@ impl MountPlan {
             dev_dir,
             cwd_dir,
             workdir: workdir_c,
+            rootfs_overlay,
             binds,
             file_binds,
             exec_path,
@@ -231,6 +307,7 @@ pub(crate) fn spawn(
     executable: &Path,
     args: &[String],
     workdir: &Path,
+    rootfs: Option<&Path>,
     runtimes: &[PathBuf],
     cwd_rel: Option<&str>,
     env_vars: &[(String, String)],
@@ -239,7 +316,7 @@ pub(crate) fn spawn(
     seccomp: Option<&crate::backend::linux::seccomp::Program>,
     stdio: &mut StdioSet,
 ) -> io::Result<Child> {
-    let plan = MountPlan::build(workdir, runtimes, executable, cwd_rel)?;
+    let plan = MountPlan::build(workdir, rootfs, runtimes, executable, cwd_rel)?;
 
     // argv[0] is the path the program is actually exec'd from (the injected
     // `/cwd/.river/<name>` when the host path was not visible).
@@ -518,6 +595,59 @@ unsafe fn supervise(
     if err != 0 {
         fail(3, err);
     }
+
+    // ---- caller rootfs (overlayfs, read-only) ---------------------------
+    // With `rootfs=` the overlay is mounted at the tmpfs root: lower = the
+    // host rootfs (never written), upper = per-run tmpfs. The mountpoint
+    // directories the layout needs (`/cwd`, `/proc`, `/dev`, `/.oldroot`,
+    // runtime bind targets) are created *now* — they land in the upper
+    // layer — and then the overlay is remounted read-only so the program
+    // sees a frozen rootfs. Without a rootfs this block is skipped and the
+    // system dirs are bind-mounted below instead.
+    if let Some(options) = &plan.rootfs_overlay {
+        if libc::mount(
+            c"overlay".as_ptr(),
+            plan.root.as_ptr(),
+            c"overlay".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            options.as_ptr().cast(),
+        ) != 0
+        {
+            fail(3, errno());
+        }
+        for dir in [&plan.cwd_dir, &plan.proc_dir, &plan.dev_dir, &plan.oldroot] {
+            let err = mount::mkdir_p(dir);
+            if err != 0 {
+                fail(3, err);
+            }
+        }
+        for (_, dst) in &plan.binds {
+            let err = mount::mkdir_p(dst);
+            if err != 0 {
+                fail(3, err);
+            }
+        }
+        for (_, dir, _) in &plan.file_binds {
+            let err = mount::mkdir_p(dir);
+            if err != 0 {
+                fail(3, err);
+            }
+        }
+        // Freeze the rootfs view: read-only, no suid, no devices. The
+        // writable surface stays `/cwd` (bind-mounted below, on top of the
+        // read-only overlay) — same model as the tmpfs root.
+        if libc::mount(
+            std::ptr::null(),
+            plan.root.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+            std::ptr::null(),
+        ) != 0
+        {
+            fail(3, errno());
+        }
+    }
+
     let err = mount::mkdir_p(&plan.cwd_dir);
     if err != 0 {
         fail(3, err);
@@ -751,6 +881,7 @@ mod tests {
             Path::new("/nonexistent/river-probe-xyz"),
             &[],
             workdir.path(),
+            None,
             &[],
             None,
             &env(),
@@ -778,6 +909,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c".to_string(), "exit 0".to_string()],
             workdir.path(),
+            None,
             &[],
             None,
             &env(),
@@ -798,6 +930,40 @@ mod tests {
         assert_eq!(libc::WEXITSTATUS(status), 0);
     }
 
+    /// With a rootfs, `executable` is a sandbox-internal path: an empty
+    /// rootfs therefore makes `/bin/sh` an exec failure (ENOENT through the
+    /// ready protocol), *not* a host-path injection. Requires root
+    /// (namespaces + overlayfs) like the other spawn tests.
+    #[test]
+    fn rootfs_exec_uses_rootfs_coordinates() {
+        let mut stdio = set();
+        let workdir = crate::backend::linux::workdir::WorkDir::create().unwrap();
+        let rootfs_dir =
+            std::env::temp_dir().join(format!("river-rootfs-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&rootfs_dir).unwrap();
+        let err = spawn(
+            Path::new("/bin/sh"),
+            &["-c".to_string(), "exit 0".to_string()],
+            workdir.path(),
+            Some(&rootfs_dir),
+            &[],
+            None,
+            &env(),
+            None,
+            ChildLimits {
+                fsize_bytes: 64 << 20,
+                nofile: 1024,
+                cpu_secs: None,
+            },
+            None,
+            &mut stdio,
+        )
+        .err()
+        .expect("an empty rootfs cannot provide /bin/sh");
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+        let _ = std::fs::remove_dir(&rootfs_dir);
+    }
+
     /// A nonzero exit propagates through the supervisor (the exit path).
     #[test]
     fn nonzero_exit_propagates() {
@@ -807,6 +973,7 @@ mod tests {
             Path::new("/bin/sh"),
             &["-c".to_string(), "exit 3".to_string()],
             workdir.path(),
+            None,
             &[],
             None,
             &env(),

@@ -20,7 +20,7 @@ river 是一个沙箱库（Python 扩展，Rust 实现），用于在受限环�
 | 能力 | Linux | macOS | Windows |
 |---|---|---|---|
 | 状态 | ✅ 已实现 | 未实现 | ✅ 已实现 |
-| `rootfs` | 未实现（传入即 `ValueError`） | 未实现 | ❌ 不支持（传入即 `ValueError`） |
+| `rootfs` | ✅ 已实现（只读替换沙箱根） | 未实现 | ❌ 不支持（传入即 `ValueError`） |
 | `runtimes` 实现 | 只读 bind mount（+ 系统目录只读） | 只读 profile 扩展 | AppContainer + 只读 ACL |
 | 网络隔离 | namespace（空 netns） | profile | AppContainer 无 capability 即断网 |
 | 资源限制 | cgroup v2（memory/pids） | — | Job Object |
@@ -29,10 +29,17 @@ Windows 不支持 `rootfs`：Windows 进程永远从真实 `System32` 加载系�
 "另一份操作系统"的语义不成立（除非容器/虚拟化，明确排除）。运行时环境
 （Python、JDK 等）通过 `runtimes` 授权直读 + `env` 注入 PATH 组合出来。
 
-Linux 的对应取舍：动态链接器/libc/shell 是任何程序启动的前提，因此
-`/usr /lib /lib64 /bin /sbin /etc` 始终以只读方式并入沙箱——这是
-"System32 永远可读"规则的 Linux 对应物；`runtimes` 在此基础上提供运行时
-目录。机制细节见 [docs/linux-backend.md](docs/linux-backend.md)。
+Linux 的两种文件系统模式（机制细节见
+[docs/linux-backend.md](docs/linux-backend.md)）：
+
+- **默认模式**：动态链接器/libc/shell 是任何程序启动的前提，因此
+  `/usr /lib /lib64 /bin /sbin /etc` 始终以只读方式并入沙箱——这是
+  "System32 永远可读"规则的 Linux 对应物；`runtimes` 在此基础上提供运行时
+  目录；`executable` 是宿主路径（不可见时注入到 `/cwd/.river/<name>`）。
+- **rootfs 模式**：调用方提供自包含根树，以 overlayfs 只读替换沙箱根
+  （宿主树是 lower 层，零写入；挂载点目录落在 per-run upper 层），
+  `runtimes` 只读叠加；`executable` 坐标系变为 **rootfs 内路径**。
+  唯一可写处仍是 `/cwd`。
 
 ## 2. API 契约
 
@@ -58,7 +65,8 @@ river.capabilities()
 river.Sandbox(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)
 ```
 
-- `rootfs` —— Windows 传入抛 `ValueError`
+- `rootfs` —— Linux 专属：只读替换沙箱根的自包含根树（宿主绝对路径，
+  非 `/`）；Windows/macOS 传入抛 `ValueError`
 - `runtimes` —— 只读运行时目录
 - `max_wall_secs` / `max_processes` —— 收紧（不可禁用）内部安全上限；
   默认 24h 墙钟 / 64 存活进程。"不设限"只是调用方语义，机制永远存在。

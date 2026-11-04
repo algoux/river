@@ -27,7 +27,7 @@ def main() -> int:
     caps = river.capabilities()
     print("capabilities:", caps)
     assert caps["platform"] == "linux", caps
-    assert caps["rootfs"] is False, "rootfs is not implemented"
+    assert caps["rootfs"] is True, "rootfs is supported on Linux"
 
     facts = river.doctor()
     print("doctor:", {k: facts[k] for k in facts if k != "controllers"})
@@ -92,6 +92,17 @@ def main() -> int:
         print("root listing:", sorted(names))
         assert {"cwd", "proc", "dev"} <= names, names
         assert "tmp" not in names, names  # host /tmp is never mounted
+
+    # rootfs: a caller-supplied root tree replaces the sandbox root. Here we
+    # smoke-test with a minimal tree (an empty rootfs must make exec fail,
+    # proving `executable` is resolved inside the rootfs, not on the host).
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as empty_root:
+        with river.Sandbox(rootfs=empty_root) as sb:
+            r = sb.run("/bin/sh", ["-c", "echo hi"])
+            print("empty rootfs exec:", r)
+            assert r.status == "SE", r  # /bin/sh does not exist in the rootfs
 
     print("linux smoke: OK")
     return 0

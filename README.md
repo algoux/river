@@ -28,8 +28,9 @@ uv run ./examples/example.py
 Both backends share the same frozen contract (`tests/test_conformance.py` runs
 unchanged on both); platform-specific probes live in `tests/test_attack.py`
 (Windows) and `tests/test_attack_linux.py` / `tests/test_cleanup_linux.py`
-(Linux). `rootfs` is not implemented, so `capabilities()["rootfs"]` is
-`false`.
+(Linux). `rootfs` is supported on Linux (read-only overlayfs root
+replacement) and rejected on Windows; `capabilities()["rootfs"]` reflects
+this.
 
 ## Windows capability matrix
 
@@ -110,6 +111,15 @@ Executables that live outside every mounted runtime/system directory are
 bind-mounted read-only into the sandbox at `/cwd/.river/<name>` and executed
 from there, so `executable` really is a host path.
 
+**`rootfs` mode** (`Sandbox(rootfs=<host dir>)`): the sandbox root is replaced
+by a caller-supplied, self-contained root tree — mounted read-only via
+overlayfs (the host tree is the lower layer and is never written, not even
+mountpoint directories), with `runtimes` layered on top and `/cwd` the only
+writable place. The host system directories are *not* merged in, and
+`executable` becomes a path **inside the rootfs** (e.g. `/usr/bin/python3`).
+Requires overlayfs (universal on kernels ≥ 5.9); rootfs paths must not
+contain `,` or `:`.
+
 ### Startup check
 
 `Sandbox(...)` fails closed when a mechanism is missing (no cgroups v2, no
@@ -118,10 +128,12 @@ returns the same facts for deployment diagnosis.
 
 ### Known limitations
 
-- `rootfs` is not implemented: `capabilities()["rootfs"]` is false and
-  passing `rootfs=` raises `ValueError`.
+- With `rootfs=` the caller's tree must be self-contained (dynamic loader,
+  libc, shell); nothing from the host is merged in. `executable` is resolved
+  inside the rootfs, and rootfs paths containing `,`/`:` are rejected.
 - Requires cgroups v2 (`/sys/fs/cgroup`) and Linux 5.9+ (`close_range`);
-  `memory.peak`/`memory.swap.max` require 5.19+/5.0+.
+  `memory.peak`/`memory.swap.max` require 5.19+/5.0+. `rootfs=` additionally
+  requires overlayfs.
 - Memory limits are RSS + page cache — reading a large file counts against
   the limit (unlike the Windows commit semantics).
 - `cwd` itself is a host directory: `RLIMIT_FSIZE` bounds a single file, but

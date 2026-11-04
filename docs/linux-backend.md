@@ -22,6 +22,27 @@
 └── usr lib lib64 bin sbin etc 系统目录，bind + ro,nosuid,nodev（见下）
 ```
 
+**rootfs 模式**（`Sandbox(rootfs=...)`）：调用方提供的根树 **整体替换** 上表
+中的"系统目录"层——不再并入任何宿主系统目录，rootfs 必须自包含（动态链接
+器、libc、shell 都在里面）。实现是 **overlayfs**：
+
+```
+mount -t overlay -o lowerdir=<rootfs>,upperdir=<workdir>/upper,workdir=<workdir>/ovl-work <root>
+# 在 merged 视图里 mkdir /cwd /proc /dev /.oldroot 与各 runtime bind 目标
+# （落在 per-run 的 upper tmpfs 层，宿主 rootfs 树零写入）
+mount -o remount,ro,nosuid,nodev <root>     # 冻结 rootfs 视图
+# 之后的 cwd bind（rw）、/dev tmpfs、runtimes ro bind、pivot_root 与默认模式相同
+```
+
+- 宿主 rootfs 是 **只读 lower 层**，永远不会被写入——包括不需要在调用方树里
+  预建 `/cwd`、`/proc` 等挂载点（纯 ro bind 做不到这一点：挂载点必须先存在）。
+- remount ro 后 rootfs 视图冻结；唯一可写处仍是 `/cwd`（bind 在 ro overlay
+  之上）。upper 层随 workdir 每次 run 销毁。
+- `executable` 坐标系变为 **rootfs 内路径**（如 `/usr/bin/python3`），不做宿主
+  注入；rootfs 里不存在即 exec 失败（`SE`）。
+- 构造期校验：绝对路径、存在、非 `/`；路径含 `,` 或 `:` 会被拒绝（它们是
+  overlay options 的分隔符）。
+
 `pivot_root(root, root/.oldroot)` 后 `umount2("/.oldroot", MNT_DETACH)`，
 宿主文件系统完全不可见。
 
@@ -68,11 +89,14 @@
 
 ### 可执行文件注入
 
-`executable` 是宿主路径（契约）。若该路径不在任何已 bind 的目录（系统目录或
-`runtimes`）之下，setup 时把它 **只读 bind 到 `/cwd/.river/<name>`** 并从那里
-exec（`argv[0]` 同步改为沙箱内路径）。无需复制、无需调用方把宿主任意目录塞
-进 `runtimes`。若可执行文件本身已在 bind 覆盖范围内（如 venv 的 python），
-则原路径直接执行。
+默认模式（无 rootfs）：`executable` 是宿主路径（契约）。若该路径不在任何已
+bind 的目录（系统目录或 `runtimes`）之下，setup 时把它 **只读 bind 到
+`/cwd/.river/<name>`** 并从那里 exec（`argv[0]` 同步改为沙箱内路径）。无需
+复制、无需调用方把宿主任意目录塞进 `runtimes`。若可执行文件本身已在 bind
+覆盖范围内（如 venv 的 python），则原路径直接执行。
+
+rootfs 模式：`executable` 是 **rootfs 内路径**，直接 exec、不做宿主注入
+（见 §1 rootfs 模式）。
 
 ### 网络拒绝（无条件）：network namespace
 
@@ -160,7 +184,7 @@ Linux 样本上回归通过（1/8 限额 + 1MB 下限），OOM 事件命中时�
 | 异常终止 exit_code | NTSTATUS (如 0xC0000005) | `128+sig`（如 139/137） |
 | 残余子孙判定 | Job 进程列表 | `cgroup.procs` + 100ms 宽限 |
 | 主进程死后子孙 | Job 强杀 + SE | pid ns init 退出即内核杀光（AC 也可） |
-| rootfs | 不支持 | 未实现（传入即 `ValueError`） |
+| rootfs | 不支持 | 只读 overlayfs 替换沙箱根；executable 为 rootfs 内路径 |
 | 计时抖动 | 较大（5-10% 放宽） | 较小；CPU 超调 ≤10ms |
 | 部署检查 | — | `river.doctor()` + 构造期 fail-closed |
 
@@ -173,4 +197,5 @@ sudo -E uv run pytest        # 打印各判定与证据（root 必需）
 测试必须以 root 运行（unshare/挂载/cgroup 写入需要 `CAP_SYS_ADMIN`）。
 套件分布：`test_functional.py` / `test_conformance.py` 平台无关；
 `test_attack.py` 仅 Windows；`test_attack_linux.py` / `test_cleanup_linux.py`
-仅 Linux。断言纪律同 Windows（去掉机制必须失败）。
+仅 Linux；`test_rootfs_linux.py` 仅 Linux（rootfs 模式）。断言纪律同 Windows
+（去掉机制必须失败）。

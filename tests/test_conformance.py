@@ -321,9 +321,13 @@ def test_invalid_copy_in_keys_raise(sandbox, python_exe):
 def test_rootfs_follows_the_capability_matrix():
     caps = river.capabilities()
     if caps["rootfs"]:
-        pytest.skip("backend supports rootfs; rejection cannot be tested here")
-    with pytest.raises(ValueError):
-        river.Sandbox(rootfs="/tmp/whatever")
+        # Supported (Linux): construction-level validation still refuses
+        # nonsense — the host root itself would expose the whole host.
+        with pytest.raises(ValueError):
+            river.Sandbox(rootfs="/")
+    else:
+        with pytest.raises(ValueError):
+            river.Sandbox(rootfs="/tmp/whatever")
 
 
 def test_with_block_never_suppresses_exceptions():

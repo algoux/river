@@ -30,6 +30,26 @@ const CHILD_FSIZE_BYTES: u64 = 64 * 1024 * 1024;
 /// `RLIMIT_NOFILE` for the sandboxed program.
 const CHILD_NOFILE: u64 = 1024;
 
+/// Constructor-time validation of a caller-supplied rootfs directory: an
+/// absolute host path to an existing directory, and not `/` (binding the
+/// host root would erase the whole isolation model, same rule as
+/// `runtimes=["/"]` in `ns::MountPlan`).
+fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "rootfs must be an absolute host path: {}",
+            path.display()
+        ));
+    }
+    if path == std::path::Path::new("/") {
+        return Err("rootfs \"/\" is refused: it would expose the whole host".to_string());
+    }
+    if !path.is_dir() {
+        return Err(format!("rootfs is not a directory: {}", path.display()));
+    }
+    Ok(())
+}
+
 /// Translate the contract limits into the child-side rlimits.
 fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
     ns::ChildLimits {
@@ -52,8 +72,14 @@ fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
 ///   the program: root-owned, mode 0444, program runs as nobody);
 /// - network access denied unconditionally (empty network namespace).
 ///
-/// `rootfs` (a caller-supplied root tree) is not implemented: passing it raises
-/// `ValueError` for now — check `river.capabilities()`.
+/// `rootfs` (a caller-supplied root tree) replaces the tmpfs root when
+/// given: it is bind-mounted **read-only** (`nosuid,nodev`) and the program
+/// is pivoted into it instead. The host system directories are *not* merged
+/// in — the rootfs must be self-contained (dynamic loader, libc, ...). Each
+/// `runtimes` entry is still layered on top, read-only. `executable` and the
+/// `runtimes` paths are then interpreted in **sandbox coordinates** (paths
+/// inside the rootfs); only `copy_in` values and `*_file` I/O stay host
+/// paths. Check `river.capabilities()`.
 ///
 /// Concurrency: the class is `frozen` — it holds no mutable state (only the
 /// configured `runtimes` and the safety ceilings), and every run keeps all
@@ -80,11 +106,8 @@ impl Sandbox {
         max_wall_secs: Option<u64>,
         max_processes: Option<u32>,
     ) -> PyResult<Self> {
-        if rootfs.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "rootfs is not supported on Linux; use runtimes=[...] to \
-                 expose read-only runtime directories instead (check river.capabilities())",
-            ));
+        if let Some(fs) = &rootfs {
+            validate_rootfs(fs).map_err(pyo3::exceptions::PyValueError::new_err)?;
         }
         // Fail closed: a missing mechanism (cgroups v2, memory.peak,
         // seccomp) must surface here, not as a silent per-run degradation.
@@ -97,7 +120,7 @@ impl Sandbox {
             ceilings.max_processes = n.max(1);
         }
         Ok(Self {
-            rootfs: None,
+            rootfs,
             runtimes: runtimes.unwrap_or_default(),
             ceilings,
         })
@@ -129,8 +152,9 @@ impl Sandbox {
 
     /// Run an untrusted executable inside the sandbox and collect its status.
     ///
-    /// Coordinate systems: `executable` is a host path; `cwd` and `copy_in`
-    /// keys are relative to the per-run private working directory.
+    /// Coordinate systems: without `rootfs`, `executable` is a host path;
+    /// with one, it is a path inside the rootfs. `cwd` and `copy_in` keys
+    /// are relative to the per-run private working directory either way.
     ///
     /// Limits: `None` means no caller-imposed limit (internal safety ceilings
     /// still apply). `wall_time_limit_ms` defaults to `2 * time_limit_ms +
@@ -226,6 +250,7 @@ impl Sandbox {
         let cwd_rel = spec.cwd.clone();
         let env_map = spec.env.clone().unwrap_or_default();
         let runtimes = self.runtimes.clone();
+        let rootfs = self.rootfs.clone();
 
         // Compile (once per process) the seccomp allowlist; a failure must
         // not silently disable the filter.
@@ -282,6 +307,7 @@ impl Sandbox {
                 &exe,
                 &args,
                 workdir.path(),
+                rootfs.as_deref(),
                 &runtimes,
                 cwd_rel.as_deref(),
                 &env_vars,
@@ -372,11 +398,20 @@ impl Sandbox {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "Sandbox(runtimes=[{}], max_wall_secs={}, max_processes={})",
-            self.runtimes.len(),
-            self.ceilings.wall_limit.as_secs(),
-            self.ceilings.max_processes
-        )
+        match &self.rootfs {
+            Some(rootfs) => format!(
+                "Sandbox(rootfs={:?}, runtimes=[{}], max_wall_secs={}, max_processes={})",
+                rootfs.display().to_string(),
+                self.runtimes.len(),
+                self.ceilings.wall_limit.as_secs(),
+                self.ceilings.max_processes
+            ),
+            None => format!(
+                "Sandbox(runtimes=[{}], max_wall_secs={}, max_processes={})",
+                self.runtimes.len(),
+                self.ceilings.wall_limit.as_secs(),
+                self.ceilings.max_processes
+            ),
+        }
     }
 }
