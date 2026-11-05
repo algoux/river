@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use pyo3::prelude::*;
+use pyo3::types::PyBytes;
 
 use super::verdict::Verdict;
 
@@ -48,6 +51,15 @@ pub struct Status {
     /// file-sink safety ceiling was reached and bytes were dropped).
     pub stdout_file_truncated: bool,
     pub stderr_file_truncated: bool,
+    /// Materialized Python `bytes` objects, created on first attribute
+    /// access. Reading `r.stdout` more than once (a very common judge
+    /// pattern) must not copy the sample — up to 64 MiB per channel — on
+    /// every access.
+    ///
+    /// Invariant: `stdout`/`stderr` are populated by the backend *before*
+    /// the object is returned to Python; nothing mutates them afterwards.
+    stdout_py: OnceLock<Py<PyBytes>>,
+    stderr_py: OnceLock<Py<PyBytes>>,
 }
 
 impl Status {
@@ -120,15 +132,18 @@ impl Status {
     }
 
     /// Captured stdout, truncated to `stdout_limit_kb`.
+    ///
+    /// The returned object is cached: repeated reads return the same
+    /// immutable `bytes` (no re-copy of the sample).
     #[getter]
-    fn stdout(&self) -> Vec<u8> {
-        self.stdout.clone()
+    fn stdout(&self, py: Python<'_>) -> Py<PyBytes> {
+        bytes_cached(py, &self.stdout_py, &self.stdout)
     }
 
     /// Captured stderr, truncated to `stderr_limit_kb`.
     #[getter]
-    fn stderr(&self) -> Vec<u8> {
-        self.stderr.clone()
+    fn stderr(&self, py: Python<'_>) -> Py<PyBytes> {
+        bytes_cached(py, &self.stderr_py, &self.stderr)
     }
 
     /// Whether stdout exceeded its limit and bytes were dropped.
@@ -165,5 +180,22 @@ impl Status {
             self.wall_time_used_ms,
             self.memory_used_kb
         )
+    }
+}
+
+/// Return the cached `bytes` object for `data`, creating it on first access.
+/// The `OnceLock` makes repeated attribute reads O(1) (a refcount bump)
+/// instead of re-copying the (up to 64 MiB) sample; concurrent first reads
+/// are safe — both may build a `PyBytes`, one wins the `set` and both
+/// return an equivalent object.
+fn bytes_cached(py: Python<'_>, cache: &OnceLock<Py<PyBytes>>, data: &[u8]) -> Py<PyBytes> {
+    if let Some(cached) = cache.get() {
+        return cached.clone_ref(py);
+    }
+    let fresh = PyBytes::new(py, data).unbind();
+    match cache.set(fresh.clone_ref(py)) {
+        Ok(()) => fresh,
+        // Another thread materialized it first: hand out that object.
+        Err(_) => cache.get().map_or(fresh, |c| c.clone_ref(py)),
     }
 }
