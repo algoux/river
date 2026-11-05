@@ -156,8 +156,10 @@ def doctor() -> dict[str, object]:
 
     Linux also reports `kernel`, `cgroup_root`, `cgroups_v2`, `controllers`,
     `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
-    `seccomp_actions`, `userns_allowed`, `apparmor_userns_restrict` and
-    `workdir_root`. Windows reports `app_container`, `job_object` and
-    `workdir_root`. `Sandbox(...)` runs the same checks and fails closed when
-    `ok` is false.
+    `seccomp_actions`, `pidfd_open`, `userns_allowed`,
+    `apparmor_userns_restrict` and `workdir_root`. `pidfd_open` tells
+    whether the monitor is event-driven (Linux 5.3+); without it every run
+    pays the polling fallback's wakeups. Windows reports `app_container`,
+    `job_object` and `workdir_root`. `Sandbox(...)` runs the same checks
+    and fails closed when `ok` is false.
     """

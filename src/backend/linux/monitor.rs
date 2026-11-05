@@ -71,8 +71,35 @@ pub(crate) fn monitor(
             result
         }
         // Old kernels (no SYS_pidfd_open): the polling loop still enforces
-        // every limit, it just costs wakeups.
-        Err(_) => monitor_polling(pid, wall_limit, overflow, cgroup, cpu_limit_ms),
+        // every limit, it just costs wakeups. `EINVAL` means the kernel
+        // knows the syscall but rejected the flags -- same "not supported
+        // here" situation.
+        //
+        // Every OTHER error (EMFILE/ENFILE: the *judger* ran out of
+        // descriptors) is an infrastructure failure, not a reason to
+        // silently degrade every concurrent run to the 2 ms polling path
+        // (measured: ~458 wakeups/second per run). Report it instead.
+        Err(e) => match e.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => {
+                monitor_polling(pid, wall_limit, overflow, cgroup, cpu_limit_ms)
+            }
+            _ => Err(e),
+        },
+    }
+}
+
+/// Is `pidfd_open` usable on this kernel? Reported by `doctor()` so an
+/// operator can tell whether the judge pays the polling cost.
+pub(crate) fn pidfd_available() -> bool {
+    // A pid always fits a pid_t (the kernel's own pid space is pid_t).
+    let pid = std::process::id() as libc::pid_t;
+    match pidfd_open(pid) {
+        Ok(fd) => {
+            // SAFETY: the fd is ours and no longer used after this point.
+            unsafe { libc::close(fd) };
+            true
+        }
+        Err(_) => false,
     }
 }
 

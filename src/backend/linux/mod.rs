@@ -107,6 +107,10 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
         ),
         ("seccomp", DoctorValue::Bool(seccomp_ok)),
         ("seccomp_actions", DoctorValue::Str(seccomp_actions)),
+        // `pidfd_open` (Linux 5.3+) makes the monitor event-driven; without
+        // it every run pays ~458 wakeups/second in the polling fallback.
+        // Non-blocking diagnostic: the judge works either way.
+        ("pidfd_open", DoctorValue::Bool(monitor::pidfd_available())),
         ("userns_allowed", DoctorValue::Bool(userns_allowed)),
         (
             "apparmor_userns_restrict",

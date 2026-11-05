@@ -47,7 +47,8 @@ fn capabilities(py: Python<'_>) -> PyResult<Py<PyDict>> {
 /// problems), `warnings` (list of non-blocking caveats) and
 /// platform-specific keys (Linux: `kernel`, `cgroup_root`, `cgroups_v2`,
 /// `controllers`, `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
-/// `seccomp_actions`, `userns_allowed`, `workdir_root`; Windows:
+/// `seccomp_actions`, `pidfd_open`, `userns_allowed`,
+/// `apparmor_userns_restrict`, `workdir_root`; Windows:
 /// `app_container`, `job_object`, `workdir_root`).
 ///
 /// `Sandbox(...)` runs the same checks and fails closed when `ok` is false.
