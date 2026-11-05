@@ -33,10 +33,38 @@ pub(crate) enum StdinSource {
 /// Per-channel overflow flags the monitor watches (the Linux counterpart of
 /// the Windows overflow event: set by a reader thread, observed by the
 /// monitor loop).
-#[derive(Default)]
+///
+/// Besides the atomics there is an `eventfd`: a reader that crosses a kill
+/// threshold writes one byte to it, which wakes the monitor's `poll()`
+/// immediately. The atomics remain the source of truth (a run whose
+/// `eventfd` could not be created still works — the monitor then falls back
+/// to its legacy polling loop) and are re-checked on every wake, so a lost
+/// wakeup cannot delay an output kill.
 pub(crate) struct OverflowFlags {
     pub(crate) stdout: AtomicBool,
     pub(crate) stderr: AtomicBool,
+    /// Wakeup channel for the monitor (`None` if `eventfd` is unavailable).
+    event: Option<OwnedFd>,
+}
+
+impl Default for OverflowFlags {
+    fn default() -> Self {
+        OverflowFlags {
+            stdout: AtomicBool::new(false),
+            stderr: AtomicBool::new(false),
+            event: make_eventfd(),
+        }
+    }
+}
+
+fn make_eventfd() -> Option<OwnedFd> {
+    // SAFETY: plain syscall; the fd is owned from here on.
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        None
+    } else {
+        Some(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
 }
 
 impl OverflowFlags {
@@ -44,13 +72,35 @@ impl OverflowFlags {
         self.stdout.load(Ordering::Relaxed) || self.stderr.load(Ordering::Relaxed)
     }
 
-    fn fire(&self, index: usize) {
+    /// File descriptor the monitor can `poll` for overflow wakeups.
+    pub(crate) fn event_fd(&self) -> Option<RawFd> {
+        self.event.as_ref().map(|fd| fd.as_raw_fd())
+    }
+
+    /// Drain the eventfd (it is level-triggered per `read`, not per write).
+    pub(crate) fn drain_event(&self) {
+        if let Some(fd) = &self.event {
+            let mut buf = [0u8; 8];
+            // SAFETY: 8-byte buffer for the eventfd counter; EAGAIN when
+            // already drained is fine (and expected).
+            unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
+        }
+    }
+
+    pub(crate) fn fire(&self, index: usize) {
         let flag = if index == 0 {
             &self.stdout
         } else {
             &self.stderr
         };
         flag.store(true, Ordering::Relaxed);
+        if let Some(fd) = &self.event {
+            let one: u64 = 1;
+            // SAFETY: 8-byte write to the eventfd; a full counter
+            // (EAGAIN) only means a wakeup is already pending, which is
+            // enough — the flag is the source of truth.
+            unsafe { libc::write(fd.as_raw_fd(), (&one as *const u64).cast(), 8) };
+        }
     }
 }
 
@@ -306,7 +356,10 @@ fn drain_channel(
     let mut total: u64 = 0;
     let mut sink_bytes: u64 = 0;
     let mut sink_truncated = false;
-    let mut buf = [0u8; 8192];
+    // 64 KiB: a 1 GiB archive costs ~16k reads instead of ~131k with the
+    // 8 KiB buffer; truncation slices by limit, so the buffer size never
+    // changes the captured byte count.
+    let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {

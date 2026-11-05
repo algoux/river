@@ -139,7 +139,10 @@ fn reader_thread(mut read: File, spec: ReaderSpec) -> Output {
             None
         }
     });
-    let mut buf = [0u8; 8 * 1024];
+    // 64 KiB: a 1 GiB archive costs ~16k reads instead of ~131k with the
+    // 8 KiB buffer; the truncation logic slices by limit, so the buffer
+    // size never changes the captured byte count.
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
         match read.read(&mut buf) {
             Ok(0) => break, // EOF: child closed its end (and exited)
