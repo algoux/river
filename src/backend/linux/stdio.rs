@@ -218,26 +218,34 @@ impl StdioSet {
     /// The feeder takes **ownership** of the stdin write end: wrapping a
     /// borrowed raw fd in a `File` would double-close it when `StdioSet`
     /// drops (the IO-safety abort).
-    pub(crate) fn after_fork(&mut self) {
+    ///
+    /// Thread creation can fail (`EAGAIN`/`ENOMEM` under fd or memory
+    /// pressure). That is an **infrastructure** failure, not a panic: the
+    /// caller must learn about it as an `io::Error` so the run can be
+    /// classified `SE`. Panicking here would abort the *judger* — and on a
+    /// thread that does not hold the GIL (this runs inside `py.detach`), a
+    /// panic terminates the process with SIGSEGV instead of surfacing as a
+    /// `PanicException`.
+    pub(crate) fn after_fork(&mut self) -> io::Result<()> {
         drop(self.stdin_read.take());
         drop(self.stdout_write.take());
         drop(self.stderr_write.take());
         let write_end = self
             .stdin_write
             .take()
-            .expect("stdin write end must exist until after_fork");
-        self.feeder = start_feeder(&self.stdin, write_end);
+            .ok_or_else(|| io::Error::other("stdin write end missing at after_fork"))?;
+        self.feeder = start_feeder(&self.stdin, write_end)?;
         let overflow = Arc::clone(&self.overflow);
         for (index, ch) in std::mem::take(&mut self.channels).into_iter().enumerate() {
             let overflow = Arc::clone(&overflow);
-            self.readers.push(
-                std::thread::Builder::new()
-                    .name(format!("river-stdio-{index}"))
-                    .spawn(move || drain_channel(ch, index, &overflow))
-                    .expect("spawn stdio reader thread"),
-            );
+            let handle = std::thread::Builder::new()
+                .name(format!("river-stdio-{index}"))
+                .spawn(move || drain_channel(ch, index, &overflow))
+                .map_err(|e| io::Error::other(format!("spawn stdio reader thread: {e}")))?;
+            self.readers.push(handle);
         }
         self.readers_started = true;
+        Ok(())
     }
 
     /// Overflow flags shared with the monitor.
@@ -286,43 +294,45 @@ impl StdioSet {
 }
 
 /// Feed stdin from a dedicated thread; the fd is consumed as a `File`.
+///
+/// Thread creation can fail (fd/memory pressure). The error is returned so
+/// the caller can classify the run `SE` instead of panicking the judge (see
+/// [`StdioSet::after_fork`]).
 fn start_feeder(
     source: &StdinSource,
     write_end: OwnedFd,
-) -> Option<std::thread::JoinHandle<io::Result<()>>> {
+) -> io::Result<Option<std::thread::JoinHandle<io::Result<()>>>> {
     let mut writer = File::from(write_end);
     match source {
-        StdinSource::Null => None,
+        StdinSource::Null => Ok(None),
         StdinSource::Bytes(bytes) => {
             let bytes = bytes.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("river-stdin".into())
-                    .spawn(move || {
-                        // BrokenPipe = the child died without reading; not
-                        // an infrastructure failure.
-                        writer.write_all(&bytes).or_else(ignore_epipe)
-                    })
-                    .expect("spawn stdin feeder thread"),
-            )
+            let handle = std::thread::Builder::new()
+                .name("river-stdin".into())
+                .spawn(move || {
+                    // BrokenPipe = the child died without reading; not
+                    // an infrastructure failure.
+                    writer.write_all(&bytes).or_else(ignore_epipe)
+                })
+                .map_err(|e| io::Error::other(format!("spawn stdin feeder thread: {e}")))?;
+            Ok(Some(handle))
         }
         StdinSource::File(path) => {
             let path = path.clone();
-            Some(
-                std::thread::Builder::new()
-                    .name("river-stdin".into())
-                    .spawn(move || {
-                        let mut file = match File::open(&path) {
-                            Ok(f) => f,
-                            Err(e) => return Err(e),
-                        };
-                        // BrokenPipe = the child died without reading.
-                        io::copy(&mut file, &mut writer)
-                            .map(|_| ())
-                            .or_else(ignore_epipe)
-                    })
-                    .expect("spawn stdin feeder thread"),
-            )
+            let handle = std::thread::Builder::new()
+                .name("river-stdin".into())
+                .spawn(move || {
+                    let mut file = match File::open(&path) {
+                        Ok(f) => f,
+                        Err(e) => return Err(e),
+                    };
+                    // BrokenPipe = the child died without reading.
+                    io::copy(&mut file, &mut writer)
+                        .map(|_| ())
+                        .or_else(ignore_epipe)
+                })
+                .map_err(|e| io::Error::other(format!("spawn stdin feeder thread: {e}")))?;
+            Ok(Some(handle))
         }
     }
 }

@@ -221,11 +221,18 @@ impl StdioSet {
             StdinSource::Null => (File::open("NUL")?, None),
             StdinSource::Bytes(bytes) => {
                 let (read, mut write) = make_pipe()?;
-                let feeder = std::thread::spawn(move || {
-                    // Broken pipe is fine: the child may have exited without
-                    // reading all of stdin.
-                    let _ = write.write_all(&bytes);
-                });
+                // `Builder::spawn` returns the failure instead of panicking:
+                // thread creation can fail under fd/memory pressure, and a
+                // panic here would abort the judge (on a GIL-free worker
+                // thread: SIGSEGV instead of a catchable exception).
+                let feeder = std::thread::Builder::new()
+                    .name("river-stdin".into())
+                    .spawn(move || {
+                        // Broken pipe is fine: the child may have exited without
+                        // reading all of stdin.
+                        let _ = write.write_all(&bytes);
+                    })
+                    .map_err(|e| io::Error::other(format!("spawn stdin feeder thread: {e}")))?;
                 (read, Some(feeder))
             }
             StdinSource::File(path) => (File::open(path)?, None),
@@ -253,39 +260,45 @@ impl StdioSet {
 
         let (out_read, child_stdout) = make_pipe()?;
         set_inheritable(&child_stdout)?;
-        let stdout_reader = std::thread::spawn(move || {
-            reader_thread(
-                out_read,
-                ReaderSpec {
-                    limit: stdout_limit,
-                    capture_ceiling: crate::contract::capture_ceiling(
-                        stdout_limit,
-                        ceilings.capture_limit_bytes,
-                    ),
-                    sink_ceiling: ceilings.sink_limit_bytes,
-                    sink: stdout_file,
-                    overflow_event: Some(ev),
-                },
-            )
-        });
+        let stdout_reader = std::thread::Builder::new()
+            .name("river-stdio-0".into())
+            .spawn(move || {
+                reader_thread(
+                    out_read,
+                    ReaderSpec {
+                        limit: stdout_limit,
+                        capture_ceiling: crate::contract::capture_ceiling(
+                            stdout_limit,
+                            ceilings.capture_limit_bytes,
+                        ),
+                        sink_ceiling: ceilings.sink_limit_bytes,
+                        sink: stdout_file,
+                        overflow_event: Some(ev),
+                    },
+                )
+            })
+            .map_err(|e| io::Error::other(format!("spawn stdio reader thread: {e}")))?;
 
         let (err_read, child_stderr) = make_pipe()?;
         set_inheritable(&child_stderr)?;
-        let stderr_reader = std::thread::spawn(move || {
-            reader_thread(
-                err_read,
-                ReaderSpec {
-                    limit: stderr_limit,
-                    capture_ceiling: crate::contract::capture_ceiling(
-                        stderr_limit,
-                        ceilings.capture_limit_bytes,
-                    ),
-                    sink_ceiling: ceilings.sink_limit_bytes,
-                    sink: stderr_file,
-                    overflow_event: Some(ev),
-                },
-            )
-        });
+        let stderr_reader = std::thread::Builder::new()
+            .name("river-stdio-1".into())
+            .spawn(move || {
+                reader_thread(
+                    err_read,
+                    ReaderSpec {
+                        limit: stderr_limit,
+                        capture_ceiling: crate::contract::capture_ceiling(
+                            stderr_limit,
+                            ceilings.capture_limit_bytes,
+                        ),
+                        sink_ceiling: ceilings.sink_limit_bytes,
+                        sink: stderr_file,
+                        overflow_event: Some(ev),
+                    },
+                )
+            })
+            .map_err(|e| io::Error::other(format!("spawn stdio reader thread: {e}")))?;
 
         Ok(Self {
             child_stdin,
