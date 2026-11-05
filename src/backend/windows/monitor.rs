@@ -69,6 +69,16 @@ fn residual_count(job: &Job, main_pid: u32) -> io::Result<u32> {
 /// the Linux `cpu.stat` poll).
 const CPU_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Relaxed CPU poll interval used while the measured usage is well below the
+/// limit (< 80%): a long CPU-limited run then costs ~5x fewer accounting
+/// syscalls, while the final approach still runs at
+/// [`CPU_POLL_INTERVAL`] so the kill overshoot bound is unchanged.
+const CPU_POLL_INTERVAL_SLOW: Duration = Duration::from_millis(50);
+
+/// Usage/limit ratio (percent) above which the monitor switches back to the
+/// fast poll interval.
+const CPU_POLL_FAST_ABOVE_PCT: u64 = 80;
+
 /// Retry budget for the post-run residual-process query (see
 /// [`residual_count`]); each retry waits
 /// [`RESIDUAL_RETRY_DELAY`] to let the kernel settle the job list.
@@ -106,6 +116,10 @@ pub(crate) fn monitor(
         handles.push(event);
     }
     let overflow_index = overflow_event.map(|_| 1usize);
+    // Adaptive accounting poll: relaxed while far from the limit, fast near
+    // it (and immediately after start, so a short limit still kills with the
+    // 10 ms bound).
+    let mut cpu_poll = CPU_POLL_INTERVAL;
 
     let kill = loop {
         let elapsed = started.elapsed();
@@ -115,10 +129,11 @@ pub(crate) fn monitor(
             break KillOrigin::WallTimeout;
         }
         let remaining = limit - elapsed;
-        // With a CPU limit, wake up every 10 ms to read the job accounting;
-        // otherwise block until the process/overflow event or the deadline.
+        // With a CPU limit, wake up on the current poll interval to read the
+        // job accounting; otherwise block until the process/overflow event
+        // or the deadline.
         let wait_ms = if cpu_limit_ms.is_some() {
-            limit_ms(&remaining.min(CPU_POLL_INTERVAL))
+            limit_ms(&remaining.min(cpu_poll))
         } else {
             limit_ms(&remaining)
         };
@@ -129,12 +144,20 @@ pub(crate) fn monitor(
         match rc {
             WAIT_OBJECT_0 => break KillOrigin::None,
             WAIT_TIMEOUT => {
-                if let Some(cpu_limit) = cpu_limit_ms
-                    && job.cpu_time_ms()? > cpu_limit
-                {
-                    job.terminate(KILL_EXIT_CODE)?;
-                    wait_forever(handle);
-                    break KillOrigin::CpuLimit;
+                if let Some(cpu_limit) = cpu_limit_ms {
+                    let used = job.cpu_time_ms()?;
+                    if used > cpu_limit {
+                        job.terminate(KILL_EXIT_CODE)?;
+                        wait_forever(handle);
+                        break KillOrigin::CpuLimit;
+                    }
+                    cpu_poll = if used.saturating_mul(100)
+                        < cpu_limit.saturating_mul(CPU_POLL_FAST_ABOVE_PCT)
+                    {
+                        CPU_POLL_INTERVAL_SLOW
+                    } else {
+                        CPU_POLL_INTERVAL
+                    };
                 }
                 continue;
             }
