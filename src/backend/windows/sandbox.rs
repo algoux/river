@@ -197,11 +197,6 @@ impl Sandbox {
         validate(&spec)?;
 
         // --- translate the frozen contract into backend primitives --------
-        let stdin_src = match (&spec.stdin, &spec.stdin_file) {
-            (Some(bytes), _) => StdinSource::Bytes(bytes.clone()),
-            (None, Some(path)) => StdinSource::File(path.clone()),
-            _ => StdinSource::Null,
-        };
         let limits = JobLimits {
             memory_limit_bytes: spec.memory_limit_kb.map(|kb| kb.saturating_mul(1024)),
             max_processes: self.ceilings.max_processes,
@@ -214,29 +209,44 @@ impl Sandbox {
             .unwrap_or(self.ceilings.wall_limit);
         // Effective limits the job enforces (user limit or safety ceiling);
         // the verdict compares measurements against these (contract-layer
-        // evidence).
+        // evidence). Scalars stay outside the closure: they are needed after
+        // it for the evidence, and all are `Copy`.
         let memory_limit_bytes = limits
             .memory_limit_bytes
             .unwrap_or_else(physical_memory_bytes);
         let cpu_time_limit_ms = spec.time_limit_ms;
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
-        let exe = spec.executable.clone();
-        let args = spec.args.clone();
-        let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
-        let copy_in = spec.copy_in.clone();
-        let copy_out = spec.copy_out.clone();
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
-        let cwd_rel = spec.cwd.clone();
-        let env_map = spec.env.clone().unwrap_or_default();
-        let runtimes = self.runtimes.clone();
         let stdio_ceilings = StdioCeilings {
             capture_limit_bytes: self.ceilings.capture_limit_bytes,
             sink_limit_bytes: self.ceilings.file_sink_limit_bytes,
         };
 
-        // Blocking pipeline with the GIL released.
+        // Blocking pipeline with the GIL released. The spec itself moves in:
+        // the large fields (`copy_in` bytes, `copy_out`, args, env) must not
+        // be copied a second time just to cross the closure boundary.
         let result = py.detach(move || -> io::Result<_> {
+            let RunSpec {
+                executable: exe,
+                args,
+                cwd: cwd_rel,
+                env,
+                stdin,
+                stdin_file,
+                copy_in,
+                copy_out,
+                stdout_file,
+                stderr_file,
+                ..
+            } = spec;
+            let stdin_src = match (stdin, stdin_file) {
+                (Some(bytes), _) => StdinSource::Bytes(bytes),
+                (None, Some(path)) => StdinSource::File(path),
+                _ => StdinSource::Null,
+            };
+            let env_map = env.unwrap_or_default();
+            let (stdout_file, stderr_file) = (stdout_file, stderr_file);
             // Per-run working directory: the only writable place the program
             // sees. `WorkDir` removes itself on drop (also on error paths).
             let workdir = WorkDir::create()?;
@@ -263,7 +273,7 @@ impl Sandbox {
             for entry in &provisioned {
                 acl::protect_read_only(&entry.path, sid, entry.is_dir)?;
             }
-            for rt in &runtimes {
+            for rt in &self.runtimes {
                 acl::grant_ro(rt, sid)?;
             }
 

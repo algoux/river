@@ -255,7 +255,13 @@ impl Drop for AttributeList {
 /// what CreateProcessW expects) from `vars`.
 pub(crate) fn env_block(vars: &[(String, String)]) -> Vec<u16> {
     let mut sorted = vars.to_vec();
-    sorted.sort_by_key(|(k, _)| k.to_uppercase());
+    // Case-insensitive order without allocating per key (the old
+    // `to_uppercase()` allocated one String per variable on every run).
+    sorted.sort_unstable_by(|(a, _), (b, _)| {
+        a.bytes()
+            .map(|c| c.to_ascii_lowercase())
+            .cmp(b.bytes().map(|c| c.to_ascii_lowercase()))
+    });
     let mut block = Vec::new();
     for (k, v) in sorted {
         block.extend(k.encode_utf16());

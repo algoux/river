@@ -263,14 +263,11 @@ impl Sandbox {
         validate(&spec)?;
 
         // --- translate the frozen contract into backend primitives --------
-        let stdin_src = match (&spec.stdin, &spec.stdin_file) {
-            (Some(bytes), _) => StdinSource::Bytes(bytes.clone()),
-            (None, Some(path)) => StdinSource::File(path.clone()),
-            _ => StdinSource::Null,
-        };
         // Effective limits the sandbox enforces (user limit or safety
         // fallback); the verdict compares measurements against these
-        // (contract-layer evidence).
+        // (contract-layer evidence). Scalars stay outside the closure (all
+        // `Copy`); the spec itself moves in below, so big `copy_in` inputs
+        // are not cloned a second time.
         let memory_limit_bytes = spec
             .memory_limit_kb
             .map(|kb| kb.saturating_mul(1024))
@@ -284,17 +281,7 @@ impl Sandbox {
             .effective_wall_time_limit_ms()
             .map(Duration::from_millis)
             .unwrap_or(self.ceilings.wall_limit);
-        let exe = spec.executable.clone();
-        let args = spec.args.clone();
-        let (stdout_file, stderr_file) = (spec.stdout_file.clone(), spec.stderr_file.clone());
-        let copy_in = spec.copy_in.clone();
-        let copy_out = spec.copy_out.clone();
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
-        let cwd_rel = spec.cwd.clone();
-        let env_map = spec.env.clone().unwrap_or_default();
-        let runtimes = self.runtimes.clone();
-        let rootfs = self.rootfs.clone();
-
         // Compile (once per process) the seccomp filter set (allowlist +
         // clone3 prefilter); a failure must not silently disable it.
         let seccomp = match seccomp::filters() {
@@ -306,6 +293,25 @@ impl Sandbox {
         // feeder/readers) are created inside this closure, after the fork
         // (fork-safety rule: no threads before the fork).
         let result = py.detach(move || -> io::Result<_> {
+            let RunSpec {
+                executable: exe,
+                args,
+                cwd: cwd_rel,
+                env,
+                stdin,
+                stdin_file,
+                copy_in,
+                copy_out,
+                stdout_file,
+                stderr_file,
+                ..
+            } = spec;
+            let stdin_src = match (stdin, stdin_file) {
+                (Some(bytes), _) => StdinSource::Bytes(bytes),
+                (None, Some(path)) => StdinSource::File(path),
+                _ => StdinSource::Null,
+            };
+            let env_map = env.unwrap_or_default();
             // Per-run working directory: the only writable place the program
             // sees. `WorkDir` removes itself on drop (also on error paths).
             // The program reaches it as `/cwd` inside the sandbox.
@@ -359,8 +365,8 @@ impl Sandbox {
                 &exe,
                 &args,
                 workdir.path(),
-                rootfs.as_deref(),
-                &runtimes,
+                self.rootfs.as_deref(),
+                &self.runtimes,
                 cwd_rel.as_deref(),
                 &env_vars,
                 Some(&procs_c),

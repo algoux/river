@@ -101,6 +101,17 @@ impl Slot {
 
     fn wipe(&self) {
         if let Some(dir) = &self.package {
+            // Cheap empty check first: after a quiet run the package folder
+            // exists but has already been emptied by the next lease's wipe,
+            // and a recursive delete of an empty tree is pure overhead on the
+            // release path (the second of two wipes per run).
+            let empty = match std::fs::read_dir(dir) {
+                Ok(mut entries) => entries.next().is_none(),
+                Err(_) => true, // missing/unreadable: nothing to wipe
+            };
+            if empty {
+                return;
+            }
             // Best effort outside of `acquire` (a stale file must not fail a
             // run that is otherwise healthy); `acquire` reports the error.
             let _ = wipe_dir_contents(dir);
