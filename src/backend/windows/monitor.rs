@@ -61,7 +61,7 @@ fn residual_count(job: &Job, main_pid: u32) -> io::Result<u32> {
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| io::Error::new(io::ErrorKind::Other, "residual query failed")))
+    Err(last_err.unwrap_or_else(|| io::Error::other("residual query failed")))
 }
 
 /// How often the job's CPU accounting is polled while a CPU limit is set.
