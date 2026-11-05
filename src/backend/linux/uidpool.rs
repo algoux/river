@@ -105,7 +105,7 @@ pub(crate) fn facts() -> Vec<(&'static str, crate::backend::DoctorValue)> {
         Ok(r) => {
             out.push(("per_run_uid_base", DoctorValue::Str(r.base.to_string())));
             out.push(("per_run_uid_count", DoctorValue::Str(r.count.to_string())));
-            if let Some(uid) = colliding_system_uid(&r) {
+            if let Some(uid) = colliding_system_uid(r) {
                 out.push(("per_run_uid_collision", DoctorValue::Str(uid.to_string())));
             }
         }
@@ -119,7 +119,7 @@ pub(crate) fn blocking_errors() -> Vec<String> {
     let mut errors = Vec::new();
     match range() {
         Ok(r) => {
-            if let Some(uid) = colliding_system_uid(&r) {
+            if let Some(uid) = colliding_system_uid(r) {
                 errors.push(format!(
                     "per-run uid range [{}, {}) collides with /etc/passwd uid {uid} \
                      (set RIVER_UID_BASE/RIVER_UID_COUNT to a free range)",
@@ -145,7 +145,7 @@ pub(crate) struct UidGuard {
 pub(crate) fn acquire() -> io::Result<UidGuard> {
     let range = range().map_err(io::Error::other)?;
     // First use double-checks the /etc/passwd collision (cheap: one read).
-    if let Some(uid) = colliding_system_uid(&range) {
+    if let Some(uid) = colliding_system_uid(range) {
         return Err(io::Error::other(format!(
             "per-run uid range [{}, {}) collides with /etc/passwd uid {uid}",
             range.base,
