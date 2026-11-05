@@ -87,26 +87,53 @@ impl Drop for Child {
         // Error path in the caller: the monitor never reaped the supervisor,
         // so its process group (the program tree) is still alive and no
         // watchdog will enforce limits any more. Kill it, reap it, then stop
-        // the watchdog. A blocking waitpid is safe after SIGKILL (and returns
-        // ECHILD immediately when the monitor already reaped it).
+        // the watchdog.
         if self.watchdog > 0 {
-            unsafe { libc::kill(-self.pid, libc::SIGKILL) };
-            let mut status = 0;
-            loop {
-                let rc = unsafe { libc::waitpid(self.pid, &mut status, 0) };
-                if rc == self.pid {
-                    break;
-                }
-                if unsafe { errno() } == libc::EINTR {
-                    continue;
-                }
-                break; // ECHILD: already reaped by the monitor
-            }
-            unsafe { libc::kill(self.watchdog, libc::SIGKILL) };
-            let mut wstatus = 0;
-            unsafe { libc::waitpid(self.watchdog, &mut wstatus, 0) };
+            unsafe { abort_spawn(self.pid, self.watchdog) };
             self.watchdog = 0;
         }
+    }
+}
+
+/// Kill the supervisor's process group, reap it, and stop the watchdog.
+///
+/// Shared by **every** error path out of [`spawn`]: the supervisor (and the
+/// program tree it leads) must not outlive a failed spawn, and the watchdog
+/// must not keep polling a run that no longer exists.
+///
+/// Why it matters: an error that skips this leaves the supervisor
+/// unreaped (a zombie that only the judge process' exit would clear) and
+/// the watchdog alive. The program itself does not survive either way — the
+/// pid namespace kills it when the supervisor exits — but the leaked
+/// supervisor and watchdog are real, and they accumulate over a long-lived
+/// judge.
+///
+/// A blocking waitpid is safe after SIGKILL (and returns ECHILD immediately
+/// when the monitor already reaped the child).
+///
+/// # Safety
+/// `supervisor` must be the pid of a child of the calling process (or an
+/// already-reaped one, in which case waitpid reports ECHILD), and
+/// `watchdog` must be a pid of a child of the calling process or <= 0.
+unsafe fn abort_spawn(supervisor: libc::pid_t, watchdog: libc::pid_t) {
+    // The supervisor leads its own process group: kill(-pgid) takes the
+    // whole program tree with it.
+    libc::kill(-supervisor, libc::SIGKILL);
+    let mut status = 0;
+    loop {
+        let rc = libc::waitpid(supervisor, &mut status, 0);
+        if rc == supervisor {
+            break;
+        }
+        if errno() == libc::EINTR {
+            continue;
+        }
+        break; // ECHILD: already reaped by the monitor
+    }
+    if watchdog > 0 {
+        libc::kill(watchdog, libc::SIGKILL);
+        let mut wstatus = 0;
+        libc::waitpid(watchdog, &mut wstatus, 0);
     }
 }
 
@@ -489,6 +516,10 @@ impl MountPlan {
 ///
 /// `env_vars` is the complete environment (whitelist base + caller
 /// overrides — no host environment leaks through).
+// The parameters are the complete spawn input (paths, argv, env, limits,
+// stdio, seccomp); grouping them would only move the list one level down,
+// and this is called from exactly one place.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     executable: &Path,
     args: &[String],
@@ -553,11 +584,8 @@ pub(crate) fn spawn(
     let watchdog = unsafe { libc::fork() };
     if watchdog < 0 {
         let err = io::Error::last_os_error();
-        unsafe {
-            libc::kill(fork_rc, libc::SIGKILL);
-            let mut st = 0;
-            libc::waitpid(fork_rc, &mut st, 0);
-        }
+        // No watchdog yet, so it is killed with the supervisor's group only.
+        unsafe { abort_spawn(fork_rc, -1) };
         return Err(err);
     }
     if watchdog == 0 {
@@ -565,13 +593,26 @@ pub(crate) fn spawn(
     }
 
     // ---- parent ---------------------------------------------------------
-    stdio.after_fork();
+    // Starting the stdio threads can fail (fd/memory pressure). The error
+    // must abort the spawn like any other: the supervisor is already
+    // running, so leaving it behind would leak it unreaped and keep the
+    // watchdog polling a run that will never be monitored.
+    if let Err(e) = stdio.after_fork() {
+        unsafe { abort_spawn(fork_rc, watchdog) };
+        return Err(e);
+    }
     // Confirm setup + exec: "ok\n" = both succeeded; any other bytes are the
     // failing errno (setup failure in A, or exec failure in B).
     drop(ready_write);
     let mut reader = unsafe { std::fs::File::from_raw_fd(ready_read.into_raw_fd()) };
     let mut report = Vec::new();
-    reader.read_to_end(&mut report)?;
+    if let Err(e) = reader.read_to_end(&mut report) {
+        // The `?` would skip the teardown below: the supervisor would stay
+        // unreaped (a zombie) and the watchdog would keep polling. Abort
+        // explicitly.
+        unsafe { abort_spawn(fork_rc, watchdog) };
+        return Err(e);
+    }
     drop(reader);
     if !report.starts_with(b"ok\n") || report.len() > 3 {
         let code = if report.starts_with(b"ok\n") {
@@ -582,11 +623,7 @@ pub(crate) fn spawn(
             String::from_utf8_lossy(&report).trim().parse::<i32>()
         }
         .unwrap_or(libc::EIO);
-        let mut status = 0;
-        unsafe { libc::waitpid(fork_rc, &mut status, 0) };
-        // Stop the watchdog; it would kill whatever the supervisor left.
-        unsafe { libc::kill(watchdog, libc::SIGKILL) };
-        unsafe { libc::waitpid(watchdog, &mut status, 0) };
+        unsafe { abort_spawn(fork_rc, watchdog) };
         return Err(io::Error::from_raw_os_error(code));
     }
 
@@ -701,6 +738,9 @@ unsafe fn apply_rlimits(limits: &ChildLimits) -> libc::c_int {
 /// # Fork safety
 /// Raw libc calls only: no allocation, no std I/O, no panic paths. All
 /// paths and pointer arrays are pre-built by the parent.
+// The limits/seccomp/stdio inputs must cross the fork as plain values, so
+// they stay separate parameters rather than a heap-allocated struct.
+#[allow(clippy::too_many_arguments)]
 unsafe fn supervise(
     plan: &MountPlan,
     stdio_fds: (libc::c_int, libc::c_int, libc::c_int),
@@ -761,10 +801,15 @@ unsafe fn supervise(
             }
         }
         let wrote = libc::write(fd, buf[n..].as_ptr().cast(), buf.len() - n);
-        libc::close(fd);
         if wrote != (buf.len() - n) as isize {
-            fail(3, errno());
+            // Capture the errno *before* close(): close() is a syscall and
+            // the kernel is free to touch the thread's errno region, which
+            // would report the wrong cause.
+            let err = errno();
+            libc::close(fd);
+            fail(3, err);
         }
+        libc::close(fd);
     }
 
     // ---- namespaces -----------------------------------------------------
@@ -860,15 +905,11 @@ unsafe fn supervise(
     if err != 0 {
         fail(3, err);
     }
-    if libc::mount(
-        plan.workdir.as_ptr(),
-        plan.cwd_dir.as_ptr(),
-        std::ptr::null(),
-        libc::MS_BIND | libc::MS_REC,
-        std::ptr::null(),
-    ) != 0
-    {
-        fail(3, errno());
+    // The cwd is the only writable bind; it still must not honour setuid
+    // bits or device nodes, like every other bind (see `mount::bind_ro`).
+    let err = mount::bind_rw_nosuid(&plan.workdir, &plan.cwd_dir);
+    if err != 0 {
+        fail(3, err);
     }
     if mount::mkdir_p(&plan.proc_dir) != 0 || mount::mkdir_p(&plan.dev_dir) != 0 {
         fail(3, errno());
@@ -982,10 +1023,10 @@ unsafe fn supervise(
         if rlimit_err != 0 {
             fail(3, rlimit_err);
         }
-        if let Some(prog) = seccomp {
-            if crate::backend::linux::seccomp::apply(prog) != 0 {
-                fail(3, errno());
-            }
+        if let Some(prog) = seccomp
+            && crate::backend::linux::seccomp::apply(prog) != 0
+        {
+            fail(3, errno());
         }
         if libc::chdir(plan.cwd_preferred.as_ptr()) != 0
             && libc::chdir(plan.cwd_fallback.as_ptr()) != 0

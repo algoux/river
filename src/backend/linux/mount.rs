@@ -120,6 +120,41 @@ pub(crate) unsafe fn bind_ro(src: &CStr, dst: &CStr) -> libc::c_int {
     errno_or_zero(rc)
 }
 
+/// Bind-mount `src` onto `dst` **writable**, with `nosuid,nodev`.
+///
+/// The writable counterpart of [`bind_ro`]: the per-run working directory is
+/// the one bind the program may write, but a setuid binary dropped there
+/// must never gain privileges, and no device node may appear on it. Today
+/// `no_new_privs` already blocks the setuid path and `mknod` is denied by
+/// seccomp, so this is defence in depth — but it must not be the *only*
+/// mount without the restrictions, because that would make the guarantee
+/// depend on `no_new_privs` staying set forever.
+///
+/// The flags are applied with a `MS_REMOUNT` pass (not on the initial
+/// `MS_BIND`) because a bind mount ignores most flags: only a remount
+/// updates the existing mount's `mnt_flags`.
+pub(crate) unsafe fn bind_rw_nosuid(src: &CStr, dst: &CStr) -> libc::c_int {
+    let rc = libc::mount(
+        src.as_ptr(),
+        dst.as_ptr(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REC,
+        std::ptr::null(),
+    );
+    if rc != 0 {
+        return *libc::__errno_location();
+    }
+    // No MS_RDONLY: the cwd stays writable.
+    let rc = libc::mount(
+        std::ptr::null(),
+        dst.as_ptr(),
+        std::ptr::null(),
+        libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+        std::ptr::null(),
+    );
+    errno_or_zero(rc)
+}
+
 /// Create a device node inside the sandbox dev tmpfs.
 pub(crate) unsafe fn make_device(
     dir: &CStr,
