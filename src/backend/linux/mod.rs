@@ -10,6 +10,7 @@ pub mod ns;
 pub mod sandbox;
 pub mod seccomp;
 pub mod stdio;
+pub mod uidpool;
 pub mod workdir;
 
 use crate::backend::{Capabilities, DoctorValue};
@@ -117,8 +118,10 @@ pub(crate) fn facts() -> Vec<(&'static str, DoctorValue)> {
             DoctorValue::Str(std::env::temp_dir().display().to_string()),
         ),
     ];
+    errors.extend(uidpool::blocking_errors());
     out.push(("ok", DoctorValue::Bool(errors.is_empty())));
-    out.push(("errors", DoctorValue::List(errors)));
+    out.push(("errors", DoctorValue::List(errors.clone())));
+    out.extend(uidpool::facts());
     out
 }
 

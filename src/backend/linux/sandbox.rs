@@ -11,6 +11,7 @@ use crate::backend::linux::monitor;
 use crate::backend::linux::ns;
 use crate::backend::linux::seccomp;
 use crate::backend::linux::stdio::{StdinSource, StdioSet};
+use crate::backend::linux::uidpool;
 use crate::backend::linux::workdir::{self, WorkDir};
 use crate::contract::status::Status;
 use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
@@ -60,8 +61,9 @@ fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Translate the contract limits into the child-side rlimits.
-fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
+/// Translate the contract limits and the leased identity into the
+/// child-side limits.
+fn child_limits(cpu_limit_ms: Option<u64>, uid: libc::uid_t, gid: libc::gid_t) -> ns::ChildLimits {
     ns::ChildLimits {
         fsize_bytes: CHILD_FSIZE_BYTES,
         nofile: CHILD_NOFILE,
@@ -69,6 +71,10 @@ fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
         // primary enforcement; this only guarantees the kernel kills a
         // multi-process escape eventually.
         cpu_secs: cpu_limit_ms.map(|ms| (ms + 999) / 1000 + 1),
+        // Per-run leased identity (see `uidpool`): distinct from every other
+        // run and from host accounts.
+        uid,
+        gid,
     }
 }
 
@@ -80,7 +86,7 @@ fn child_limits(cpu_limit_ms: Option<u64>) -> ns::ChildLimits {
 /// - each path in `runtimes` exposed read-only (+execute) via bind mounts;
 /// - `copy_in` files provisioned into the working directory (read-only for
 ///   the program: mode 0440, owned by the sandbox uid, program runs as
-///   nobody);
+///   a per-run leased uid);
 /// - network access denied unconditionally (empty network namespace).
 ///
 /// `rootfs` (a caller-supplied root tree) replaces the tmpfs root when
@@ -310,12 +316,17 @@ impl Sandbox {
             // TMPDIR target: `/cwd/tmp` from the program's point of view.
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
-            // The program is nobody: it must own the cwd root (and only the
-            // `tmp/` subdir) to create files there. `copy_in` entries stay
+            // Lease the per-run identity first: the workdir ownership and
+            // the child's setuid both come from it. The guard lives until
+            // the end of the closure, so the uid stays exclusive for the
+            // whole run (dropped after copy_out, before the workdir).
+            let identity = uidpool::acquire()?;
+            // The program must own the cwd root (and only the `tmp/`
+            // subdir) to create files there. `copy_in` entries stay
             // root-owned 0444/0755 — readable, never modifiable (DESIGN
             // §3.3: an owned 0440 file could be chmod'ed and overwritten).
-            workdir.grant_to(ns::NOBODY_UID, ns::NOBODY_GID)?;
-            WorkDir::grant_dir_to(&tmp_dir, ns::NOBODY_UID, ns::NOBODY_GID)?;
+            workdir.grant_to(identity.uid, identity.gid)?;
+            WorkDir::grant_dir_to(&tmp_dir, identity.uid, identity.gid)?;
 
             // Whitelisted environment, in **sandbox coordinates** (the
             // program never sees host paths). Base + caller overrides.
@@ -353,7 +364,7 @@ impl Sandbox {
                 cwd_rel.as_deref(),
                 &env_vars,
                 Some(&procs_c),
-                child_limits(cpu_time_limit_ms),
+                child_limits(cpu_time_limit_ms, identity.uid, identity.gid),
                 seccomp,
                 &mut set,
             )?;

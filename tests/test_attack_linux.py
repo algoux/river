@@ -8,7 +8,7 @@ Surface under test:
 
   1. the visible filesystem is exactly the private tree (no host dirs)
   2. host files outside the private cwd are invisible
-  3. /etc secrets are unreadable (uid drop to nobody)
+  3. /etc secrets are unreadable (per-run leased uid)
   4. network denial (unconditional): empty namespace -> no connection, no DNS
   5. /proc is a fresh pid namespace (program is PID 1)
   6. mounts are read-only / non-writable for the unprivileged program
@@ -17,8 +17,8 @@ Surface under test:
   9. the program cannot mount / cannot write system dirs
  10. syscalls that need privileges fail (setuid, mknod)
  11. privilege fences: no_new_privs, empty capabilities, nosuid/nodev binds,
-     user-namespace creation denied for `unshare` and `clone(CLONE_NEW*)`
-     (`clone3` remains open for glibc; doctor() warns about it)
+     user-namespace creation denied for `unshare`, `clone(CLONE_NEW*)` and
+     `clone3` (forced to ENOSYS by the stacked prefilter)
  12. host metadata does not leak (hostname, /etc)
  13. limit enforcement: active CPU kill, OOM-killed flag, file-size bound
  14. host executables outside every runtime are bind-injected and run
@@ -568,6 +568,63 @@ def test_clone3_user_namespace_is_denied(sandbox, tmp_path):
     assert "clone3-denied" in out and "errno=38" in out, out
     assert "clone3-CHILD" not in out and "clone3-ALLOWED" not in out, out
     assert "thread-ok" in out, out
+
+
+def test_per_run_uid_isolates_live_runs(sandbox, python_exe, tmp_path):
+    # Every run leases a distinct uid from the pool (RIVER_UID_BASE /
+    # RIVER_UID_COUNT, defaults 100000/64). The old fixed nobody (65534)
+    # identity let any same-uid host process read AND overwrite a live
+    # run's workdir (verified: setpriv --reuid=65534 cat secret.txt).
+    import pathlib
+    import subprocess
+    import tempfile
+    import threading
+    import time
+
+    code = (
+        "import os\n"
+        "open('/cwd/secret.txt', 'w').write('TOKEN')\n"
+        "print('UID', os.getuid(), flush=True)\n"
+        "import time; time.sleep(6)\n"
+    )
+    result = {}
+
+    def target():
+        result["r"] = sandbox.run(python_exe, ["-c", code], wall_time_limit_ms=20000)
+
+    t = threading.Thread(target=target)
+    t.start()
+    time.sleep(2.5)
+    workdirs = [
+        p
+        for p in pathlib.Path(tempfile.gettempdir()).glob("river-*")
+        if (p / "secret.txt").exists()
+    ]
+    assert workdirs, "no live workdir found while a run was active"
+    owner = workdirs[0].stat().st_uid
+    assert owner != 65534, "a live run still uses the shared nobody uid"
+    # Another process running as nobody must not be able to read it.
+    denied = subprocess.run(
+        [
+            "setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "cat",
+            str(workdirs[0] / "secret.txt"),
+        ],
+        capture_output=True,
+    )
+    assert denied.returncode != 0, (
+        f"a nobody process read a live run's workdir: {denied.stdout!r}"
+    )
+    t.join()
+    r = result["r"]
+    assert r.status == "AC", r.stderr[:400]
+    uid = int(r.stdout.split()[1])
+    base = int(os.environ.get("RIVER_UID_BASE", "100000"))
+    count = int(os.environ.get("RIVER_UID_COUNT", "64"))
+    assert base <= uid < base + count, f"run uid {uid} outside the pool range"
 
 
 def test_seccomp_denies_keyctl_and_io_uring(sandbox, python_exe):

@@ -111,7 +111,7 @@ cgroup writes need `CAP_SYS_ADMIN`).
 
 | Capability | Mechanism |
 |---|---|
-| Identity | uid/gid drop to `nobody` + empty capability sets + `no_new_privs` + non-dumpable |
+| Identity | per-run leased uid/gid (`[100000, 100064)` by default) + empty capability sets + `no_new_privs` + non-dumpable |
 | Filesystem | mount namespace + `pivot_root` into a per-run tmpfs; `runtimes` and the system dirs bind-mounted read-only with `nosuid,nodev` |
 | Network | always denied (unconditional): empty network namespace — no interfaces at all (loopback included) |
 | Process namespace | pid / cgroup namespaces: the program is PID 1, host pids and the host cgroup tree are invisible |
@@ -180,13 +180,16 @@ returns the same facts for deployment diagnosis.
 - Children are allowed (bounded by `pids.max`); a program that hands work to
   a child which would outlive it cannot: the pid namespace kills descendants
   when the main process exits.
-- The workdir is 0700 owned by the sandbox uid; `copy_in` entries are
+- The workdir is 0700 owned by the run's leased uid; `copy_in` entries are
   root-owned 0444/0755, so the program can read but never chmod or overwrite
   them. The program still owns the workdir root, so it can delete/rename an
-  entry in its own cwd (content cannot be changed). Unrelated host processes
-  are locked out, but another process running as the *same* uid (`nobody`)
-  shares the workdir's owner rights — per-run uids would be needed for full
-  cross-run isolation.
+  entry in its own cwd (content cannot be changed). Each run leases an
+  exclusive uid from a fixed high range (`RIVER_UID_BASE`/`RIVER_UID_COUNT`,
+  default `[100000, 100064)`), so **other runs and unrelated host processes
+  are locked out** — the old fixed `nobody` identity let any same-uid host
+  process read *and overwrite* a live run's workdir (verified). The pool
+  blocks when exhausted, like the Windows slot pool; `doctor()` fails
+  construction if the range collides with an account in `/etc/passwd`.
 
 ## Testing
 

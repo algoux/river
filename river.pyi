@@ -66,7 +66,7 @@ class Sandbox:
     supported on Windows (processes always resolve system DLLs from the real
     `System32`) or macOS.
 
-    Linux specifics: the process runs as `nobody` inside mount/pid/net/ipc/
+    Linux specifics: the process runs as a per-run leased uid inside mount/pid/net/ipc/
     uts/cgroup namespaces under a seccomp allowlist with `no_new_privs`;
     network access is always denied (empty network namespace). Without
     `rootfs`, `executable` is a host path — if it is not already visible
@@ -132,11 +132,15 @@ def capabilities() -> _Capabilities:
     - `default_max_processes`: default live-process cap per run
     - `internal_wall_limit_secs`: safety wall-clock ceiling for
       caller-unlimited runs
+    - `max_concurrent_runs`: hard ceiling on simultaneously running `run()`
+      calls per session (`4294967295` = no fixed ceiling; Windows reports
+      its AppContainer profile slot pool size, Linux is unbounded)
 
     Network access is denied unconditionally on every platform, and a
     `Sandbox` may always be used from several threads concurrently (it is
     frozen; every run keeps its state in locals) — neither is a capability
-    key.
+    key. Concurrency is *capped* on Windows by the slot pool (runs beyond
+    the cap block until a slot frees).
     """
 
 

@@ -6,11 +6,11 @@
 //! `WorkDir` guard).
 //!
 //! `copy_in` read-only enforcement: files are
-//! written/copied as root and later chowned to the sandbox uid, mode 0440;
+//! written/copied as root and later chowned to the sandbox uid, mode 0444;
 //! the sandboxed program can read but never write them. Directories are
 //! chowned to the sandbox uid and mode 0700, so an unrelated host process
 //! (and another uid) cannot traverse the tree by path. Residual exposure:
-//! other processes running as the *same* uid (nobody) still share owner
+//! other processes running as the *same* uid still share owner
 //! rights — true per-run isolation needs a distinct uid, which this backend
 //! does not allocate (documented limitation).
 //!
@@ -298,7 +298,7 @@ fn make_read_only(path: &Path) -> io::Result<()> {
 }
 
 /// Create the workdir mode 0700: before the run starts nothing on the host
-/// (not even another `nobody` process) can read the provisioned inputs.
+/// (not even another run) can read the provisioned inputs.
 fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(path)
@@ -427,7 +427,7 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"payload");
         assert_eq!(
             fs::metadata(&p).unwrap().permissions().mode() & 0o777,
-            0o440
+            0o444
         );
     }
 
@@ -443,9 +443,12 @@ mod tests {
         );
     }
 
-    /// `grant_to` hands the whole tree to the sandbox uid: directories 0700,
-    /// `copy_in` files 0440 (readable, never writable) and `.owner` left
-    /// root-owned for the stale sweep. Needs root (chown).
+    /// `grant_to` hands the workdir root to the sandbox uid: directories
+    /// 0700; `copy_in` files keep their **root** owner and mode 0444 (root
+    /// ownership is what makes them unmodifiable — an owned file could be
+    /// chmod'ed by its owner, which is why the tree is no longer chowned
+    /// recursively); `.owner` stays root-owned for the stale sweep. Needs
+    /// root (chown).
     #[test]
     fn grant_to_makes_the_tree_private_to_the_sandbox_uid() {
         use std::os::unix::fs::PermissionsExt;
@@ -462,8 +465,9 @@ mod tests {
         assert_eq!(std::os::unix::fs::MetadataExt::uid(&root_md), 65534);
 
         let file_md = fs::metadata(workdir.path().join("run.sh")).unwrap();
-        assert_eq!(file_md.permissions().mode() & 0o777, 0o440);
-        assert_eq!(std::os::unix::fs::MetadataExt::uid(&file_md), 65534);
+        assert_eq!(file_md.permissions().mode() & 0o777, 0o444);
+        // Root-owned on purpose: only a non-owner is denied chmod.
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&file_md), 0);
 
         let owner_md = fs::metadata(workdir.path().join(".owner")).unwrap();
         assert_eq!(std::os::unix::fs::MetadataExt::uid(&owner_md), 0);

@@ -57,13 +57,22 @@ mount -o remount,ro,nosuid,nodev <root>     # 冻结 rootfs 视图
 **系统目录为什么总是只读并入**：动态链接器、libc、shell 是任何二进制启动的
 前提。这是 Windows 后端"System32 永远可读"规则的 Linux 对应物（DESIGN §4）。
 
-**copy_in 只读（内容不可改）**：文件 root 属主 + mode 0444，程序以 nobody(65534)
-运行。只有 **workdir 根与 `tmp/`** chown 给 nobody（否则程序连文件都建不了）；
-`copy_in` 目录保持 root 属主 0755——可读、可进入、不可写。属主才能 `chmod`，
-因此程序既不能改写输入也不能清掉写保护（旧实现把整棵树 chown 给 nobody，属主
-chmod 后即可改写，已修）。程序仍拥有 cwd 根，所以可以删除/重命名自己 cwd 里的
-条目：内容不变、无外泄，语义上接受。`copy_in` 值为宿主机目录时递归投放（常规
-文件与子目录；符号链接跳过）。
+**copy_in 只读（内容不可改）**：文件 root 属主 + mode 0444，程序以 per-run
+leased uid 运行（见下）。只有 **workdir 根与 `tmp/`** chown 给该 uid（否则程序
+连文件都建不了）；`copy_in` 目录保持 root 属主 0755——可读、可进入、不可写。
+属主才能 `chmod`，因此程序既不能改写输入也不能清掉写保护（旧实现把整棵树
+chown 给 nobody，属主 chmod 后即可改写，已修）。程序仍拥有 cwd 根，所以可以
+删除/重命名自己 cwd 里的条目：内容不变、无外泄，语义上接受。`copy_in` 值为
+宿主机目录时递归投放（常规文件与子目录；符号链接跳过）。
+
+**per-run uid 租约**：每个 run 从固定高位 uid 区间独占租一个 uid/gid
+（`RIVER_UID_BASE`/`RIVER_UID_COUNT`，默认 `[100000, 100064)`）。租约是
+`<tmp>/river-uidpool/<uid>` 上的 `flock`：judger 被硬杀时内核自动释放，无需
+清扫。旧实现固定降权到 `nobody(65534)`，任何同 uid 的宿主机进程都能读写活跃
+run 的 workdir（实测 `setpriv --reuid=65534 cat <workdir>/secret.txt` 成功），
+并发 run 之间同样无隔离；租约 uid 关闭了这条横向通道。池耗尽时阻塞（20ms
+轮询），与 Windows slot 池语义一致。`doctor()`/首次租约会检查区间与
+`/etc/passwd` 冲突——冲突是构造期错误（fail closed）。
 
 **copy_out 回收**：运行结束（monitor 返回后、workdir Drop 前）由 root
 judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以植入指向宿主任意
@@ -86,7 +95,7 @@ judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以
 
 所有只读 bind 都带 `nosuid,nodev`（`/dev` 的 tmpfs 只加 `nosuid`，否则设备
 节点不可用）。`/etc`、`/usr` 仍整目录只读并入——`/etc` 的信息暴露面属于已知
-取舍（含 `passwd`/`hosts`/`machine-id`；`shadow` 因 nobody 不可读）。
+取舍（含 `passwd`/`hosts`/`machine-id`；`shadow` 因非 root 不可读）。
 
 ### 系统调用：seccomp allowlist
 
@@ -173,7 +182,7 @@ cgroup 根可用环境变量 `RIVER_CGROUP_ROOT` 指向被委托的层级（默�
 
 ```
 validate(spec)
-  ① workdir：创建 per-run 目录 + copy_in 落盘(0444) + 目录 chown nobody
+  ① workdir：租 per-run uid + 创建目录 + copy_in 落盘(0444) + 目录 chown 该 uid
   ② stdio：3 组管道（stdin/stdout/stderr），CLOEXEC
   ③ cgroup：创建 run 目录，写 memory.max / memory.swap.max=0 / pids.max
   ④ fork A（supervisor）：
@@ -182,7 +191,7 @@ validate(spec)
        → tmpfs 根 + binds(ro,nosuid,nodev) + 可执行文件注入 → pivot_root
        → 写 "ok\n" 到 ready 管道 → fork B → close(3) → wait4(B) → _exit(code)
      fork W（watchdog）：轮询 getppid()，judger 死亡即 kill(-A)
-  ⑤ B：PDEATHSIG → mount /proc → setgroups/setgid/setuid(nobody)
+  ⑤ B：PDEATHSIG → mount /proc → setgroups/setgid/setuid(leased uid)
         → dumpable=0 → no_new_privs=1 → capset 清零 → rlimits → seccomp
         → chdir(/cwd[/rel]) → execvpe
   ⑥ monitor：wait4(A)（rusage 聚合 A+B）+ 2ms 轮询墙钟/OLE 事件

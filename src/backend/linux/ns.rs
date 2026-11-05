@@ -8,7 +8,7 @@
 //!                            │   mounts, pivot_root
 //!                            ├─ report "ok" on the ready pipe
 //!                            └─ fork B, close ready pipe, wait4(B), _exit(code)
-//!                                B: PDEATHSIG, fresh /proc, uid drop to nobody,
+//!                                B: PDEATHSIG, fresh /proc, uid drop to leased uid,
 //!                                   chdir, execvpe
 //! ```
 //!
@@ -46,9 +46,11 @@ use super::stdio::StdioSet;
 const SYSTEM_DIRS: &[&str] = &["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc"];
 
 /// Nobody uid/gid (Debian/Ubuntu convention; also the kernel's overflow
-/// uid). The sandboxed program runs unprivileged even though the judger is
-/// root.
+/// uid). Only the unit tests use it now: real runs lease a per-run identity
+/// from [`super::uidpool`].
+#[cfg(test)]
 pub(crate) const NOBODY_UID: libc::uid_t = 65534;
+#[cfg(test)]
 pub(crate) const NOBODY_GID: libc::gid_t = 65534;
 
 /// A spawned child whose exec has been confirmed by the ready protocol.
@@ -606,7 +608,8 @@ fn ready_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
     }))
 }
 
-/// Per-run resource limits applied by the child just before exec.
+/// Per-run resource limits and identity applied by the child just before
+/// exec. Plain-old-data on purpose: it crosses the fork unchanged.
 #[derive(Clone, Copy)]
 pub(crate) struct ChildLimits {
     /// `RLIMIT_FSIZE`: a single file the program writes cannot exceed this
@@ -617,6 +620,11 @@ pub(crate) struct ChildLimits {
     /// `RLIMIT_CPU` hard backstop (seconds); the judger's CPU polling is the
     /// primary enforcement.
     pub(crate) cpu_secs: Option<u64>,
+    /// Per-run identity (leased from the uid pool): a run must not share a
+    /// uid with another run or a host account (the old fixed `nobody` let
+    /// any same-uid process read/write a live run's workdir — verified).
+    pub(crate) uid: libc::uid_t,
+    pub(crate) gid: libc::gid_t,
 }
 
 /// Zero every capability set (permitted/effective/inheritable). `setuid`
@@ -952,8 +960,8 @@ unsafe fn supervise(
             fail(3, errno());
         }
         if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setgid(NOBODY_GID) != 0
-            || libc::setuid(NOBODY_UID) != 0
+            || libc::setgid(limits.gid) != 0
+            || libc::setuid(limits.uid) != 0
         {
             fail(3, errno());
         }
@@ -1113,6 +1121,8 @@ mod tests {
                 fsize_bytes: 64 << 20,
                 nofile: 1024,
                 cpu_secs: None,
+                uid: NOBODY_UID,
+                gid: NOBODY_GID,
             },
             None,
             &mut stdio,
@@ -1142,6 +1152,8 @@ mod tests {
                 fsize_bytes: 64 << 20,
                 nofile: 1024,
                 cpu_secs: None,
+                uid: NOBODY_UID,
+                gid: NOBODY_GID,
             },
             None,
             &mut stdio,
@@ -1179,6 +1191,8 @@ mod tests {
                 fsize_bytes: 64 << 20,
                 nofile: 1024,
                 cpu_secs: None,
+                uid: NOBODY_UID,
+                gid: NOBODY_GID,
             },
             None,
             &mut stdio,
@@ -1208,6 +1222,8 @@ mod tests {
                 fsize_bytes: 64 << 20,
                 nofile: 1024,
                 cpu_secs: None,
+                uid: NOBODY_UID,
+                gid: NOBODY_GID,
             },
             None,
             &mut stdio,
