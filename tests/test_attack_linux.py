@@ -649,6 +649,125 @@ def test_seccomp_denies_keyctl_and_io_uring(sandbox, python_exe):
     assert "('io_uring_setup', -1, 1)" in text, text
 
 
+def test_denied_syscall_returns_eperm_not_sigsys(sandbox, python_exe):
+    """A seccomp-denied syscall surfaces as ``EPERM`` (errno 1), not ``SIGSYS``.
+
+    The seccomp filter's default action is ``EPERM``, not ``KILL`` (see
+    ``seccomp.rs``): the program does **not** die, the call simply fails and
+    the program keeps running.
+
+    Why this is pinned: a missing allowlist entry therefore degrades
+    *silently* -- the program may take a different code path and produce a
+    wrong answer while the verdict stays ``AC``. A crash would have made
+    such a regression obvious; ``EPERM`` does not. This test exists so a
+    future change of the default action cannot pass unnoticed.
+
+    (Verified live on Linux: ``ptrace(PTRACE_TRACEME)`` -> errno 1,
+    ``unshare(CLONE_NEWUSER)`` -> errno 1, ``socket(AF_INET)`` -> errno 1.)
+    """
+    code = (
+        "import ctypes\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "ctypes.set_errno(0)\n"
+        "rc = libc.ptrace(0, 0, 0, 0)   # PTRACE_TRACEME: not in the allowlist\n"
+        "print('RC', rc, 'ERRNO', ctypes.get_errno())\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    # The program survived (it printed its line) -- a SIGSYS would have
+    # killed it before the print.
+    assert r.status == "AC", r.stderr[:400]
+    text = r.stdout.decode()
+    assert "RC -1 ERRNO 1" in text, text
+
+
+def test_interpreter_script_mode_runs(sandbox, python_exe, tmp_path):
+    """`python3 <script>` must work, which requires `ioctl` in the allowlist.
+
+    CPython's *script* mode issues an `ioctl` during startup; `-c` mode does
+    not. The original allowlist (derived from `-c` probes) therefore missed
+    `ioctl`, and every `python3 main.py` run failed with::
+
+        can't open file '/cwd/main.py': [Errno 1] Operation not permitted
+
+    -- a misleading EPERM that looks like a permissions problem, not a
+    seccomp denial. Verified live with `SECCOMP_RET_LOG`: the denied syscall
+    was `ioctl` (x86_64 nr 16).
+
+    This is a functional capability, but it belongs next to the allowlist
+    contract tests because the failure mode is a seccomp denial.
+    """
+    script = tmp_path / "main.py"
+    script.write_text("print('SCRIPT-MODE-RAN')\n")
+
+    r = sandbox.run(python_exe, ["/cwd/main.py"],
+                    copy_in={"main.py": script.read_bytes()})
+    assert r.status == "AC", r.stderr[:400]
+    assert b"SCRIPT-MODE-RAN" in r.stdout, r.stdout
+
+
+def test_terminal_injection_ioctls_are_denied(sandbox, python_exe):
+    """`ioctl` is allowed, but the tty-injection requests stay denied.
+
+    `TIOCSTI` (0x5412) pushes bytes into another process' terminal input
+    queue; `TIOCLINUX` (0x541C) can reprogram the console. The stacked
+    `ioctl_prefilter` returns EPERM for exactly those two request codes
+    (Docker's default profile takes the same approach: allow ioctl, deny a
+    small denylist).
+    """
+    code = (
+        "import ctypes\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "libc.syscall.restype = ctypes.c_long\n"
+        "out = []\n"
+        "for name, req in (('TIOCSTI', 0x5412), ('TIOCLINUX', 0x541C)):\n"
+        "    ctypes.set_errno(0)\n"
+        "    rc = libc.syscall(16, 0, ctypes.c_ulong(req), 0)  # 16 = ioctl\n"
+        "    out.append((name, rc, ctypes.get_errno()))\n"
+        "print(out)\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    assert r.status == "AC", r.stderr[:400]
+    text = r.stdout.decode()
+    assert "('TIOCSTI', -1, 1)" in text, text
+    assert "('TIOCLINUX', -1, 1)" in text, text
+
+
+def test_execveat_is_denied(sandbox, python_exe):
+    """`execveat` is not in the allowlist: no exec of an in-memory image.
+
+    `execveat(fd, "", argv, envp, AT_EMPTY_PATH)` runs the ELF behind an open
+    descriptor; together with `memfd_create` that is a complete
+    "execute arbitrary bytes" primitive (verified live: a memfd holding a
+    real ELF ran). It is not an escape — the new image inherits the
+    sandbox's namespaces, uid, seccomp filter and `no_new_privs` — but the
+    program can already execute code it writes into its own cwd, so the
+    fd-based route is not needed. `fexecve` is `execveat` on modern glibc,
+    so this also closes `fexecve`.
+
+    The assertion is an EPERM from the syscall, *not* process death: the
+    filter's default action is EPERM (see
+    `test_denied_syscall_returns_eperm_not_sigsys`).
+    """
+    code = (
+        "import ctypes, os\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "libc.memfd_create.restype = ctypes.c_int\n"
+        "libc.memfd_create.argtypes = [ctypes.c_char_p, ctypes.c_uint]\n"
+        "fd = libc.memfd_create(b'x', 0)\n"
+        "libc.write(fd, b'\\x7fELF', 4)\n"
+        "argv = (ctypes.c_char_p * 2)(b'/x', None)\n"
+        "envp = (ctypes.c_char_p * 1)(None)\n"
+        "ctypes.set_errno(0)\n"
+        "rc = libc.syscall(322, ctypes.c_int(fd), b'', argv, envp, 0x1000)\n"
+        "print('EXECVEAT', rc, ctypes.get_errno())\n"
+    )
+    r = _probe(sandbox, python_exe, code)
+    # 322 = execveat on x86_64.
+    assert r.status == "AC", r.stderr[:400]
+    text = r.stdout.decode()
+    assert "EXECVEAT -1 1" in text, text
+
+
 def test_hostname_does_not_leak(sandbox, python_exe):
     r = _probe(sandbox, python_exe, "import socket; print(socket.gethostname())")
     assert r.status == "AC"

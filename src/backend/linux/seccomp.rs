@@ -43,12 +43,16 @@ use std::collections::BTreeMap;
 pub(crate) type Program = seccompiler::BpfProgram;
 
 /// The stacked filter set applied to every sandboxed program: the big
-/// default-deny allowlist plus the `clone3`→`ENOSYS` prefilter.
+/// default-deny allowlist plus the `clone3`→`ENOSYS` prefilter and the
+/// terminal-injection `ioctl` prefilter.
 pub(crate) struct Filters {
     /// Default-deny allowlist (`EPERM` on mismatch).
     pub(crate) allowlist: Program,
     /// Forces `clone3` to `ENOSYS` (see the module docs).
     pub(crate) clone3_prefilter: Program,
+    /// Denies the terminal-injection `ioctl` requests (`TIOCSTI`,
+    /// `TIOCLINUX`) that the allowlist would otherwise pass.
+    pub(crate) ioctl_prefilter: Program,
 }
 
 /// Compile the filter set once per process (the filters are immutable and
@@ -73,7 +77,7 @@ fn build() -> Result<Filters, String> {
     for syscall in ALLOW {
         let rule =
             SeccompRule::new(vec![always.clone()]).map_err(|e| format!("seccomp rule: {e:?}"))?;
-        rules.entry(*syscall as i64).or_default().push(rule);
+        rules.entry(*syscall).or_default().push(rule);
     }
 
     // `clone` is allowed only when **no** namespace-creation flag is set
@@ -104,7 +108,7 @@ fn build() -> Result<Filters, String> {
     .map_err(|e| format!("seccomp clone condition: {e:?}"))?;
     let clone_rule = SeccompRule::new(vec![no_new_namespace])
         .map_err(|e| format!("seccomp clone rule: {e:?}"))?;
-    rules.insert(libc::SYS_clone as i64, vec![clone_rule]);
+    rules.insert(libc::SYS_clone, vec![clone_rule]);
 
     let filter = SeccompFilter::new(
         rules,
@@ -123,7 +127,7 @@ fn build() -> Result<Filters, String> {
     // makes clone3 fail with ENOSYS no matter what the allowlist says.
     let mut deny_clone3: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     deny_clone3.insert(
-        libc::SYS_clone3 as i64,
+        libc::SYS_clone3,
         vec![SeccompRule::new(vec![always]).map_err(|e| format!("seccomp rule: {e:?}"))?],
     );
     let pre = SeccompFilter::new(
@@ -139,9 +143,47 @@ fn build() -> Result<Filters, String> {
         .try_into()
         .map_err(|e| format!("seccomp prefilter compile: {e:?}"))?;
 
+    // The ioctl prefilter: `ioctl` is allowed (CPython's script mode, and
+    // many runtimes, need it — without it `python3 <script>` fails with
+    // EPERM), but the two *terminal-injection* requests are denied:
+    //
+    // - `TIOCSTI` pushes bytes into the terminal input queue of another
+    //   process (the classic tty-injection primitive);
+    // - `TIOCLINUX` can reprogram the console / selection buffer.
+    //
+    // The sandbox has no controlling terminal (`setsid` in the supervisor),
+    // so neither is reachable today; denying them keeps the guarantee
+    // independent of that. This mirrors Docker's default seccomp profile,
+    // which also allows ioctl with a small denylist rather than blocking the
+    // whole syscall.
+    //
+    // The request code is `ioctl`'s **arg1** (arg0 is the fd).
+    let mut deny_tty_inject: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
+    let mut tty_rules = Vec::new();
+    for request in [libc::TIOCSTI, libc::TIOCLINUX] {
+        let cond = SeccompCondition::new(1, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, request)
+            .map_err(|e| format!("seccomp ioctl condition: {e:?}"))?;
+        tty_rules
+            .push(SeccompRule::new(vec![cond]).map_err(|e| format!("seccomp ioctl rule: {e:?}"))?);
+    }
+    deny_tty_inject.insert(libc::SYS_ioctl, tty_rules);
+    let ioctl_pre = SeccompFilter::new(
+        deny_tty_inject,
+        // not matched (every other ioctl request) → allow
+        SeccompAction::Allow,
+        // matched (TIOCSTI / TIOCLINUX) → EPERM
+        SeccompAction::Errno(libc::EPERM as u32),
+        TargetArch::x86_64,
+    )
+    .map_err(|e| format!("seccomp ioctl prefilter: {e:?}"))?;
+    let ioctl_prefilter: Program = ioctl_pre
+        .try_into()
+        .map_err(|e| format!("seccomp ioctl prefilter compile: {e:?}"))?;
+
     Ok(Filters {
         allowlist,
         clone3_prefilter,
+        ioctl_prefilter,
     })
 }
 
@@ -153,15 +195,16 @@ fn build() -> Result<Filters, String> {
 }
 
 /// Apply the compiled filter set to the calling process (and its future
-/// children). The `clone3` prefilter is installed *after* the allowlist so
-/// it runs first (filters execute most-recent-first; a syscall only
-/// proceeds when every filter allows it).
+/// children). The prefilters are installed *after* the allowlist so they run
+/// first (filters execute most-recent-first; a syscall only proceeds when
+/// every filter allows it).
 ///
 /// Returns 0 on success, -1 on failure (errno set) — called between fork and
 /// exec, so no allocation, no formatting.
 pub(crate) fn apply(filters: &Filters) -> libc::c_int {
     match seccompiler::apply_filter(&filters.allowlist)
         .and_then(|_| seccompiler::apply_filter(&filters.clone3_prefilter))
+        .and_then(|_| seccompiler::apply_filter(&filters.ioctl_prefilter))
     {
         Ok(()) => 0,
         Err(_) => -1,
@@ -182,7 +225,15 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_fork,
     libc::SYS_vfork,
     libc::SYS_execve,
-    libc::SYS_execveat,
+    // `execveat` is NOT here on purpose. It executes an image named by an
+    // `fd` (+`AT_EMPTY_PATH`), which combined with `memfd_create` gives a
+    // complete "run an arbitrary in-memory ELF" primitive (verified live:
+    // a memfd holding a real ELF was exec'd and ran). That is not a sandbox
+    // escape — the new image keeps the same namespaces, uid, seccomp filter
+    // and `no_new_privs` — but the program can already run code it wrote to
+    // its own cwd, so the fd-based route adds no capability the judge needs.
+    // `fexecve` is `execveat` under the hood on modern glibc, so this also
+    // closes the `fexecve` path.
     libc::SYS_exit,
     libc::SYS_exit_group,
     libc::SYS_wait4,
@@ -320,6 +371,17 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_tee,
     libc::SYS_vmsplice,
     libc::SYS_fcntl,
+    // `ioctl` is needed: CPython's **script mode** (`python3 <file>`) issues
+    // it during startup, so without it every `python3 main.py` run fails with
+    // EPERM ("can't open file ... Operation not permitted") — verified live.
+    // `-c` mode happens not to use it, which is why the original allowlist
+    // (built from `-c` probes) missed it.
+    //
+    // Allowing the syscall wholesale is a deliberate trade-off; the
+    // dangerous terminal-injection requests are denied by the stacked
+    // `ioctl_prefilter` (see `build()`), and the program has no controlling
+    // terminal, no capabilities and no device nodes to drive.
+    libc::SYS_ioctl,
     libc::SYS_utimensat,
     libc::SYS_utimes,
     libc::SYS_futimesat,
@@ -441,10 +503,16 @@ mod tests {
             Ok(f) => {
                 assert!(!f.allowlist.is_empty(), "empty BPF program");
                 assert!(!f.clone3_prefilter.is_empty(), "empty prefilter");
+                assert!(!f.ioctl_prefilter.is_empty(), "empty ioctl prefilter");
             }
             Err(e) => {
-                // Non-x86_64 targets fail closed by design.
-                assert!(!cfg!(target_arch = "x86_64"), "{e}");
+                // Non-x86_64 targets fail closed by design; on x86_64 a
+                // build error is a real failure. `cfg!` is a compile-time
+                // constant, so spell the check as a match on the target.
+                #[cfg(target_arch = "x86_64")]
+                panic!("seccomp filter build failed on x86_64: {e}");
+                #[cfg(not(target_arch = "x86_64"))]
+                let _ = e;
             }
         }
     }
