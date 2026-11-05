@@ -215,8 +215,11 @@ impl Sandbox {
             .memory_limit_bytes
             .unwrap_or_else(physical_memory_bytes);
         let cpu_time_limit_ms = spec.time_limit_ms;
-        let stdout_limit = spec.stdout_limit_kb.map(|kb| kb * 1024);
-        let stderr_limit = spec.stderr_limit_kb.map(|kb| kb * 1024);
+        // `saturating_mul`: `kb * 1024` overflows a u64 for an absurd limit
+        // (`stdout_limit_kb = 2**54`), which wrapped to a *small* value and
+        // would have killed the program almost immediately.
+        let stdout_limit = spec.stdout_limit_kb.map(|kb| kb.saturating_mul(1024));
+        let stderr_limit = spec.stderr_limit_kb.map(|kb| kb.saturating_mul(1024));
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
         let stdio_ceilings = StdioCeilings {
             capture_limit_bytes: self.ceilings.capture_limit_bytes,

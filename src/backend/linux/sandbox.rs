@@ -70,7 +70,13 @@ fn child_limits(cpu_limit_ms: Option<u64>, uid: libc::uid_t, gid: libc::gid_t) -
         // RLIMIT_CPU backstop: the judger's 10ms `cpu.stat` poll is the
         // primary enforcement; this only guarantees the kernel kills a
         // multi-process escape eventually.
-        cpu_secs: cpu_limit_ms.map(|ms| (ms + 999) / 1000 + 1),
+        //
+        // `saturating_add` + `div_ceil`: the naive `(ms + 999) / 1000`
+        // overflows a u64 for an absurd limit (`time_limit_ms = 2**64-1`),
+        // which panicked in debug builds and wrapped to a nonsense value
+        // in release builds. Saturating keeps the intent ("no CPU limit
+        // the kernel could enforce") instead of a wrapped 0.
+        cpu_secs: cpu_limit_ms.map(|ms| ms.saturating_add(999).div_ceil(1000) + 1),
         // Per-run leased identity (see `uidpool`): distinct from every other
         // run and from host accounts.
         uid,
@@ -85,8 +91,8 @@ fn child_limits(cpu_limit_ms: Option<u64>, uid: libc::uid_t, gid: libc::gid_t) -
 ///   mount namespace so the rest of the host filesystem is invisible;
 /// - each path in `runtimes` exposed read-only (+execute) via bind mounts;
 /// - `copy_in` files provisioned into the working directory (read-only for
-///   the program: mode 0440, owned by the sandbox uid, program runs as
-///   a per-run leased uid);
+///   the program: mode 0444, **root-owned** so it can neither write nor
+///   `chmod` them; the program itself runs as a per-run leased uid);
 /// - network access denied unconditionally (empty network namespace).
 ///
 /// `rootfs` (a caller-supplied root tree) replaces the tmpfs root when
@@ -216,6 +222,9 @@ impl Sandbox {
     #[pyo3(
         text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
+    // The signature mirrors the frozen Python contract (one parameter per
+    // run() keyword); collapsing it into a struct would hide that mapping.
+    #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
         executable: PathBuf,
