@@ -128,7 +128,16 @@ judger 把产物拷回宿主路径。**永不跟随符号链接**：程序可以
   `swapon*`/`clock_settime`/`sethostname`
 
 其余（CPython、动态链接器、shell、普通编译产物所需）无条件放行；新增语言
-运行时前先跑一遍 AC 回归，缺 syscall 的表现是 `SIGSYS`（exit 159）。
+运行时前先跑一遍 AC 回归。
+
+缺 syscall 的表现是 **`EPERM`（errno 1），不是 `SIGSYS`**：默认动作是 `EPERM`
+而非 `KILL`，程序**不会**崩溃，而是该调用失败、程序继续运行。这带来一个重要
+后果——**白名单漏项不会自己暴露**，程序可能「优雅降级」（例如某个特性读不到
+数据就走另一条路径）并产出错误答案，而判定仍是 `AC`。所以新增运行时前跑 AC
+回归是**唯一**的发现手段，不能指望崩溃来提示。
+
+> 该行为由 `tests/test_attack_linux.py::test_denied_syscall_returns_eperm_not_sigsys`
+> 钉住：若将来有人把默认动作改成 `KILL`，该测试会失败——那时必须同步更新本段。
 
 ### 可执行文件注入
 

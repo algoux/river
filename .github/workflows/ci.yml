@@ -1,0 +1,72 @@
+name: ci
+
+# Every push/PR must pass: formatting, clippy, the Rust unit tests and the
+# Python suite — on both supported backends. The README's "run `cargo fmt`
+# before every commit" rule is enforced here instead of by hand.
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Windows backend: AppContainer + Job Object. The unit tests link against
+  # the CPython DLL (STATUS_DLL_NOT_FOUND otherwise), so the interpreter's
+  # directory goes on PATH first.
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        # Warnings are errors: the `never_loop` finding used to make this
+        # step fail outright, which is exactly what we want to keep.
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build extension
+        run: uv run --no-project maturin develop --release
+        env:
+          # maturin needs the venv concept; use the system interpreter.
+          VIRTUAL_ENV: ${{ env.pythonLocation }}
+      - name: Rust unit tests
+        run: |
+          $py = (Get-Command python).Source
+          $env:PATH = "$(Split-Path $py);$env:PATH"
+          cargo test --lib --release -- --test-threads=1
+      - name: Python suite
+        run: python -m pytest -q
+
+  # Linux backend: namespaces + cgroups v2. The suite needs root
+  # (CAP_SYS_ADMIN for mount/namespace/cgroup writes).
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build extension
+        run: uv run --no-project maturin develop --release
+        env:
+          VIRTUAL_ENV: ${{ env.pythonLocation }}
+      - name: Rust unit tests
+        run: cargo test --lib --release -- --test-threads=1
+      - name: Python suite (root: namespaces + cgroups v2)
+        run: sudo -E python -m pytest -q
