@@ -5,14 +5,24 @@
 //! removed on drop — also on every error path (RAII, mirroring the Windows
 //! `WorkDir` guard).
 //!
-//! `copy_in` read-only enforcement: files are
-//! written/copied as root and later chowned to the sandbox uid, mode 0444;
-//! the sandboxed program can read but never write them. Directories are
-//! chowned to the sandbox uid and mode 0700, so an unrelated host process
-//! (and another uid) cannot traverse the tree by path. Residual exposure:
-//! other processes running as the *same* uid still share owner
-//! rights — true per-run isolation needs a distinct uid, which this backend
-//! does not allocate (documented limitation).
+//! `copy_in` read-only enforcement: the provisioned entries stay
+//! **root-owned** — files mode 0444, directories mode 0755 — so the
+//! sandboxed program can read and traverse them but can never modify or
+//! `chmod` them. (An *owned* 0444 file could be `chmod`ed by its owner and
+//! then overwritten; verified.) Only the workdir root and its `tmp/`
+//! subdirectory are handed to the sandbox uid — the program owns its own
+//! cwd and creates files there.
+//!
+//! Known Unix limit: the program owns the parent directory, so it may still
+//! *delete or rename* a `copy_in` entry (unlink permission comes from the
+//! directory, not from the entry). Deleting one's own input cannot change
+//! its content and does not leak anything, so this is accepted rather than
+//! paid for with per-file read-only mounts.
+//!
+//! Per-run isolation: every run leases a **distinct** uid/gid from a fixed
+//! high range (see `uidpool`), so no other run and no host account shares
+//! the workdir's identity — an unrelated host process cannot traverse the
+//! tree by path, and it cannot write to the entries either.
 //!
 //! The workdir is created mode 0700 (root-owned) so nothing can read it
 //! before the run starts.
@@ -32,15 +42,30 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-run working directory; removes itself on drop.
 ///
-/// Liveness for the stale sweep is proven by an **exclusive flock on
-/// `.owner`**, not by the pid in the name: pids are reused within
-/// milliseconds, so `/proc/<pid>` alone would make a just-killed judger's
-/// directory look alive (observed in the lifecycle test).
+/// Liveness for the stale sweep is proven by an **exclusive flock on a
+/// sibling `<dir>.lock` file**, not by the pid in the name: pids are reused
+/// within milliseconds, so `/proc/<pid>` alone would make a just-killed
+/// judger's directory look alive (observed in the lifecycle test).
+///
+/// The lock file lives **outside** the workdir on purpose. It used to be
+/// `.owner` *inside* the directory, but the program owns that directory (so
+/// it can create files), and on Unix unlink permission comes from the parent
+/// — a program could therefore `unlink("/cwd/.owner")` (verified live),
+/// which silently degraded the sweep to the unreliable pid check.
 pub(crate) struct WorkDir {
     path: PathBuf,
     /// Held for the run's lifetime; the lock is released by the kernel when
     /// the judger dies (that is the sweep's "owner is gone" signal).
     _owner: std::fs::File,
+}
+
+/// Path of the ownership lock belonging to the workdir at `dir`.
+///
+/// A sibling of the directory, never inside it (see [`WorkDir`]).
+fn owner_path(dir: &Path) -> PathBuf {
+    let mut s = dir.as_os_str().to_os_string();
+    s.push(".lock");
+    PathBuf::from(s)
 }
 
 impl WorkDir {
@@ -60,11 +85,14 @@ impl WorkDir {
             let path = base.join(format!("river-{}-{}-{:x}", std::process::id(), n, nanos));
             match create_private_dir(&path) {
                 Ok(()) => {
+                    // The lock lives beside the directory, not inside it:
+                    // the program owns the directory and could unlink an
+                    // entry there (see `WorkDir`).
                     let owner = fs::OpenOptions::new()
                         .create(true)
                         .truncate(false)
                         .write(true)
-                        .open(path.join(".owner"))?;
+                        .open(owner_path(&path))?;
                     lock_owner(&owner, true)?;
                     return Ok(WorkDir {
                         path,
@@ -171,8 +199,9 @@ impl WorkDir {
     /// create files there. `copy_in` entries stay **root-owned** — files
     /// 0444, directories 0755 — so the program can read and traverse them
     /// but can never modify or chmod them (an owned 0440 file could be
-    /// `chmod`ed by its owner and overwritten; verified). `.owner` also
-    /// stays root-owned: it is the sweep's liveness probe.
+    /// `chmod`ed by its owner and overwritten; verified). The ownership lock
+    /// lives **outside** this directory (a root-owned sibling), so the
+    /// program can neither see nor unlink the sweep's liveness probe.
     ///
     /// Known Unix limit: the program owns the parent directory, so it may
     /// still *delete or rename* a `copy_in` entry (unlink permission comes
@@ -196,7 +225,14 @@ impl Drop for WorkDir {
     fn drop(&mut self) {
         // Best effort: a leftover directory is recovered by the stale-dir
         // sweep (stage L5) rather than masking the real error of a run.
+        //
+        // The lock file is a sibling and must go too — otherwise every run
+        // would leave an empty `river-*.lock` in the temp dir. It is
+        // removed *after* the directory so a concurrent sweep never sees a
+        // directory without its lock (which would push it onto the
+        // unreliable pid fallback).
         let _ = fs::remove_dir_all(&self.path);
+        let _ = fs::remove_file(owner_path(&self.path));
     }
 }
 
@@ -350,11 +386,15 @@ fn pid_is_alive(pid: u32) -> bool {
 /// process (e.g. the judger was hard-killed mid-run: `Drop` never ran; the
 /// sandboxed processes died via the watchdog, but the directory remained).
 ///
-/// Ownership is decided by the `.owner` lock, not by the pid:
+/// Ownership is decided by the sibling `<dir>.lock` flock, not by the pid:
 /// - lock acquirable  => the owner process is gone => remove the directory;
 /// - lock held (EWOULDBLOCK) => a live run => leave it alone;
-/// - no `.owner` file (directory from an older build) => fall back to the
-///   `river-{pid}-...` name check.
+/// - no lock file (directory from an older build, whose lock was the
+///   in-directory `.owner`) => fall back to the `river-{pid}-...` name check.
+///
+/// Only **directories** are considered: the lock files themselves are
+/// siblings named `river-*.lock` and are skipped (they are removed together
+/// with their directory).
 ///
 /// Concurrency: two sweeps racing on the same directory are serialized
 /// through a process-global lock.
@@ -373,16 +413,33 @@ pub(crate) fn sweep_stale_workdirs() {
             continue;
         }
         let path = entry.path();
-        match fs::OpenOptions::new().write(true).open(path.join(".owner")) {
+        // Skip the lock files (and any other non-directory): only workdirs
+        // are reclaimable.
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if !is_dir {
+            continue;
+        }
+        match fs::OpenOptions::new().write(true).open(owner_path(&path)) {
             Ok(owner) => match lock_owner(&owner, true) {
                 Ok(()) => {
                     let _ = lock_owner(&owner, false);
                     drop(owner);
                     let _ = fs::remove_dir_all(&path);
+                    let _ = fs::remove_file(owner_path(&path));
                 }
                 Err(_) => continue, // live owner
             },
             Err(_) => {
+                // No sibling lock: either an older build (in-directory
+                // `.owner`) or a foreign directory. Fall back to the pid.
+                if path.join(".owner").exists() {
+                    // Older build: try the legacy lock first.
+                    if let Ok(owner) = fs::OpenOptions::new().write(true).open(path.join(".owner"))
+                        && lock_owner(&owner, true).is_err()
+                    {
+                        continue; // a live older-build owner
+                    }
+                }
                 let Some(pid) = owner_pid_of(name) else {
                     continue;
                 };
@@ -410,11 +467,12 @@ mod tests {
     use super::*;
 
     /// Provisioned files exist, carry exactly the given bytes, and are mode
-    /// 0440 (non-trivial: removing the chmod in `provision` must make this
-    /// fail). Before `grant_to` the file is root-owned, so 0440 also means
-    /// no other uid can read it.
+    /// 0444 (non-trivial: removing the chmod in `provision` must make this
+    /// fail). The file stays **root-owned**, so 0444 also means no other uid
+    /// can read it — and, crucially, the program cannot `chmod` it back to
+    /// writable (only the owner may change the mode).
     #[test]
-    fn provisioned_copy_in_is_read_only_0440() {
+    fn provisioned_copy_in_is_read_only_0444() {
         use std::os::unix::fs::PermissionsExt;
         let workdir = WorkDir::create().unwrap();
         let mut files = std::collections::HashMap::new();
@@ -447,8 +505,8 @@ mod tests {
     /// 0700; `copy_in` files keep their **root** owner and mode 0444 (root
     /// ownership is what makes them unmodifiable — an owned file could be
     /// chmod'ed by its owner, which is why the tree is no longer chowned
-    /// recursively); `.owner` stays root-owned for the stale sweep. Needs
-    /// root (chown).
+    /// recursively). The ownership lock stays root-owned **and outside the
+    /// directory**, so the program cannot unlink it.
     #[test]
     fn grant_to_makes_the_tree_private_to_the_sandbox_uid() {
         use std::os::unix::fs::PermissionsExt;
@@ -469,8 +527,15 @@ mod tests {
         // Root-owned on purpose: only a non-owner is denied chmod.
         assert_eq!(std::os::unix::fs::MetadataExt::uid(&file_md), 0);
 
-        let owner_md = fs::metadata(workdir.path().join(".owner")).unwrap();
-        assert_eq!(std::os::unix::fs::MetadataExt::uid(&owner_md), 0);
+        // The lock is a sibling of the workdir, root-owned, and NOT inside
+        // the directory the program can write.
+        let lock = owner_path(workdir.path());
+        let lock_md = fs::metadata(&lock).unwrap();
+        assert_eq!(std::os::unix::fs::MetadataExt::uid(&lock_md), 0);
+        assert!(
+            !workdir.path().join(".owner").exists(),
+            "the ownership lock must not live inside the writable cwd"
+        );
     }
 
     /// Nested copy_in keys get their parent directories created.
