@@ -7,11 +7,17 @@
 //! memory numbers come from the run's cgroup (`cpu.stat` / `memory.peak`),
 //! which also covers already-exited descendants.
 //!
-//! The CPU limit is enforced **actively**: every `CPU_POLL_INTERVAL` the
-//! monitor reads `cpu.stat` and kills the tree once the measured usage
-//! passes the limit. (Without this the limit was only a post-mortem verdict:
-//! a 500ms CPU limit let the program run for the whole wall allowance —
-//! measured at ~2s.)
+//! **Waiting is event-driven**: `pidfd_open` + `poll` on the pidfd and on the
+//! stdio overflow `eventfd` wakes the monitor exactly when the process exits
+//! or an output channel crosses its kill threshold, so an idle run costs
+//! **zero** wakeups (the old loop polled `wait4(WNOHANG)` every 2 ms —
+//! measured at ~458 wakeups/s per run). Kernels without `pidfd_open` fall
+//! back to that polling loop ([`monitor_polling`]).
+//!
+//! The CPU limit is enforced **actively**: while it is set, the `poll`
+//! timeout is capped at `CPU_POLL_INTERVAL` so `cpu.stat` is re-read on that
+//! cadence; once the measured usage passes the limit the tree is killed
+//! (the same contract as the Windows job-accounting poll).
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -33,7 +39,8 @@ pub(crate) struct Outcome {
     pub(crate) wall_time_ms: u64,
 }
 
-/// How often the wait loop re-checks the overflow flags / wall deadline.
+/// Legacy polling cadence (only used when `pidfd_open` is unavailable): how
+/// often the wait loop re-checks the overflow flags / wall deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(2);
 
 /// How often `cpu.stat` is read while the program runs. Overshoot of the CPU
@@ -50,6 +57,167 @@ const CPU_READ_FAILURE_LIMIT: u32 = 5;
 /// the stdio overflow flags. On a sandbox kill the process group gets
 /// SIGKILL and is reaped before returning.
 pub(crate) fn monitor(
+    pid: libc::pid_t,
+    wall_limit: Duration,
+    overflow: &OverflowFlags,
+    cgroup: Option<&Cgroup>,
+    cpu_limit_ms: Option<u64>,
+) -> io::Result<Outcome> {
+    match pidfd_open(pid) {
+        Ok(pidfd) => {
+            let result = monitor_evented(pid, pidfd, wall_limit, overflow, cgroup, cpu_limit_ms);
+            // SAFETY: the fd is ours and no longer used after this point.
+            unsafe { libc::close(pidfd) };
+            result
+        }
+        // Old kernels (no SYS_pidfd_open): the polling loop still enforces
+        // every limit, it just costs wakeups.
+        Err(_) => monitor_polling(pid, wall_limit, overflow, cgroup, cpu_limit_ms),
+    }
+}
+
+fn pidfd_open(pid: libc::pid_t) -> io::Result<libc::c_int> {
+    // SAFETY: plain syscall, no pointers involved.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(fd as libc::c_int)
+    }
+}
+
+/// Event-driven wait: `poll` on the pidfd (process exit) and the overflow
+/// eventfd (kill threshold crossed), with the CPU poll interval as the
+/// timeout when a CPU limit is set.
+fn monitor_evented(
+    pid: libc::pid_t,
+    pidfd: libc::c_int,
+    wall_limit: Duration,
+    overflow: &OverflowFlags,
+    cgroup: Option<&Cgroup>,
+    cpu_limit_ms: Option<u64>,
+) -> io::Result<Outcome> {
+    let start = Instant::now();
+    let deadline = start + wall_limit;
+    let mut status: libc::c_int = 0;
+    let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
+    let mut last_cpu_check = start;
+    let mut cpu_read_failures: u32 = 0;
+    let overflow_fd = overflow.event_fd();
+
+    loop {
+        // The atomics are the source of truth: an eventfd write may have
+        // been lost (counter full) and a reader may fire before the poll
+        // starts.
+        if overflow.any() {
+            overflow.drain_event();
+            return finish_killed(
+                pid,
+                KillOrigin::OutputLimit,
+                start,
+                &mut status,
+                &mut rusage,
+            );
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return finish_killed(
+                pid,
+                KillOrigin::WallTimeout,
+                start,
+                &mut status,
+                &mut rusage,
+            );
+        }
+        let remaining_ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
+        // With a CPU limit the poll must wake at least every
+        // CPU_POLL_INTERVAL to read `cpu.stat`; otherwise it sleeps until
+        // the deadline and only the pidfd/eventfd can wake it.
+        let timeout_ms = if cpu_limit_ms.is_some() {
+            let poll_ms = CPU_POLL_INTERVAL.as_millis().min(i32::MAX as u128) as i32;
+            poll_ms.min(remaining_ms)
+        } else {
+            remaining_ms
+        };
+
+        let mut fds = [
+            libc::pollfd {
+                fd: pidfd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: overflow_fd.unwrap_or(-1),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if overflow_fd.is_some() { 2 } else { 1 };
+        // SAFETY: the array outlives the call; nfds matches the filled
+        // entries.
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), nfds, timeout_ms) };
+        if rc < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        if rc > 0 {
+            if fds[0].revents != 0 {
+                // The process exited (or the pidfd reported an error): reap
+                // it with a blocking wait4 to collect the exit status and
+                // rusage.
+                wait4_blocking(pid, &mut status, &mut rusage)?;
+                return Ok(Outcome {
+                    kill: KillOrigin::None,
+                    exit_code: decode_exit_code(status),
+                    cpu_time_ms: rusage_cpu_ms(&rusage),
+                    peak_memory_bytes: rusage_peak_bytes(&rusage),
+                    wall_time_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            if nfds == 2 && fds[1].revents != 0 {
+                overflow.drain_event();
+                return finish_killed(
+                    pid,
+                    KillOrigin::OutputLimit,
+                    start,
+                    &mut status,
+                    &mut rusage,
+                );
+            }
+        }
+        // Either the poll timed out or it woke for a reason we do not act on
+        // (pidfd has POLLPRI in some kernels); check the CPU limit on its
+        // own cadence.
+        if let (Some(cg), Some(limit)) = (cgroup, cpu_limit_ms)
+            && last_cpu_check.elapsed() >= CPU_POLL_INTERVAL
+        {
+            last_cpu_check = Instant::now();
+            match poll_cpu(cg, limit, &mut cpu_read_failures) {
+                Ok(true) => {
+                    return finish_killed(
+                        pid,
+                        KillOrigin::CpuLimit,
+                        start,
+                        &mut status,
+                        &mut rusage,
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    kill_tree(pid);
+                    return Err(e);
+                }
+            }
+        }
+    }
+}
+
+/// Legacy wait loop for kernels without `pidfd_open`: `wait4(WNOHANG)` plus
+/// a 2ms sleep. Functionally identical, but costs one wakeup per 2ms.
+fn monitor_polling(
     pid: libc::pid_t,
     wall_limit: Duration,
     overflow: &OverflowFlags,
@@ -100,35 +268,24 @@ pub(crate) fn monitor(
                 &mut rusage,
             );
         }
-        if let (Some(cg), Some(limit)) = (cgroup, cpu_limit_ms) {
-            if last_cpu_check.elapsed() >= CPU_POLL_INTERVAL {
-                last_cpu_check = Instant::now();
-                match cg.usage_usec() {
-                    Ok(usec) => {
-                        cpu_read_failures = 0;
-                        if usec / 1000 > limit {
-                            return finish_killed(
-                                pid,
-                                KillOrigin::CpuLimit,
-                                start,
-                                &mut status,
-                                &mut rusage,
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // Fail closed: a transient read error is retried on
-                        // the next tick, but persistent failures must not
-                        // silently degrade the CPU limit to the RLIMIT_CPU
-                        // backstop (whose overshoot is a full second). Kill
-                        // and surface an infrastructure error (verdict SE).
-                        cpu_read_failures += 1;
-                        if cpu_read_failures >= CPU_READ_FAILURE_LIMIT {
-                            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
-                            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
-                            return Err(e);
-                        }
-                    }
+        if let (Some(cg), Some(limit)) = (cgroup, cpu_limit_ms)
+            && last_cpu_check.elapsed() >= CPU_POLL_INTERVAL
+        {
+            last_cpu_check = Instant::now();
+            match poll_cpu(cg, limit, &mut cpu_read_failures) {
+                Ok(true) => {
+                    return finish_killed(
+                        pid,
+                        KillOrigin::CpuLimit,
+                        start,
+                        &mut status,
+                        &mut rusage,
+                    );
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    kill_tree(pid);
+                    return Err(e);
                 }
             }
         }
@@ -144,10 +301,59 @@ pub(crate) fn monitor(
     })
 }
 
+/// Read `cpu.stat` once. `Ok(true)` means the CPU limit was exceeded.
+/// Persistent read errors are returned as `Err` (fail closed: the caller
+/// kills the tree and the run becomes `SE` instead of silently degrading to
+/// the `RLIMIT_CPU` backstop, whose overshoot is a full second).
+fn poll_cpu(cg: &Cgroup, limit_ms: u64, failures: &mut u32) -> io::Result<bool> {
+    match cg.usage_usec() {
+        Ok(usec) => {
+            *failures = 0;
+            Ok(usec / 1000 > limit_ms)
+        }
+        Err(e) => {
+            *failures += 1;
+            if *failures >= CPU_READ_FAILURE_LIMIT {
+                Err(e)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+}
+
 /// Kill the child's whole process group (the supervisor called `setsid`, so
 /// its pid is the pgid; the program and its descendants all inherit it).
 /// Falls back to the single pid if the group does not exist yet (the kill
 /// can race the supervisor's `setsid`).
+fn kill_tree(pid: libc::pid_t) {
+    let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    if rc != 0 {
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+}
+
+fn wait4_blocking(
+    pid: libc::pid_t,
+    status: &mut libc::c_int,
+    rusage: &mut libc::rusage,
+) -> io::Result<()> {
+    loop {
+        let got = unsafe { libc::wait4(pid, status, 0, rusage) };
+        if got == pid {
+            return Ok(());
+        }
+        if got < 0 {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(err);
+        }
+        // `wait4` without WNOHANG cannot return 0; loop defensively.
+    }
+}
+
 fn finish_killed(
     pid: libc::pid_t,
     kill: KillOrigin,
@@ -155,22 +361,8 @@ fn finish_killed(
     status: &mut libc::c_int,
     rusage: &mut libc::rusage,
 ) -> io::Result<Outcome> {
-    let rc = unsafe { libc::kill(-pid, libc::SIGKILL) };
-    if rc != 0 {
-        unsafe { libc::kill(pid, libc::SIGKILL) };
-    }
-    let got = loop {
-        let got = unsafe { libc::wait4(pid, status, 0, rusage) };
-        if got == pid {
-            break got;
-        }
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        return Err(err);
-    };
-    debug_assert_eq!(got, pid);
+    kill_tree(pid);
+    wait4_blocking(pid, status, rusage)?;
     Ok(Outcome {
         kill,
         exit_code: decode_exit_code(*status),
@@ -217,7 +409,7 @@ mod tests {
     }
 
     /// A child that exits 0 is reaped with exit code 0 and no kill origin
-    /// (removing the wait4 loop must make this hang or fail).
+    /// (removing the wait path must make this hang or fail).
     #[test]
     fn clean_child_exit_is_reaped_without_kill() {
         let pid = unsafe { libc::fork() };
@@ -248,8 +440,9 @@ mod tests {
         assert!(outcome.wall_time_ms < 5_000);
     }
 
-    /// An overflow flag ends the run as an output kill (direct observation
-    /// outranks the wall clock — contract classify priority 2).
+    /// An overflow flag set *before* the monitor starts ends the run as an
+    /// output kill (direct observation outranks the wall clock — contract
+    /// classify priority 2).
     #[test]
     fn overflow_flag_kills_as_output_limit() {
         let pid = unsafe { libc::fork() };
@@ -259,9 +452,36 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
         let overflow = OverflowFlags::default();
-        overflow.stdout.store(true, Ordering::Relaxed);
+        overflow.fire(0);
         let outcome = monitor(pid, Duration::from_secs(30), &overflow, None, None).unwrap();
         assert_eq!(outcome.kill, KillOrigin::OutputLimit);
+    }
+
+    /// The middleware that matters for the event-driven path: an overflow
+    /// fired *while* the monitor is blocked in `poll` (not before it
+    /// starts) must wake it immediately — the child would sleep for 30s.
+    #[test]
+    fn evented_monitor_wakes_on_overflow_while_polling() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            std::thread::sleep(Duration::from_secs(30));
+            unsafe { libc::_exit(0) };
+        }
+        let overflow = std::sync::Arc::new(OverflowFlags::default());
+        let fired = std::sync::Arc::clone(&overflow);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            fired.fire(1);
+        });
+        let outcome = monitor(pid, Duration::from_secs(30), &overflow, None, None).unwrap();
+        t.join().unwrap();
+        assert_eq!(outcome.kill, KillOrigin::OutputLimit);
+        assert!(
+            outcome.wall_time_ms < 5_000,
+            "overflow wakeup took {}ms",
+            outcome.wall_time_ms
+        );
     }
 
     /// With a cgroup + CPU limit the monitor kills a CPU-bound child long
@@ -311,5 +531,31 @@ mod tests {
         .unwrap();
         assert_eq!(outcome.kill, KillOrigin::CpuLimit);
         assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+    }
+
+    /// The atomics stay authoritative even when the eventfd was never
+    /// written (reader crashed before the write, or the fd is unavailable):
+    /// the monitor's wake-up path re-checks them.
+    #[test]
+    fn overflow_atomic_without_eventfd_wakeup_still_kills() {
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            std::thread::sleep(Duration::from_secs(30));
+            unsafe { libc::_exit(0) };
+        }
+        let overflow = std::sync::Arc::new(OverflowFlags::default());
+        let flag = std::sync::Arc::clone(&overflow);
+        let t = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            // Set the atomic directly: simulates a wakeup that never came.
+            flag.stdout.store(true, Ordering::Relaxed);
+        });
+        // The wall limit bounds the wait: the kill must still be attributed
+        // to the output evidence, not the wall clock (the flag is checked
+        // on every wake, including the wall timeout).
+        let outcome = monitor(pid, Duration::from_millis(300), &overflow, None, None).unwrap();
+        t.join().unwrap();
+        assert_eq!(outcome.kill, KillOrigin::OutputLimit);
     }
 }
