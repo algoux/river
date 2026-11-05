@@ -125,7 +125,7 @@ cgroup writes need `CAP_SYS_ADMIN`).
 | Limit | Parameter | Mechanism | Verdict |
 |---|---|---|---|
 | CPU time | `time_limit_ms` | `cpu.stat usage_usec` polled every 10 ms, killed at the limit; `RLIMIT_CPU` backstop | `TLE` |
-| Wall clock | `wall_time_limit_ms` (default `2 × time_limit + 1000`) | 2 ms poll watchdog | `TLE` |
+| Wall clock | `wall_time_limit_ms` (default `2 × time_limit + 1000`) | pidfd/eventfd poll (event-driven) | `TLE` |
 | Memory (RSS + page cache) | `memory_limit_kb` | cgroup `memory.max` + `memory.swap.max=0`; OOM kills read from `memory.events` and exposed as `Status.oom_killed` | `MLE` |
 | Collected output | `copy_out_limit_kb` | total `copy_out` bytes measured by the collector; collection stops (no partial files) | `OLE` |
 | File writes | — | `RLIMIT_FSIZE` 64 MB per file | `RE` on `SIGXFSZ`/`EFBIG` |

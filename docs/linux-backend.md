@@ -194,8 +194,9 @@ validate(spec)
   ⑤ B：PDEATHSIG → mount /proc → setgroups/setgid/setuid(leased uid)
         → dumpable=0 → no_new_privs=1 → capset 清零 → rlimits → seccomp
         → chdir(/cwd[/rel]) → execvpe
-  ⑥ monitor：wait4(A)（rusage 聚合 A+B）+ 2ms 轮询墙钟/OLE 事件
-             + 10ms 轮询 cpu.stat（超限即杀，KillOrigin::CpuLimit）
+  ⑥ monitor：poll(pidfd(A), OLE eventfd) 事件驱动等待（墙钟为 poll 超时；
+             无 pidfd 的内核回退 2ms 轮询）；CPU 限额时 poll 超时取 10ms，
+             每拍读 cpu.stat，超限即杀（KillOrigin::CpuLimit）
   ⑦ 证据：cgroup cpu.stat / memory.peak / memory.events / 残余计数
           → classify → Status（含 oom_killed）
   ⑧ 清理：cgroup.kill → wait_until_empty → rmdir → workdir Drop → watchdog 收尸
@@ -206,7 +207,7 @@ validate(spec)
 | 证据 | 来源 | 语义 |
 |---|---|---|
 | CPU 时间 | `cpu.stat usage_usec` | 整棵树，含已退出的子进程；10ms 轮询主动限额 |
-| 墙钟 | `Instant` | 看门狗（2ms 轮询） |
+| 墙钟 | `Instant` + `poll` 超时 | 事件驱动（无唤醒开销；旧内核回退 2ms 轮询） |
 | 峰值内存 | `memory.peak` | **RSS + page cache**，不是 Windows 的 commit |
 | OOM | `memory.events` `oom_kill` | 直接证据 → `Status.oom_killed`，优先于 peak 推断 |
 | 残余子孙 | `cgroup.procs` | 收尸后 100ms 宽限期，排除已死主进程的异步残留 |
