@@ -1,4 +1,4 @@
-﻿#[cfg(target_os = "linux")]
+#[cfg(target_os = "linux")]
 mod imp {
     use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags, EventVec};
     use rustix::fd::{AsFd, AsRawFd, OwnedFd};
@@ -15,7 +15,7 @@ mod imp {
     const BUF_SIZE: usize = 65536;
     const MONITOR_INTERVAL: Duration = Duration::from_millis(100);
     
-    // ======================== Configuration ========================
+    // ======================== 配置 ========================
     const EXECUTABLE: &str = "/bin/dd";
     const ARGS: &[&str] = &["if=/dev/urandom", "bs=1M", "count=1024", "of=/dev/stdout"];
     const STDOUT_FILE: &str = "captured_stdout.bin";
@@ -33,8 +33,8 @@ mod imp {
     }
     
     impl StreamCtx {
-        /// Splice pipe → file. Returns Ok(n) with n > 0 on success,
-        /// Ok(0) on EOF, Err(AGAIN) if would block, Err(_) on error.
+        /// 将管道数据 splice 到文件。成功返回 Ok(n)（n > 0），
+        /// EOF 返回 Ok(0)，会阻塞时返回 Err(AGAIN)，其他错误返回 Err(_)。
         fn drain(&self) -> Result<usize, Errno> {
             match splice(
                 self.pipe_read.as_fd(),
@@ -60,42 +60,42 @@ mod imp {
     }
     
     pub fn run() {
-        println!("=== Capture with Limit ===");
-        println!("Executable: {}", EXECUTABLE);
-        println!("Args: {:?}", ARGS);
-        println!("stdout: {} (limit: {} bytes)", STDOUT_FILE, STDOUT_LIMIT);
-        println!("stderr: {} (limit: {} bytes)", STDERR_FILE, STDERR_LIMIT);
+        println!("=== 带限制的输出捕获 ===");
+        println!("可执行文件: {}", EXECUTABLE);
+        println!("参数: {:?}", ARGS);
+        println!("stdout: {} (限制: {} 字节)", STDOUT_FILE, STDOUT_LIMIT);
+        println!("stderr: {} (限制: {} 字节)", STDERR_FILE, STDERR_LIMIT);
         println!();
     
-        // Open output files
+        // 打开输出文件
         let out_file = open(
             STDOUT_FILE,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::from_raw_mode(0o644),
         )
-        .expect("open stdout file");
+        .expect("打开 stdout 文件失败");
     
         let err_file = open(
             STDERR_FILE,
             OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC,
             Mode::from_raw_mode(0o644),
         )
-        .expect("open stderr file");
+        .expect("打开 stderr 文件失败");
     
-        // Create non-blocking pipes: (read_end, write_end)
+        // 创建非阻塞管道: (读端, 写端)
         let (stdout_read, stdout_write) =
-            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("pipe2 stdout");
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("创建 stdout 管道失败");
         let (stderr_read, stderr_write) =
-            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("pipe2 stderr");
+            pipe_with(PipeFlags::CLOEXEC | PipeFlags::NONBLOCK).expect("创建 stderr 管道失败");
     
-        // fork + exec via libc
+        // 通过 libc 进行 fork + exec
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            panic!("fork failed");
+            panic!("fork 失败");
         }
     
         if pid == 0 {
-            // ---- Child process ----
+            // ---- 子进程 ----
             unsafe {
                 libc::fcntl(stdout_write.as_raw_fd(), libc::F_SETFL, 0);
                 libc::fcntl(stderr_write.as_raw_fd(), libc::F_SETFL, 0);
@@ -109,7 +109,7 @@ mod imp {
             drop(out_file);
             drop(err_file);
     
-            // Build argv: [executable, args..., NULL]
+            // 构建 argv: [executable, args..., NULL]
             let exe_cstr = CString::new(EXECUTABLE).unwrap();
             let mut c_args: Vec<CString> = vec![exe_cstr.clone()];
             for a in ARGS {
@@ -128,7 +128,7 @@ mod imp {
             }
         }
     
-        // ---- Parent process ----
+        // ---- 父进程 ----
         drop(stdout_write);
         drop(stderr_write);
     
@@ -150,8 +150,8 @@ mod imp {
             limit: STDERR_LIMIT,
         };
     
-        // Create epoll
-        let epfd = epoll::create(CreateFlags::CLOEXEC).expect("epoll_create");
+        // 创建 epoll
+        let epfd = epoll::create(CreateFlags::CLOEXEC).expect("epoll_create 失败");
     
         epoll::add(
             &epfd,
@@ -159,7 +159,7 @@ mod imp {
             EventData::new_u64(0),
             EventFlags::IN | EventFlags::ET,
         )
-        .expect("epoll add stdout");
+        .expect("epoll 添加 stdout 失败");
     
         epoll::add(
             &epfd,
@@ -167,7 +167,7 @@ mod imp {
             EventData::new_u64(1),
             EventFlags::IN | EventFlags::ET,
         )
-        .expect("epoll add stderr");
+        .expect("epoll 添加 stderr 失败");
     
         let streams: [&StreamCtx; 2] = [&stdout_ctx, &stderr_ctx];
         let mut active_streams = 2u32;
@@ -176,10 +176,10 @@ mod imp {
         let mut limit_exceeded = false;
         let mut exceeded_stream: Option<&str> = None;
     
-        let child_pid = Pid::from_raw(pid).expect("invalid child pid");
+        let child_pid = Pid::from_raw(pid).expect("无效的子进程 pid");
     
         while active_streams > 0 {
-            epoll::wait(&epfd, &mut event_list, 100).expect("epoll_wait");
+            epoll::wait(&epfd, &mut event_list, 100).expect("epoll_wait 失败");
     
             for event in &event_list {
                 let idx = event.data.u64() as usize;
@@ -202,12 +202,12 @@ mod imp {
                     loop {
                         match ctx.drain() {
                             Ok(1..) => {
-                                // Check limit after each successful splice
+                                // 每次成功 splice 后检查限制
                                 if ctx.is_over_limit() && !limit_exceeded {
                                     limit_exceeded = true;
                                     exceeded_stream = Some(ctx.label);
                                     eprintln!(
-                                        "\n⚠️  {} limit exceeded ({} bytes >= {} limit), sending SIGKILL to pid {}",
+                                        "\n⚠️  {} 超出限制 ({} 字节 >= {} 限制)，向 pid {} 发送 SIGKILL",
                                         ctx.label,
                                         ctx.bytes.load(Ordering::Relaxed),
                                         ctx.limit,
@@ -229,12 +229,12 @@ mod imp {
                 }
             }
     
-            // If we killed the child, break out once pipes are drained
+            // 如果已终止子进程，在管道排空后退出循环
             if limit_exceeded && active_streams == 0 {
                 break;
             }
     
-            // Periodic monitoring
+            // 定期监控输出
             let now = clock_gettime(ClockId::Monotonic);
             let elapsed_ns = (now.tv_sec - last_report.tv_sec) as u64 * 1_000_000_000
                 + (now.tv_nsec as u64).saturating_sub(last_report.tv_nsec as u64);
@@ -242,7 +242,7 @@ mod imp {
                 let out = stdout_bytes.load(Ordering::Relaxed);
                 let err = stderr_bytes.load(Ordering::Relaxed);
                 eprint!(
-                    "\r[realtime] stdout: {} / {} B | stderr: {} / {} B",
+                    "\r[实时] stdout: {} / {} B | stderr: {} / {} B",
                     out, STDOUT_LIMIT, err, STDERR_LIMIT
                 );
                 last_report = now;
@@ -251,36 +251,36 @@ mod imp {
     
         eprintln!();
     
-        // Reap child
+        // 回收子进程
         let wait_result = waitpid(Some(child_pid), WaitOptions::empty());
         let exit_info = match wait_result {
             Ok(Some(status)) => {
                 if status.exited() {
-                    format!("exited with code {}", status.exit_status().unwrap_or(0))
+                    format!("正常退出，退出码 {}", status.exit_status().unwrap_or(0))
                 } else if status.signaled() {
                     format!(
-                        "killed by signal {}",
+                        "被信号 {} 终止",
                         status.terminating_signal().map_or(-1, |s| s as i32)
                     )
                 } else {
-                    "unknown status".to_string()
+                    "未知状态".to_string()
                 }
             }
-            Ok(None) => "child not yet terminated".to_string(),
-            Err(e) => format!("waitpid error: {:?}", e),
+            Ok(None) => "子进程尚未终止".to_string(),
+            Err(e) => format!("waitpid 错误: {:?}", e),
         };
     
         let out_total = stdout_bytes.load(Ordering::Relaxed);
         let err_total = stderr_bytes.load(Ordering::Relaxed);
     
-        println!("\n=== Final ===");
-        println!("Child: {}", exit_info);
-        println!("stdout: {} bytes -> {}", out_total, STDOUT_FILE);
-        println!("stderr: {} bytes -> {}", err_total, STDERR_FILE);
+        println!("\n=== 最终结果 ===");
+        println!("子进程: {}", exit_info);
+        println!("stdout: {} 字节 -> {}", out_total, STDOUT_FILE);
+        println!("stderr: {} 字节 -> {}", err_total, STDERR_FILE);
         if limit_exceeded {
             println!(
-                "⚠️  Terminated: {} exceeded limit (wrote {} bytes, limit was {})",
-                exceeded_stream.unwrap_or("unknown"),
+                "⚠️  已终止: {} 超出限制 (写入 {} 字节，限制为 {})",
+                exceeded_stream.unwrap_or("未知"),
                 if exceeded_stream == Some("stdout") {
                     out_total
                 } else {
@@ -293,7 +293,7 @@ mod imp {
                 }
             );
         } else {
-            println!("✅ Completed normally (no limit exceeded)");
+            println!("✅ 正常完成 (未超出限制)");
         }
     }
 }
@@ -304,8 +304,8 @@ fn main() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("This example only runs on Linux.");
-        eprintln!("For Windows, use windows_capture.rs instead.");
+        eprintln!("此示例仅在 Linux 上运行。");
+        eprintln!("Windows 请使用 windows_capture.rs。");
         std::process::exit(1);
     }
 }

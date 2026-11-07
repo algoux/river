@@ -1,13 +1,13 @@
-//! Comprehensive demonstration of seccompiler capabilities.
+//! seccompiler 能力的全面演示。
 //!
-//! Features demonstrated:
-//!   1. Basic allowlist/denylist filter construction
-//!   2. SeccompAction variants: Allow, Errno, Trace, Log
-//!   3. SeccompRule with argument matching (exact value, ranges, masks)
-//!   4. Filter compilation and application (single-thread & all-threads)
-//!   5. Error handling: invalid filters, permission issues, architecture mismatch
-//!   6. Runtime verification via /proc/self/status
-//!   7. Multi-stage sandbox escalation demo
+//! 演示的功能：
+//!   1. 基础 allowlist/denylist 过滤器构建
+//!   2. SeccompAction 变体：Allow、Errno、Trace、Log
+//!   3. 带参数匹配的 SeccompRule（精确值、范围、掩码）
+//!   4. 过滤器编译与应用（单线程 / 全线程）
+//!   5. 错误处理：无效过滤器、权限问题、架构不匹配
+//!   6. 通过 /proc/self/status 进行运行时验证
+//!   7. 多阶段沙箱升级演示
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -19,7 +19,7 @@ mod imp {
     use std::os::raw::c_long;
 
     // ========================================================================
-    // Helper utilities
+    // 辅助工具
     // ========================================================================
 
     fn last_errno() -> i32 {
@@ -28,7 +28,7 @@ mod imp {
             .unwrap_or(-1)
     }
 
-    /// Read Seccomp field from /proc/self/status
+    /// 从 /proc/self/status 读取 Seccomp 字段
     fn read_seccomp_status() -> Option<String> {
         std::fs::read_to_string("/proc/self/status")
             .ok()?
@@ -37,75 +37,74 @@ mod imp {
             .map(|line| line.trim().to_string())
     }
 
-    /// Print current seccomp status
+    /// 打印当前 seccomp 状态
     fn print_seccomp_status(label: &str) {
         match read_seccomp_status() {
             Some(status) => println!("  [{}] {}", label, status),
-            None => println!("  [{}] cannot read /proc/self/status", label),
+            None => println!("  [{}] 无法读取 /proc/self/status", label),
         }
     }
 
     // ========================================================================
-    // Stage 1: Basic Allowlist Filter
+    // 阶段 1：基础 Allowlist 过滤器
     // ========================================================================
 
-    /// Demonstrate basic allowlist filter: only specified syscalls are allowed,
-    /// everything else returns EPERM.
+    /// 演示基础 allowlist 过滤器：仅允许指定的系统调用，
+    /// 其余所有系统调用返回 EPERM。
     fn demo_basic_allowlist() {
-        println!("\n=== Stage 1: Basic Allowlist Filter ===");
-        println!("  Building a minimal allowlist filter...");
+        println!("\n=== 阶段 1：基础 Allowlist 过滤器 ===");
+        println!("  构建最小化 allowlist 过滤器...");
 
-        // Define allowed syscalls for this stage
+        // 定义此阶段允许的系统调用
         let allowed_syscalls: &[c_long] = &[
             libc::SYS_write,       // printf / println
-            libc::SYS_read,        // potential input
-            libc::SYS_close,       // cleanup
-            libc::SYS_exit_group,  // normal exit
-            libc::SYS_exit,        // fallback exit
-            libc::SYS_brk,         // memory allocation (println may need it)
-            libc::SYS_mmap,        // memory mapping
-            libc::SYS_munmap,      // memory unmapping
+            libc::SYS_read,        // 可能的输入操作
+            libc::SYS_close,       // 清理
+            libc::SYS_exit_group,  // 正常退出
+            libc::SYS_exit,        // 备用退出
+            libc::SYS_brk,         // 内存分配（println 可能需要）
+            libc::SYS_mmap,        // 内存映射
+            libc::SYS_munmap,      // 取消内存映射
             libc::SYS_rt_sigreturn,
-            libc::SYS_futex,       // threading primitives
+            libc::SYS_futex,       // 线程原语
             libc::SYS_sched_yield,
         ];
 
-        // Empty rule vec = allow unconditionally
+        // 空规则向量 = 无条件允许
         let rules: BTreeMap<i64, Vec<SeccompRule>> = allowed_syscalls
             .iter()
             .map(|&nr| (nr as i64, Vec::new()))
             .collect();
 
-        // Default action: return EPERM for unmatched syscalls
-        // Matched action: Allow
+        // 默认动作：未匹配的系统调用返回 EPERM
+        // 匹配动作：Allow
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Errno(libc::EPERM as u32), // default deny
-            SeccompAction::Allow,                      // explicit allow
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            SeccompAction::Errno(libc::EPERM as u32), // 默认拒绝
+            SeccompAction::Allow,                      // 显式允许
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         )
-        .expect("failed to build filter");
+        .expect("构建过滤器失败");
 
-        let bpf: BpfProgram = filter.try_into().expect("failed to compile BPF");
-        println!("  ✅ Filter compiled: {} BPF instructions", bpf.len());
+        let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
+        println!("  ✅ 过滤器已编译: {} 条 BPF 指令", bpf.len());
 
-        // Note: We don't actually apply this filter because it would restrict
-        // subsequent demo stages. Instead we just show it compiles correctly.
-        println!("  ℹ️  Filter not applied (would block subsequent demos)");
-        println!("  Allowed syscalls: {:?}", 
+        // 注意：此处不实际应用该过滤器，否则会阻止后续演示阶段。
+        println!("  ℹ️  过滤器未应用（会阻止后续演示）");
+        println!("  允许的系统调用: {:?}", 
             allowed_syscalls.iter().map(|&s| s as i64).collect::<Vec<_>>());
     }
 
     // ========================================================================
-    // Stage 2: Denylist Filter with Errno Action
+    // 阶段 2：带 Errno 动作的 Denylist 过滤器
     // ========================================================================
 
-    /// Demonstrate denylist: block specific dangerous syscalls, allow everything else.
+    /// 演示 denylist：阻止特定的危险系统调用，允许其余所有。
     fn demo_denylist() {
-        println!("\n=== Stage 2: Denylist Filter (Block Dangerous Syscalls) ===");
-        println!("  Building a denylist that blocks ptrace, reboot, kexec_load...");
+        println!("\n=== 阶段 2：Denylist 过滤器（阻止危险系统调用）===");
+        println!("  构建 denylist，阻止 ptrace、reboot、kexec_load 等...");
 
-        // Dangerous syscalls to block
+        // 要阻止的危险系统调用
         let blocked_syscalls: &[c_long] = &[
             libc::SYS_ptrace,
             libc::SYS_reboot,
@@ -117,7 +116,7 @@ mod imp {
             libc::SYS_swapoff,
         ];
 
-        // For denylist: matched syscalls get Errno, unmatched get Allow
+        // 对于 denylist：匹配的系统调用返回 Errno，未匹配的允许
         let rules: BTreeMap<i64, Vec<SeccompRule>> = blocked_syscalls
             .iter()
             .map(|&nr| (nr as i64, Vec::new()))
@@ -125,40 +124,40 @@ mod imp {
 
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Allow,                       // default: allow
-            SeccompAction::Errno(libc::EPERM as u32),   // matched: deny
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            SeccompAction::Allow,                       // 默认：允许
+            SeccompAction::Errno(libc::EPERM as u32),   // 匹配：拒绝
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         )
-        .expect("failed to build denylist filter");
+        .expect("构建 denylist 过滤器失败");
 
-        let bpf: BpfProgram = filter.try_into().expect("failed to compile BPF");
-        println!("  ✅ Denylist filter compiled: {} BPF instructions", bpf.len());
-        println!("  Blocked syscalls: {:?}", 
+        let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
+        println!("  ✅ Denylist 过滤器已编译: {} 条 BPF 指令", bpf.len());
+        println!("  被阻止的系统调用: {:?}", 
             blocked_syscalls.iter().map(|&s| s as i64).collect::<Vec<_>>());
     }
 
     // ========================================================================
-    // Stage 3: Argument Matching with SeccompRule
+    // 阶段 3：使用 SeccompRule 进行参数匹配
     // ========================================================================
 
-    /// Demonstrate fine-grained syscall filtering based on arguments.
+    /// 演示基于系统调用参数的精细过滤。
     fn demo_argument_matching() {
-        println!("\n=== Stage 3: Argument Matching Rules ===");
-        println!("  Building filters with syscall argument conditions...");
+        println!("\n=== 阶段 3：参数匹配规则 ===");
+        println!("  构建带系统调用参数条件的过滤器...");
 
         let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-        // Rule 1: Allow write() only to stdout (fd=1) and stderr (fd=2)
+        // 规则 1：仅允许 write() 写入 stdout (fd=1) 和 stderr (fd=2)
         // int write(int fd, const void *buf, size_t count);
-        // Arg 0 is the file descriptor
+        // 参数 0 是文件描述符
         let write_stdout_rule = SeccompRule::new(vec![
             SeccompCondition::new(
-                0,                              // arg index
-                SeccompCmpArgLen::Dword,        // 32-bit comparison
-                SeccompCmpOp::Eq,               // equal to
+                0,                              // 参数索引
+                SeccompCmpArgLen::Dword,        // 32 位比较
+                SeccompCmpOp::Eq,               // 等于
                 1,                              // stdout fd
-            ).expect("invalid condition"),
-        ]).expect("invalid rule");
+            ).expect("无效的条件"),
+        ]).expect("无效的规则");
 
         let write_stderr_rule = SeccompRule::new(vec![
             SeccompCondition::new(
@@ -166,40 +165,40 @@ mod imp {
                 SeccompCmpArgLen::Dword,
                 SeccompCmpOp::Eq,
                 2,                              // stderr fd
-            ).expect("invalid condition"),
-        ]).expect("invalid rule");
+            ).expect("无效的条件"),
+        ]).expect("无效的规则");
 
         rules.insert(libc::SYS_write as i64, vec![write_stdout_rule, write_stderr_rule]);
 
-        // Rule 2: Allow openat() only with O_RDONLY flag
+        // 规则 2：仅允许 openat() 使用 O_RDONLY 标志
         // int openat(int dirfd, const char *pathname, int flags, ...);
-        // Arg 2 is the flags parameter
+        // 参数 2 是 flags 参数
         let open_rdonly_rule = SeccompRule::new(vec![
             SeccompCondition::new(
-                2,                              // flags argument
+                2,                              // flags 参数
                 SeccompCmpArgLen::Dword,
                 SeccompCmpOp::Eq,
                 libc::O_RDONLY as u64,
-            ).expect("invalid condition"),
-        ]).expect("invalid rule");
+            ).expect("无效的条件"),
+        ]).expect("无效的规则");
 
         rules.insert(libc::SYS_openat as i64, vec![open_rdonly_rule]);
 
-        // Rule 3: Allow mmap with PROT_READ only (no write/exec)
+        // 规则 3：仅允许 mmap 使用 PROT_READ（不允许写入/执行）
         // void *mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
-        // Arg 2 is prot
+        // 参数 2 是 prot
         let mmap_read_rule = SeccompRule::new(vec![
             SeccompCondition::new(
-                2,                              // prot argument
+                2,                              // prot 参数
                 SeccompCmpArgLen::Dword,
                 SeccompCmpOp::Eq,
                 libc::PROT_READ as u64,
-            ).expect("invalid condition"),
-        ]).expect("invalid rule");
+            ).expect("无效的条件"),
+        ]).expect("无效的规则");
 
         rules.insert(libc::SYS_mmap as i64, vec![mmap_read_rule]);
 
-        // Add essential syscalls without restrictions
+        // 添加不受限制的必要系统调用
         let essential: &[c_long] = &[
             libc::SYS_close,
             libc::SYS_exit_group,
@@ -220,51 +219,51 @@ mod imp {
             rules.clone(),
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         )
-        .expect("failed to build argument-matching filter");
+        .expect("构建参数匹配过滤器失败");
 
-        let bpf: BpfProgram = filter.try_into().expect("failed to compile BPF");
-        println!("  ✅ Argument-matching filter compiled: {} BPF instructions", bpf.len());
-        println!("  Rules summary:");
-        println!("    • write(fd=1 OR fd=2) → Allow");
-        println!("    • openat(flags=O_RDONLY) → Allow");
-        println!("    • mmap(prot=PROT_READ) → Allow");
-        println!("    • essential syscalls → Allow (unconditional)");
-        println!("    • everything else → EPERM");
+        let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
+        println!("  ✅ 参数匹配过滤器已编译: {} 条 BPF 指令", bpf.len());
+        println!("  规则摘要:");
+        println!("    • write(fd=1 或 fd=2) → 允许");
+        println!("    • openat(flags=O_RDONLY) → 允许");
+        println!("    • mmap(prot=PROT_READ) → 允许");
+        println!("    • 必要系统调用 → 允许（无条件）");
+        println!("    • 其余所有 → EPERM");
     }
 
     // ========================================================================
-    // Stage 4: Multiple Action Types
+    // 阶段 4：多种动作类型
     // ========================================================================
 
-    /// Demonstrate different SeccompAction variants.
+    /// 演示不同的 SeccompAction 变体。
     fn demo_action_types() {
-        println!("\n=== Stage 4: SeccompAction Variants ===");
-        println!("  Demonstrating different actions for matched/unmatched syscalls...");
+        println!("\n=== 阶段 4：SeccompAction 变体 ===");
+        println!("  演示匹配/未匹配系统调用的不同动作...");
 
-        // Action types available in seccompiler:
-        // - Allow: permit the syscall
-        // - Errno(errno): return specified errno
-        // - Trace(tracer_id): notify tracer via PTRACE_SECCOMP
-        // - Log: allow but log to audit (requires CAP_AUDIT_WRITE or root)
-        // - Kill: terminate the process immediately
-        // - KillProcess: terminate entire process group
+        // seccompiler 中可用的动作类型：
+        // - Allow: 允许该系统调用
+        // - Errno(errno): 返回指定的 errno
+        // - Trace(tracer_id): 通过 PTRACE_SECCOMP 通知跟踪器
+        // - Log: 允许但记录到审计日志（需要 CAP_AUDIT_WRITE 或 root）
+        // - Kill: 立即终止该线程
+        // - KillProcess: 终止整个进程组
 
-        println!("  Available SeccompAction variants:");
-        println!("    • Allow           — permit syscall");
-        println!("    • Errno(n)        — return errno n to caller");
-        println!("    • Trace(id)       — notify ptrace tracer");
-        println!("    • Log             — allow + audit log (needs privileges)");
-        println!("    • Kill            — SIGKILL the thread");
-        println!("    • KillProcess     — SIGKILL entire process");
+        println!("  可用的 SeccompAction 变体:");
+        println!("    • Allow           — 允许系统调用");
+        println!("    • Errno(n)        — 向调用者返回 errno n");
+        println!("    • Trace(id)       — 通知 ptrace 跟踪器");
+        println!("    • Log             — 允许 + 审计日志（需要特权）");
+        println!("    • Kill            — SIGKILL 终止线程");
+        println!("    • KillProcess     — SIGKILL 终止整个进程");
 
-        // Build a filter using Log action (if privileged) or Errno as fallback
+        // 使用 Log 动作构建过滤器（有特权时），否则回退到 Errno
         let log_action = if unsafe { libc::geteuid() } == 0 {
-            println!("  Running as root: using Log action for demonstration");
+            println!("  以 root 运行: 使用 Log 动作进行演示");
             SeccompAction::Log
         } else {
-            println!("  Non-root: using Errno(ENOSYS) instead of Log");
+            println!("  非 root: 使用 Errno(ENOSYS) 替代 Log");
             SeccompAction::Errno(libc::ENOSYS as u32)
         };
 
@@ -276,37 +275,37 @@ mod imp {
 
         let filter = SeccompFilter::new(
             rules,
-            SeccompAction::Allow,  // default allow
-            log_action,            // matched action (Log or Errno)
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            SeccompAction::Allow,  // 默认允许
+            log_action,            // 匹配动作（Log 或 Errno）
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         )
-        .expect("failed to build action demo filter");
+        .expect("构建动作演示过滤器失败");
 
-        let bpf: BpfProgram = filter.try_into().expect("failed to compile BPF");
-        println!("  ✅ Action-type filter compiled: {} BPF instructions", bpf.len());
+        let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
+        println!("  ✅ 动作类型过滤器已编译: {} 条 BPF 指令", bpf.len());
     }
 
     // ========================================================================
-    // Stage 5: Live Filter Application (in child process)
+    // 阶段 5：实时过滤器应用（在子进程中）
     // ========================================================================
 
-    /// Fork a child that applies a real seccomp filter and verifies it works.
+    /// fork 一个子进程，在其中应用真实的 seccomp 过滤器并验证其生效。
     fn demo_live_filter() {
-        println!("\n=== Stage 5: Live Filter Application (Child Process) ===");
-        println!("  Forking child to apply and verify seccomp filter...");
+        println!("\n=== 阶段 5：实时过滤器应用（子进程）===");
+        println!("  fork 子进程以应用并验证 seccomp 过滤器...");
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            eprintln!("  ❌ fork failed: {}", std::io::Error::last_os_error());
+            eprintln!("  ❌ fork 失败: {}", std::io::Error::last_os_error());
             return;
         }
 
         if pid == 0 {
-            // ---- Child process ----
+            // ---- 子进程 ----
             child_apply_and_verify();
         }
 
-        // ---- Parent: wait for child ----
+        // ---- 父进程：等待子进程 ----
         let mut status: libc::c_int = 0;
         unsafe {
             libc::waitpid(pid, &mut status, 0);
@@ -315,25 +314,25 @@ mod imp {
         if libc::WIFEXITED(status) {
             let code = libc::WEXITSTATUS(status);
             if code == 0 {
-                println!("  ✅ Child completed successfully (exit code 0)");
+                println!("  ✅ 子进程成功完成（退出码 0）");
             } else {
-                println!("  ⚠️  Child exited with code {}", code);
+                println!("  ⚠️  子进程以退出码 {} 退出", code);
             }
         } else if libc::WIFSIGNALED(status) {
             let sig = libc::WTERMSIG(status);
-            println!("  ⚠️  Child killed by signal {}", sig);
+            println!("  ⚠️  子进程被信号 {} 终止", sig);
         }
     }
 
-    /// Child-side: apply seccomp filter and test that blocked syscalls fail.
+    /// 子进程侧：应用 seccomp 过滤器并测试被阻止的系统调用确实失败。
     fn child_apply_and_verify() -> ! {
-        // Step 1: Set no_new_privs (required for unprivileged seccomp)
+        // 步骤 1：设置 no_new_privs（非特权 seccomp 所必需）
         if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
-            eprintln!("  ❌ prctl(NO_NEW_PRIVS) failed: {}", std::io::Error::last_os_error());
+            eprintln!("  ❌ prctl(NO_NEW_PRIVS) 失败: {}", std::io::Error::last_os_error());
             unsafe { libc::_exit(1) };
         }
 
-        // Step 2: Build a restrictive filter
+        // 步骤 2：构建限制性过滤器
         let allowed: &[c_long] = &[
             libc::SYS_write,
             libc::SYS_read,
@@ -347,7 +346,7 @@ mod imp {
             libc::SYS_munmap,
             libc::SYS_sched_yield,
             libc::SYS_getpid,
-            // File I/O needed for read_to_string("/proc/self/status")
+            // read_to_string("/proc/self/status") 所需的文件 I/O
             libc::SYS_openat,
             libc::SYS_lseek,
             libc::SYS_fstat,
@@ -365,11 +364,11 @@ mod imp {
             rules,
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         ) {
             Ok(f) => f,
             Err(e) => {
-                eprintln!("  ❌ Filter build failed: {:?}", e);
+                eprintln!("  ❌ 过滤器构建失败: {:?}", e);
                 unsafe { libc::_exit(2) };
             }
         };
@@ -377,28 +376,28 @@ mod imp {
         let bpf: BpfProgram = match filter.try_into() {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("  ❌ BPF compilation failed: {:?}", e);
+                eprintln!("  ❌ BPF 编译失败: {:?}", e);
                 unsafe { libc::_exit(3) };
             }
         };
 
-        // Step 3: Apply filter to all threads
+        // 步骤 3：将过滤器应用到所有线程
         if let Err(e) = apply_filter_all_threads(&bpf) {
-            eprintln!("  ❌ apply_filter_all_threads failed: {:?}", e);
+            eprintln!("  ❌ apply_filter_all_threads 失败: {:?}", e);
             unsafe { libc::_exit(4) };
         }
 
-        // Step 4: Verify via /proc
+        // 步骤 4：通过 /proc 验证
         match read_seccomp_status() {
             Some(status) if status.contains('2') => {
-                // Write success message to stderr (fd=2)
-                let msg = b"  \xe2\x9c\x85 Seccomp filter active (Seccomp: 2)\n";
+                // 将成功消息写入 stderr (fd=2)
+                let msg = b"\x20\x20\xe2\x9c\x85\x20Seccomp \xe8\xbf\x87\xe6\xbb\xa4\xe5\x99\xa8\xe5\xb7\xb2\xe7\x94\x9f\xe6\x95\x88 (Seccomp: 2)\n";
                 unsafe {
                     libc::write(2, msg.as_ptr() as *const _, msg.len());
                 }
             }
             other => {
-                let msg = format!("  ❌ Unexpected seccomp status: {:?}\n", other);
+                let msg = format!("  ❌ 意外的 seccomp 状态: {:?}\n", other);
                 unsafe {
                     libc::write(2, msg.as_ptr() as *const _, msg.len());
                 }
@@ -406,19 +405,19 @@ mod imp {
             }
         }
 
-        // Step 5: Test that a blocked syscall actually fails
-        // Try to call getuid which is NOT in our allowlist
+        // 步骤 5：测试被阻止的系统调用确实失败
+        // 尝试调用不在白名单中的 getuid
         let result = unsafe { libc::syscall(libc::SYS_getuid) };
         let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         
         if result == -1 && errno == libc::EPERM {
-            let msg = b"  \xe2\x9c\x85 Blocked syscall (getuid) correctly returned EPERM\n";
+            let msg = b"\x20\x20\xe2\x9c\x85\x20\xe8\xa2\xab\xe9\x98\xbb\xe6\xad\xa2\xe7\x9a\x84\xe7\xb3\xbb\xe7\xbb\x9f\xe8\xb0\x83\xe7\x94\xa8 (getuid) \xe6\xad\xa3\xe7\xa1\xae\xe8\xbf\x94\xe5\x9b\x9e EPERM\n";
             unsafe {
                 libc::write(2, msg.as_ptr() as *const _, msg.len());
             }
         } else {
             let msg = format!(
-                "  ❌ Blocked syscall unexpectedly succeeded: ret={}, errno={}\n",
+                "  ❌ 被阻止的系统调用意外成功: ret={}, errno={}\n",
                 result, errno
             );
             unsafe {
@@ -427,10 +426,10 @@ mod imp {
             unsafe { libc::_exit(6) };
         }
 
-        // Step 6: Test that allowed syscalls still work
+        // 步骤 6：测试允许的系统调用仍然正常工作
         let my_pid = unsafe { libc::getpid() };
         if my_pid > 0 {
-            let msg = b"  \xe2\x9c\x85 Allowed syscall (getpid) works correctly\n";
+            let msg = b"\x20\x20\xe2\x9c\x85\x20\xe5\x85\x81\xe8\xae\xb8\xe7\x9a\x84\xe7\xb3\xbb\xe7\xbb\x9f\xe8\xb0\x83\xe7\x94\xa8 (getpid) \xe6\xad\xa3\xe5\xb8\xb8\xe5\xb7\xa5\xe4\xbd\x9c\n";
             unsafe {
                 libc::write(2, msg.as_ptr() as *const _, msg.len());
             }
@@ -440,28 +439,28 @@ mod imp {
     }
 
     // ========================================================================
-    // Stage 6: Single-thread vs All-threads Application
+    // 阶段 6：单线程 vs 全线程应用
     // ========================================================================
 
-    /// Demonstrate the difference between apply_filter and apply_filter_all_threads.
+    /// 演示 apply_filter 与 apply_filter_all_threads 的区别。
     fn demo_thread_scope() {
-        println!("\n=== Stage 6: Thread Scope (apply_filter vs apply_filter_all_threads) ===");
-        println!("  Comparing single-thread and all-threads filter application...");
+        println!("\n=== 阶段 6：线程作用域 (apply_filter vs apply_filter_all_threads) ===");
+        println!("  比较单线程和全线程过滤器应用...");
 
-        println!("  API differences:");
-        println!("    • apply_filter(&bpf)          — applies to current thread only");
-        println!("    • apply_filter_all_threads(&bpf) — applies to all threads (TSYNC)");
-        println!("                                     requires PR_SET_NO_NEW_PRIVS or CAP_SYS_ADMIN");
+        println!("  API 区别:");
+        println!("    • apply_filter(&bpf)          — 仅应用到当前线程");
+        println!("    • apply_filter_all_threads(&bpf) — 应用到所有线程 (TSYNC)");
+        println!("                                     需要 PR_SET_NO_NEW_PRIVS 或 CAP_SYS_ADMIN");
 
-        // In a forked child, demonstrate both approaches
+        // 在 fork 的子进程中演示两种方式
         let pid = unsafe { libc::fork() };
         if pid < 0 {
-            eprintln!("  ❌ fork failed");
+            eprintln!("  ❌ fork 失败");
             return;
         }
 
         if pid == 0 {
-            // Child: use single-thread apply_filter
+            // 子进程：使用单线程 apply_filter
             if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
                 unsafe { libc::_exit(1) };
             }
@@ -486,20 +485,20 @@ mod imp {
                 rules,
                 SeccompAction::Errno(libc::EPERM as u32),
                 SeccompAction::Allow,
-                std::env::consts::ARCH.try_into().expect("unsupported arch"),
+                std::env::consts::ARCH.try_into().expect("不支持的架构"),
             )
-            .expect("filter build");
+            .expect("构建过滤器失败");
 
-            let bpf: BpfProgram = filter.try_into().expect("bpf compile");
+            let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
 
-            // Use single-thread version
+            // 使用单线程版本
             match apply_filter(&bpf) {
                 Ok(()) => {
-                    let msg = b"  \xe2\x9c\x85 apply_filter (single-thread) succeeded\n";
+                    let msg = b"\x20\x20\xe2\x9c\x85\x20apply_filter\xef\xbc\x88\xe5\x8d\x95\xe7\xba\xbf\xe7\xa8\x8b\xef\xbc\x89\xe6\x88\x90\xe5\x8a\x9f\n";
                     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
                 }
                 Err(e) => {
-                    let msg = format!("  ❌ apply_filter failed: {:?}\n", e);
+                    let msg = format!("  ❌ apply_filter 失败: {:?}\n", e);
                     unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()) };
                 }
             }
@@ -507,92 +506,94 @@ mod imp {
             unsafe { libc::_exit(0) };
         }
 
-        // Parent waits
+        // 父进程等待
         let mut status: libc::c_int = 0;
-        unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe {
+            libc::waitpid(pid, &mut status, 0);
+        };
         
         if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-            println!("  ✅ Single-thread filter application verified in child");
+            println!("  ✅ 已在子进程中验证单线程过滤器应用");
         }
     }
 
     // ========================================================================
-    // Stage 7: Error Handling & Edge Cases
+    // 阶段 7：错误处理与边界情况
     // ========================================================================
 
-    /// Demonstrate error conditions and edge cases.
+    /// 演示错误条件和边界情况。
     fn demo_error_handling() {
-        println!("\n=== Stage 7: Error Handling & Edge Cases ===");
+        println!("\n=== 阶段 7：错误处理与边界情况 ===");
 
-        // Case 1: Empty filter (no rules at all)
-        println!("  Case 1: Empty filter (deny everything)...");
+        // 情况 1：空过滤器（无任何规则）
+        println!("  情况 1：空过滤器（拒绝一切）...");
         let empty_rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
         match SeccompFilter::new(
             empty_rules,
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         ) {
             Ok(filter) => {
                 let bpf: Result<BpfProgram, _> = filter.try_into();
                 match bpf {
-                    Ok(prog) => println!("    ✅ Empty filter compiled ({} instructions) — will deny all syscalls", prog.len()),
-                    Err(e) => println!("    ⚠️  Empty filter compilation failed: {:?}", e),
+                    Ok(prog) => println!("    ✅ 空过滤器已编译（{} 条指令）— 将拒绝所有系统调用", prog.len()),
+                    Err(e) => println!("    ⚠️  空过滤器编译失败: {:?}", e),
                 }
             }
-            Err(e) => println!("    ⚠️  Empty filter creation failed: {:?}", e),
+            Err(e) => println!("    ⚠️  空过滤器创建失败: {:?}", e),
         }
 
-        // Case 2: Invalid architecture string
-        println!("  Case 2: Invalid architecture...");
+        // 情况 2：无效的架构字符串
+        println!("  情况 2：无效架构...");
         let rules: BTreeMap<i64, Vec<SeccompRule>> = [(libc::SYS_write as i64, Vec::new())]
             .into_iter()
             .collect();
         
-        // Try to create with an invalid arch by using try_into on a bad string
+        // 尝试对无效字符串使用 try_into 来创建无效架构
         let bad_arch_result: Result<seccompiler::TargetArch, _> = "invalid_arch".try_into();
         match bad_arch_result {
-            Ok(_) => println!("    ⚠️  Unexpectedly accepted invalid arch"),
-            Err(_) => println!("    ✅ Correctly rejected invalid architecture string"),
+            Ok(_) => println!("    ⚠️  意外接受了无效架构"),
+            Err(_) => println!("    ✅ 正确拒绝了无效架构字符串"),
         }
 
-        // Case 3: Applying filter without NO_NEW_PRIVS (should fail for non-root)
-        println!("  Case 3: Apply without NO_NEW_PRIVS (non-root)...");
+        // 情况 3：未设置 NO_NEW_PRIVS 时应用过滤器（非 root 应失败）
+        println!("  情况 3：未设置 NO_NEW_PRIVS 时应用（非 root）...");
         if unsafe { libc::geteuid() } != 0 {
             let filter = SeccompFilter::new(
                 rules.clone(),
                 SeccompAction::Errno(libc::EPERM as u32),
                 SeccompAction::Allow,
-                std::env::consts::ARCH.try_into().expect("unsupported arch"),
+                std::env::consts::ARCH.try_into().expect("不支持的架构"),
             )
-            .expect("filter build");
+            .expect("构建过滤器失败");
 
-            let bpf: BpfProgram = filter.try_into().expect("bpf compile");
+            let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
 
-            // This should fail without NO_NEW_PRIVS when not root
+            // 非 root 且未设置 NO_NEW_PRIVS 时应失败
             match apply_filter_all_threads(&bpf) {
-                Ok(()) => println!("    ⚠️  Filter applied without NO_NEW_PRIVS (unexpected for non-root)"),
-                Err(e) => println!("    ✅ Correctly failed without NO_NEW_PRIVS: {:?}", e),
+                Ok(()) => println!("    ⚠️  未设置 NO_NEW_PRIVS 却成功应用了过滤器（非 root 下不应发生）"),
+                Err(e) => println!("    ✅ 未设置 NO_NEW_PRIVS 时正确失败: {:?}", e),
             }
         } else {
-            println!("    ℹ️  Running as root — skipping this test (would succeed)");
+            println!("    ℹ️  以 root 运行 — 跳过此测试（root 下会成功）");
         }
 
-        // Case 4: Duplicate syscall entries in rules
-        println!("  Case 4: Multiple rules for same syscall (OR semantics)...");
+        // 情况 4：同一系统调用的重复规则条目
+        println!("  情况 4：同一系统调用的多条规则（OR 语义）...");
         let multi_rules: BTreeMap<i64, Vec<SeccompRule>> = [(
             libc::SYS_write as i64,
             vec![
                 SeccompRule::new(vec![
                     SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 1)
-                        .expect("cond"),
+                        .expect("条件"),
                 ])
-                .expect("rule"),
+                .expect("规则"),
                 SeccompRule::new(vec![
                     SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, 2)
-                        .expect("cond"),
+                        .expect("条件"),
                 ])
-                .expect("rule"),
+                .expect("规则"),
             ],
         )]
         .into_iter()
@@ -602,22 +603,22 @@ mod imp {
             multi_rules,
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         ) {
             Ok(f) => {
-                let bpf: BpfProgram = f.try_into().expect("bpf");
-                println!("    ✅ Multiple rules per syscall compiled ({} instructions)", bpf.len());
-                println!("       (rules within a syscall are OR'd together)");
+                let bpf: BpfProgram = f.try_into().expect("编译 BPF 失败");
+                println!("    ✅ 同一系统调用的多条规则已编译（{} 条指令）", bpf.len());
+                println!("       （同一系统调用内的规则以 OR 组合）");
             }
-            Err(e) => println!("    ❌ Failed: {:?}", e),
+            Err(e) => println!("    ❌ 失败: {:?}", e),
         }
 
-        // Case 5: Mask-based comparison
-        println!("  Case 5: Mask-based argument comparison...");
+        // 情况 5：基于掩码的比较
+        println!("  情况 5：基于掩码的参数比较...");
         let mask_rules: BTreeMap<i64, Vec<SeccompRule>> = [(
             libc::SYS_openat as i64,
             vec![
-                // Allow openat with O_RDONLY | O_CLOEXEC combination
+                // 允许 openat 使用 O_RDONLY | O_CLOEXEC 组合
                 SeccompRule::new(vec![
                     SeccompCondition::new(
                         2,
@@ -625,9 +626,9 @@ mod imp {
                         SeccompCmpOp::MaskedEq((libc::O_RDONLY | libc::O_CLOEXEC) as u64),
                         (libc::O_RDONLY | libc::O_CLOEXEC) as u64,
                     )
-                    .expect("cond"),
+                    .expect("条件"),
                 ])
-                .expect("rule"),
+                .expect("规则"),
             ],
         )]
         .into_iter()
@@ -637,30 +638,30 @@ mod imp {
             mask_rules,
             SeccompAction::Errno(libc::EPERM as u32),
             SeccompAction::Allow,
-            std::env::consts::ARCH.try_into().expect("unsupported arch"),
+            std::env::consts::ARCH.try_into().expect("不支持的架构"),
         ) {
             Ok(f) => {
-                let bpf: BpfProgram = f.try_into().expect("bpf");
-                println!("    ✅ MaskedEq comparison compiled ({} instructions)", bpf.len());
+                let bpf: BpfProgram = f.try_into().expect("编译 BPF 失败");
+                println!("    ✅ MaskedEq 比较已编译（{} 条指令）", bpf.len());
             }
-            Err(e) => println!("    ❌ Failed: {:?}", e),
+            Err(e) => println!("    ❌ 失败: {:?}", e),
         }
     }
 
     // ========================================================================
-    // Main entry point
+    // 主入口
     // ========================================================================
 
     pub fn run() {
         println!("╔══════════════════════════════════════════════╗");
-        println!("║     seccompiler Capability Demo              ║");
+        println!("║     seccompiler 能力演示                     ║");
         println!("╚══════════════════════════════════════════════╝\n");
 
-        println!("Library: seccompiler v{}", env!("CARGO_PKG_VERSION"));
-        println!("Architecture: {}", std::env::consts::ARCH);
-        print_seccomp_status("Initial");
+        println!("库版本: seccompiler v{}", env!("CARGO_PKG_VERSION"));
+        println!("架构: {}", std::env::consts::ARCH);
+        print_seccomp_status("初始状态");
 
-        // Run all demo stages
+        // 运行所有演示阶段
         demo_basic_allowlist();
         demo_denylist();
         demo_argument_matching();
@@ -670,7 +671,7 @@ mod imp {
         demo_error_handling();
 
         println!("\n╔══════════════════════════════════════════════╗");
-        println!("║     All stages complete                      ║");
+        println!("║     所有阶段已完成                           ║");
         println!("╚══════════════════════════════════════════════╝");
     }
 }
@@ -681,8 +682,8 @@ fn main() {
 
     #[cfg(not(target_os = "linux"))]
     {
-        eprintln!("This example only runs on Linux.");
-        eprintln!("seccompiler uses Linux seccomp-bpf which is not available on other platforms.");
+        eprintln!("此示例仅在 Linux 上运行。");
+        eprintln!("seccompiler 使用 Linux seccomp-bpf，其他平台不可用。");
         std::process::exit(1);
     }
 }

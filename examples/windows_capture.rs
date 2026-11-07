@@ -1,14 +1,13 @@
-//! Windows equivalent of linux_capture.rs
+//! linux_capture.rs 的 Windows 对等实现
 //!
-//! Captures stdout/stderr of a child process with size limits,
-//! using dedicated reader threads + anonymous pipes for reliable capture.
+//! 使用专用读取线程 + 匿名管道可靠地捕获子进程的 stdout/stderr，并支持大小限制。
 //!
-//! Key differences from the Linux version:
-//! - No splice (zero-copy): data goes through user-space buffers
-//! - Reader threads replace epoll (anonymous pipes don't support IOCP)
-//! - Anonymous pipes (CreatePipe) replace non-blocking anonymous pipes
-//! - TerminateProcess replaces SIGKILL
-//! - CreateProcessW replaces fork+exec
+//! 与 Linux 版本的主要区别：
+//! - 无 splice（零拷贝）：数据经过用户空间缓冲区中转
+//! - 用读取线程替代 epoll（匿名管道不支持 IOCP）
+//! - 用 CreatePipe 匿名管道替代非阻塞匿名管道
+//! - 用 TerminateProcess 替代 SIGKILL
+//! - 用 CreateProcessW 替代 fork+exec
 
 #[cfg(windows)]
 mod imp {
@@ -30,18 +29,18 @@ mod imp {
         PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
 
-    // ======================== Configuration ========================
+    // ======================== 配置 ========================
     const EXECUTABLE: &str = "cmd.exe";
     const ARGS: &[&str] = &["/C", "dir /s C:\\Windows\\System32"];
     const STDOUT_FILE: &str = "captured_stdout.bin";
     const STDERR_FILE: &str = "captured_stderr.bin";
     const STDOUT_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
     const STDERR_LIMIT: usize = 5 * 1024 * 1024; // 5 MB
-    const BUF_SIZE: u32 = 65536; // 64 KB per read
+    const BUF_SIZE: u32 = 65536; // 每次读取 64 KB
     const MONITOR_INTERVAL: Duration = Duration::from_millis(100);
     // ===============================================================
 
-    /// Convert a Rust string to a null-terminated wide string (UTF-16).
+    /// 将 Rust 字符串转换为以 null 结尾的宽字符串 (UTF-16)。
     fn to_wide(s: &str) -> Vec<u16> {
         OsStr::new(s)
             .encode_wide()
@@ -49,7 +48,7 @@ mod imp {
             .collect()
     }
 
-    /// Build a mutable wide-string command line for CreateProcessW.
+    /// 为 CreateProcessW 构建可变宽字符串命令行。
     fn build_command_line(exe: &str, args: &[&str]) -> Vec<u16> {
         let mut cmd = String::new();
         cmd.push('"');
@@ -68,8 +67,8 @@ mod imp {
         to_wide(&cmd)
     }
 
-    /// Reader thread: reads from pipe handle, writes to file handle, enforces limit.
-    /// Takes handles as usize to satisfy Send bound; converts back inside.
+    /// 读取线程：从管道句柄读取数据，写入文件句柄，并执行大小限制检查。
+    /// 句柄以 usize 传入以满足 Send 约束，在函数内部转换回 HANDLE。
     unsafe fn reader_thread(
         pipe_read_raw: usize,
         file_write_raw: usize,
@@ -98,7 +97,7 @@ mod imp {
             };
 
             if ok == 0 || bytes_read == 0 {
-                // Pipe closed or error → EOF
+                // 管道关闭或出错 → EOF
                 break;
             }
 
@@ -121,18 +120,18 @@ mod imp {
                 bytes_counter.fetch_add(written as usize, Ordering::Relaxed);
             }
 
-            // Check limit
+            // 检查是否超出限制
             if bytes_counter.load(Ordering::Relaxed) >= limit {
                 if !kill_flag.swap(true, Ordering::SeqCst) {
                     eprintln!(
-                        "\n⚠️  {} limit exceeded ({} bytes >= {} limit), terminating child",
+                        "\n⚠️  {} 超出限制 ({} 字节 >= {} 限制)，正在终止子进程",
                         label,
                         bytes_counter.load(Ordering::Relaxed),
                         limit,
                     );
                     unsafe { TerminateProcess(child_process, 1) };
                 }
-                // Drain remaining pipe data up to limit (already at limit, skip)
+                // 已达限制，排空管道剩余数据后退出
                 break;
             }
         }
@@ -142,15 +141,15 @@ mod imp {
     }
 
     pub fn run() {
-        println!("=== Windows Capture with Limit ===");
-        println!("Executable: {}", EXECUTABLE);
-        println!("Args: {:?}", ARGS);
-        println!("stdout: {} (limit: {} bytes)", STDOUT_FILE, STDOUT_LIMIT);
-        println!("stderr: {} (limit: {} bytes)", STDERR_FILE, STDERR_LIMIT);
+        println!("=== Windows 带限制的输出捕获 ===");
+        println!("可执行文件: {}", EXECUTABLE);
+        println!("参数: {:?}", ARGS);
+        println!("stdout: {} (限制: {} 字节)", STDOUT_FILE, STDOUT_LIMIT);
+        println!("stderr: {} (限制: {} 字节)", STDERR_FILE, STDERR_LIMIT);
         println!();
 
         unsafe {
-            // ---- Create output files ----
+            // ---- 创建输出文件 ----
             let stdout_file_wide = to_wide(STDOUT_FILE);
             let stderr_file_wide = to_wide(STDERR_FILE);
 
@@ -165,7 +164,7 @@ mod imp {
             );
             assert!(
                 stdout_file != INVALID_HANDLE_VALUE,
-                "CreateFileW stdout failed"
+                "CreateFileW stdout 失败"
             );
 
             let stderr_file = CreateFileW(
@@ -179,13 +178,13 @@ mod imp {
             );
             assert!(
                 stderr_file != INVALID_HANDLE_VALUE,
-                "CreateFileW stderr failed"
+                "CreateFileW stderr 失败"
             );
 
-            // ---- Create anonymous pipes (inheritable for child) ----
+            // ---- 创建匿名管道（可继承，供子进程使用）----
             let mut sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES = core::mem::zeroed();
             sa.nLength = size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32;
-            sa.bInheritHandle = 1; // TRUE — critical for child to inherit pipe handles
+            sa.bInheritHandle = 1; // TRUE — 子进程必须能继承管道句柄
             sa.lpSecurityDescriptor = ptr::null_mut();
 
             let mut stdout_read: HANDLE = INVALID_HANDLE_VALUE;
@@ -195,14 +194,14 @@ mod imp {
 
             assert!(
                 CreatePipe(&mut stdout_read, &mut stdout_write, &sa, 0) != 0,
-                "CreatePipe stdout failed"
+                "CreatePipe stdout 失败"
             );
             assert!(
                 CreatePipe(&mut stderr_read, &mut stderr_write, &sa, 0) != 0,
-                "CreatePipe stderr failed"
+                "CreatePipe stderr 失败"
             );
 
-            // ---- Spawn child process ----
+            // ---- 启动子进程 ----
             let mut cmd_line = build_command_line(EXECUTABLE, ARGS);
             let mut si: STARTUPINFOW = core::mem::zeroed();
             si.cb = size_of::<STARTUPINFOW>() as u32;
@@ -224,21 +223,21 @@ mod imp {
                 &si,
                 &mut pi,
             );
-            assert!(ok != 0, "CreateProcessW failed");
+            assert!(ok != 0, "CreateProcessW 失败");
 
-            // Close write ends in parent (child owns them now)
+            // 在父进程中关闭写端（子进程已持有）
             CloseHandle(stdout_write);
             CloseHandle(stderr_write);
             CloseHandle(pi.hThread);
 
             let child_process = pi.hProcess;
 
-            // ---- Shared state ----
+            // ---- 共享状态 ----
             let stdout_bytes = Arc::new(AtomicUsize::new(0));
             let stderr_bytes = Arc::new(AtomicUsize::new(0));
             let kill_flag = Arc::new(AtomicBool::new(false));
 
-            // ---- Spawn reader threads ----
+            // ---- 启动读取线程 ----
             let child_process_raw = child_process as usize;
 
             let stdout_reader = {
@@ -260,7 +259,7 @@ mod imp {
                             child_process_raw,
                         )
                     })
-                    .expect("spawn stdout reader")
+                    .expect("启动 stdout 读取线程失败")
             };
 
             let stderr_reader = {
@@ -282,10 +281,10 @@ mod imp {
                             child_process_raw,
                         )
                     })
-                    .expect("spawn stderr reader")
+                    .expect("启动 stderr 读取线程失败")
             };
 
-            // ---- Monitoring loop ----
+            // ---- 监控循环 ----
             let mut last_report = Instant::now();
 
             loop {
@@ -293,13 +292,13 @@ mod imp {
                 const WAIT_OBJECT_0: u32 = 0;
                 let child_exited = wait_result == WAIT_OBJECT_0;
 
-                // Periodic monitoring
+                // 定期输出监控信息
                 let now = Instant::now();
                 if now.duration_since(last_report) >= MONITOR_INTERVAL || child_exited {
                     let out = stdout_bytes.load(Ordering::Relaxed);
                     let err = stderr_bytes.load(Ordering::Relaxed);
                     eprint!(
-                        "\r[realtime] stdout: {} / {} B | stderr: {} / {} B",
+                        "\r[实时] stdout: {} / {} B | stderr: {} / {} B",
                         out, STDOUT_LIMIT, err, STDERR_LIMIT,
                     );
                     last_report = now;
@@ -312,11 +311,11 @@ mod imp {
 
             eprintln!();
 
-            // Wait for reader threads to finish draining
+            // 等待读取线程完成数据排空
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
 
-            // Get exit code
+            // 获取退出码
             let mut exit_code: u32 = 0;
             GetExitCodeProcess(child_process, &mut exit_code);
             CloseHandle(child_process);
@@ -326,17 +325,17 @@ mod imp {
             let out_total = stdout_bytes.load(Ordering::Relaxed);
             let err_total = stderr_bytes.load(Ordering::Relaxed);
 
-            println!("\n=== Final ===");
-            println!("Child: exited with code {}", exit_code);
-            println!("stdout: {} bytes -> {}", out_total, STDOUT_FILE);
-            println!("stderr: {} bytes -> {}", err_total, STDERR_FILE);
+            println!("\n=== 最终结果 ===");
+            println!("子进程: 退出码 {}", exit_code);
+            println!("stdout: {} 字节 -> {}", out_total, STDOUT_FILE);
+            println!("stderr: {} 字节 -> {}", err_total, STDERR_FILE);
             if kill_flag.load(Ordering::Relaxed) {
                 println!(
-                    "⚠️  Terminated: output exceeded limit (stdout: {} / {}, stderr: {} / {})",
+                    "⚠️  已终止: 输出超出限制 (stdout: {} / {}, stderr: {} / {})",
                     out_total, STDOUT_LIMIT, err_total, STDERR_LIMIT,
                 );
             } else {
-                println!("✅ Completed normally (no limit exceeded)");
+                println!("✅ 正常完成 (未超出限制)");
             }
         }
     }
@@ -348,8 +347,8 @@ fn main() {
 
     #[cfg(not(windows))]
     {
-        eprintln!("This example only runs on Windows.");
-        eprintln!("For Linux, use linux_capture.rs instead.");
+        eprintln!("此示例仅在 Windows 上运行。");
+        eprintln!("Linux 请使用 linux_capture.rs。");
         std::process::exit(1);
     }
 }
