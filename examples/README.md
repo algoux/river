@@ -11,6 +11,7 @@
 | [`linux_pidfd.rs`](linux_pidfd.rs) | Linux | 演示 pidfd 系列能力：clone3(CLONE_PIDFD)、pidfd_send_signal、waitid(P_PIDFD)，以及基于 CLOEXEC 状态管道的沙箱握手协议 |
 | [`linux_seccompiler.rs`](linux_seccompiler.rs) | Linux | 全面演示 seccompiler 库：allowlist/denylist 过滤器、参数匹配规则、多种 Action 类型、实时应用验证及错误处理 |
 | [`linux_namespaces.rs`](linux_namespaces.rs) | Linux | 演示全部 6 种 Linux Namespaces（PID/UTS/Mount/IPC/Net/User），使用 clone3 + CLOEXEC 握手协议，需 root 权限 |
+| [`linux_pivot_root.rs`](linux_pivot_root.rs) | Linux | 演示 pivot_root 系统调用：完整容器化根文件系统切换流程，含 mount namespace + PID namespace 隔离验证，需 root 权限 |
 
 ## 运行方式
 
@@ -20,6 +21,7 @@ cargo run --example linux_capture
 cargo run --example linux_pidfd
 cargo run --example linux_seccompiler
 sudo cargo run --example linux_namespaces  # 需要 root
+sudo cargo run --example linux_pivot_root  # 需要 root
 
 # Windows 示例
 cargo run --example windows_capture
@@ -107,6 +109,35 @@ cargo run --example windows_capture
 - 每个 namespace 独立 clone3，互不干扰
 
 **运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_namespaces`）
+
+### linux_pivot_root — pivot_root 根文件系统切换演示（Linux）
+
+演示完整的容器化根文件系统切换流程，展示 `pivot_root` 系统调用的正确使用方式及隔离效果验证。
+
+| 步骤 | 操作 | 说明 |
+|------|------|------|
+| 1 | mkdir + mount tmpfs | 在 `/mnt/pivot_newroot` 准备新根（必须在 make-rprivate 之前完成挂载） |
+| 2 | mount --make-rprivate / | 防止挂载事件传播到父 namespace |
+| 3 | mkdir /proc /dev /.oldroot | 在新根中创建必要子目录 |
+| 4 | pivot_root(new_root, put_old) | 切换根文件系统，旧根被移动到 put_old |
+| 5 | chdir("/") | 将工作目录切换到新根 |
+| 6 | umount2(MNT_DETACH) | 延迟卸载旧根并删除挂载点 |
+| 7 | 验证隔离性 | 检查根目录内容、PID、/proc、文件读写 |
+
+**关键技术点：**
+- `clone3(CLONE_NEWNS | CLONE_NEWPID | CLONE_PIDFD)` 同时创建 mount 和 PID namespace
+- `pivot_root` 通过 `libc::syscall(SYS_pivot_root, ...)` 调用（rustix 未封装）
+- WSL overlay 兼容性：tmpfs 挂载必须在 `mount --make-rprivate` 之前完成
+- CLOEXEC 状态管道握手协议与 `linux_namespaces.rs` 一致
+- 隔离验证：根目录仅含 dev/proc、PID=1、/proc 仅可见自身进程
+
+**内核版本要求：**
+- `pivot_root`: ≥ 2.3.41
+- `clone3`: ≥ 5.3
+- Mount namespace: ≥ 2.4.19
+- PID namespace: ≥ 2.6.24
+
+**运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_pivot_root`）
 
 ## 依赖
 

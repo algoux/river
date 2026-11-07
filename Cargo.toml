@@ -49,4 +49,6 @@ name = "linux_seccompiler"
 [[example]]
 name = "linux_namespaces"
 [[example]]
+name = "linux_pivot_root"
+[[example]]
 name = "windows_capture"
