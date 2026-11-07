@@ -12,6 +12,7 @@ pyo3 = "0.30.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+rustix = { version = "0.38", features = ["pipe", "event", "process", "fs", "time", "alloc"] }
 seccompiler = "0.5"
 
 [target.'cfg(windows)'.dependencies]
