@@ -1,4 +1,4 @@
-[package]
+﻿[package]
 name = "river"
 version = "0.0.1"
 edition = "2024"
@@ -10,9 +10,22 @@ crate-type = ["cdylib"]
 [dependencies]
 pyo3 = "0.30.1"
 
+[[example]]
+name = "linux_capture"
+
+[[example]]
+name = "windows_capture"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
-rustix = { version = "0.38", features = ["pipe", "event", "process", "fs", "time", "alloc"] }
+rustix = { version = "0.38", features = [
+    "pipe",
+    "event",
+    "process",
+    "fs",
+    "time",
+    "alloc",
+] }
 seccompiler = "0.5"
 
 [target.'cfg(windows)'.dependencies]
@@ -29,4 +42,3 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
-

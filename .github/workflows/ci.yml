@@ -68,5 +68,5 @@ jobs:
           VIRTUAL_ENV: ${{ env.pythonLocation }}
       - name: Rust unit tests
         run: cargo test --lib --release -- --test-threads=1
-      - name: Python suite (root: namespaces + cgroups v2)
+      - name: "Python suite (root: namespaces + cgroups v2)"
         run: sudo -E python -m pytest -q
