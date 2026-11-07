@@ -558,22 +558,41 @@ mod imp {
         }
 
         // 情况 3：未设置 NO_NEW_PRIVS 时应用过滤器（非 root 应失败）
+        // 注意：必须在子进程中测试，避免过滤器意外生效后影响主进程清理导致 segfault
         println!("  情况 3：未设置 NO_NEW_PRIVS 时应用（非 root）...");
         if unsafe { libc::geteuid() } != 0 {
-            let filter = SeccompFilter::new(
-                rules.clone(),
-                SeccompAction::Errno(libc::EPERM as u32),
-                SeccompAction::Allow,
-                std::env::consts::ARCH.try_into().expect("不支持的架构"),
-            )
-            .expect("构建过滤器失败");
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                println!("    ❌ fork 失败");
+            } else if pid == 0 {
+                // 子进程：不设置 NO_NEW_PRIVS，尝试应用过滤器
+                let filter = SeccompFilter::new(
+                    rules.clone(),
+                    SeccompAction::Errno(libc::EPERM as u32),
+                    SeccompAction::Allow,
+                    std::env::consts::ARCH.try_into().expect("不支持的架构"),
+                )
+                .expect("构建过滤器失败");
 
-            let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
+                let bpf: BpfProgram = filter.try_into().expect("编译 BPF 失败");
 
-            // 非 root 且未设置 NO_NEW_PRIVS 时应失败
-            match apply_filter_all_threads(&bpf) {
-                Ok(()) => println!("    ⚠️  未设置 NO_NEW_PRIVS 却成功应用了过滤器（非 root 下不应发生）"),
-                Err(e) => println!("    ✅ 未设置 NO_NEW_PRIVS 时正确失败: {:?}", e),
+                // 非 root 且未设置 NO_NEW_PRIVS 时应失败
+                match apply_filter_all_threads(&bpf) {
+                    Ok(()) => {
+                        let msg = b"    \xe2\x9a\xa0\xef\xb8\x8f  \xe6\x9c\xaa\xe8\xae\xbe\xe7\xbd\xae NO_NEW_PRIVS \xe5\x8d\xb4\xe6\x88\x90\xe5\x8a\x9f\xe5\xba\x94\xe7\x94\xa8\xe4\xba\x86\xe8\xbf\x87\xe6\xbb\xa4\xe5\x99\xa8\n";
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                        unsafe { libc::_exit(0); }
+                    }
+                    Err(_) => {
+                        let msg = b"    \xe2\x9c\x85 \xe6\x9c\xaa\xe8\xae\xbe\xe7\xbd\xae NO_NEW_PRIVS \xe6\x97\xb6\xe6\xad\xa3\xe7\xa1\xae\xe5\xa4\xb1\xe8\xb4\xa5\n";
+                        unsafe { libc::write(2, msg.as_ptr() as *const _, msg.len()); }
+                        unsafe { libc::_exit(0); }
+                    }
+                }
+            } else {
+                // 父进程：等待子进程完成
+                let mut status: libc::c_int = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0); }
             }
         } else {
             println!("    ℹ️  以 root 运行 — 跳过此测试（root 下会成功）");
