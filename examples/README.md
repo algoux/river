@@ -10,6 +10,7 @@
 | [`windows_capture.rs`](windows_capture.rs) | Windows | 使用匿名管道 + 专用读取线程捕获子进程输出，功能等同于 Linux 版本 |
 | [`linux_pidfd.rs`](linux_pidfd.rs) | Linux | 演示 pidfd 系列能力：clone3(CLONE_PIDFD)、pidfd_send_signal、waitid(P_PIDFD)，以及基于 CLOEXEC 状态管道的沙箱握手协议 |
 | [`linux_seccompiler.rs`](linux_seccompiler.rs) | Linux | 全面演示 seccompiler 库：allowlist/denylist 过滤器、参数匹配规则、多种 Action 类型、实时应用验证及错误处理 |
+| [`linux_namespaces.rs`](linux_namespaces.rs) | Linux | 演示全部 6 种 Linux Namespaces（PID/UTS/Mount/IPC/Net/User），使用 clone3 + CLOEXEC 握手协议，需 root 权限 |
 
 ## 运行方式
 
@@ -18,6 +19,7 @@
 cargo run --example linux_capture
 cargo run --example linux_pidfd
 cargo run --example linux_seccompiler
+sudo cargo run --example linux_namespaces  # 需要 root
 
 # Windows 示例
 cargo run --example windows_capture
@@ -82,6 +84,29 @@ cargo run --example windows_capture
 | Stage 5 | 在子进程中实际应用过滤器并验证被阻止的系统调用返回 EPERM |
 | Stage 6 | `apply_filter`（单线程）与 `apply_filter_all_threads`（TSYNC）的区别 |
 | Stage 7 | 错误处理与边界情况：空过滤器、无效架构、缺少 NO_NEW_PRIVS、多规则 OR 语义、MaskedEq 比较 |
+
+### linux_namespaces — Linux Namespaces 能力演示（Linux）
+
+使用 `clone3` 系统调用逐一创建全部 6 种 Linux Namespace，并通过 CLOEXEC 状态管道握手协议确保子进程初始化完成后再进行验证。
+
+| 阶段 | Namespace | Flag | 验证方式 |
+|------|-----------|------|----------|
+| Stage 1 | PID | `CLONE_NEWPID` | 子进程 `getpid() == 1` |
+| Stage 2 | UTS | `CLONE_NEWUTS` | `sethostname` + `gethostname` |
+| Stage 3 | Mount | `CLONE_NEWNS` | `mount --make-rprivate` + 私有 tmpfs |
+| Stage 4 | IPC | `CLONE_NEWIPC` | `msgget(IPC_CREAT\|IPC_EXCL)` 消息队列 |
+| Stage 5 | Network | `CLONE_NEWNET` | `/sys/class/net` 仅含 lo |
+| Stage 6 | User | `CLONE_NEWUSER` | 父进程写 uid_map/gid_map + 双管道同步 |
+| 附加 | Combined | PID+UTS+IPC+Mount | 多 namespace 组合测试 |
+
+**关键技术点：**
+- `clone3` 原始系统调用封装（rustix 0.38 尚未支持）
+- CLOEXEC 状态管道握手：子进程就绪后写入 4 字节 errno，EOF 表示初始化失败
+- `/proc/<pid>/ns/*` inode 交叉验证：父进程对比自身与子进程的 namespace 标识
+- User Namespace 双管道同步：解决父进程写映射文件与子进程执行的竞态
+- 每个 namespace 独立 clone3，互不干扰
+
+**运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_namespaces`）
 
 ## 依赖
 

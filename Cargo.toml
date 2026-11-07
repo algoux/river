@@ -19,6 +19,9 @@ rustix = { version = "0.38", features = [
     "fs",
     "time",
     "alloc",
+    "mount",
+    "system",
+    "thread",
 ] }
 seccompiler = "0.5"
 
@@ -43,5 +46,7 @@ name = "linux_capture"
 name = "linux_pidfd"
 [[example]]
 name = "linux_seccompiler"
+[[example]]
+name = "linux_namespaces"
 [[example]]
 name = "windows_capture"
