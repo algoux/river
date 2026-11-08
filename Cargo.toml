@@ -54,3 +54,5 @@ name = "linux_pivot_root"
 name = "linux_cgroups_v2"
 [[example]]
 name = "windows_capture"
+[[example]]
+name = "windows_app_container"

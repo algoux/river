@@ -13,6 +13,7 @@
 | [`linux_namespaces.rs`](linux_namespaces.rs) | Linux | 演示全部 6 种 Linux Namespaces（PID/UTS/Mount/IPC/Net/User），使用 clone3 + CLOEXEC 握手协议，需 root 权限 |
 | [`linux_pivot_root.rs`](linux_pivot_root.rs) | Linux | 演示 pivot_root 系统调用：完整容器化根文件系统切换流程，含 mount namespace + PID namespace 隔离验证，需 root 权限 |
 | [`linux_cgroups_v2.rs`](linux_cgroups_v2.rs) | Linux | 全面演示 cgroups v2 能力：层级操作、进程迁移、CPU/Memory/PIDs/IO 控制器、clone3(CLONE_INTO_CGROUP)、cgroup.freeze、多进程并行 CPU 统计，需 root 权限 |
+| [`windows_app_container.rs`](windows_app_container.rs) | Windows | 完整演示 AppContainer 沙箱能力：Profile 创建/删除、SID 获取、ACL 授权（读写/只读）、以 AppContainer 身份启动子进程、文件系统与环境变量隔离验证 |
 
 ## 运行方式
 
@@ -27,6 +28,7 @@ sudo cargo run --example linux_cgroups_v2      # 需要 root
 
 # Windows 示例
 cargo run --example windows_capture
+cargo run --example windows_app_container
 ```
 
 > **注意：** 每个示例都包含平台检查，在非目标平台上运行会提示并退出。
@@ -172,6 +174,26 @@ cargo run --example windows_capture
 - memory.high: ≥ 5.8
 
 **运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_cgroups_v2`）
+
+### windows_app_container — AppContainer 沙箱能力演示（Windows）
+
+完整演示 Windows AppContainer 沙箱机制的核心能力，涵盖从 Profile 管理到进程隔离验证的全流程。
+
+| 阶段 | 内容 | 验证方式 |
+|------|------|----------|
+| Stage 1 | Profile 管理 | `CreateAppContainerProfile` 创建、`DeriveAppContainerSidFromAppContainerName` 派生 SID、`DeleteAppContainerProfile` 删除 |
+| Stage 2 | ACL 授权 | `SetEntriesInAclW` + `SetNamedSecurityInfoW` 授予读写/只读权限，支持继承标志 |
+| Stage 3 | 沙箱进程启动 | `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` + `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` 启动受限子进程 |
+| Stage 4 | 文件系统隔离 | 授权目录写入成功、未授权路径 (C:\) 写入被拒绝、只读文件修改被拒绝 |
+| Stage 5 | 环境变量隔离 | 白名单变量可见、宿主 PATH 等敏感变量未泄露 |
+
+**关键技术点：**
+- `userenv.dll` 三个未公开于 `windows-sys` 的 API 通过 `#[link] extern "system"` 手动声明
+- `PROFILE_CREATE_LOCK` 序列化 Profile 创建：`CreateAppContainerProfile` 是写注册表的变更操作，并发调用会导致 `ERROR_KEY_DELETED` / `ERROR_INVALIDARG`
+- `SECURITY_CAPABILITIES` 结构体通过 `UpdateProcThreadAttribute` 传递给 `CreateProcessW`，使子进程在创建时即成为 AppContainer
+- 环境变量白名单：AppContainer 子进程需要最少 `SystemRoot` + `LOCALAPPDATA` 才能启动 `cmd.exe`
+- ACL 合并语义：`SetEntriesInAclW` 按 trustee 合并 ACE，重复授权不会增加 DACL 条目数
+- 句柄限制：仅 stdio 三个句柄通过 `HANDLE_LIST` 属性继承，防止句柄泄露
 
 ## 依赖
 
