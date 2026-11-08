@@ -12,6 +12,7 @@
 | [`linux_seccompiler.rs`](linux_seccompiler.rs) | Linux | 全面演示 seccompiler 库：allowlist/denylist 过滤器、参数匹配规则、多种 Action 类型、实时应用验证及错误处理 |
 | [`linux_namespaces.rs`](linux_namespaces.rs) | Linux | 演示全部 6 种 Linux Namespaces（PID/UTS/Mount/IPC/Net/User），使用 clone3 + CLOEXEC 握手协议，需 root 权限 |
 | [`linux_pivot_root.rs`](linux_pivot_root.rs) | Linux | 演示 pivot_root 系统调用：完整容器化根文件系统切换流程，含 mount namespace + PID namespace 隔离验证，需 root 权限 |
+| [`linux_cgroups_v2.rs`](linux_cgroups_v2.rs) | Linux | 全面演示 cgroups v2 能力：层级操作、进程迁移、CPU/Memory/PIDs/IO 控制器、clone3(CLONE_INTO_CGROUP)、cgroup.freeze、多进程并行 CPU 统计，需 root 权限 |
 
 ## 运行方式
 
@@ -20,8 +21,9 @@
 cargo run --example linux_capture
 cargo run --example linux_pidfd
 cargo run --example linux_seccompiler
-sudo cargo run --example linux_namespaces  # 需要 root
-sudo cargo run --example linux_pivot_root  # 需要 root
+sudo cargo run --example linux_namespaces      # 需要 root
+sudo cargo run --example linux_pivot_root      # 需要 root
+sudo cargo run --example linux_cgroups_v2      # 需要 root
 
 # Windows 示例
 cargo run --example windows_capture
@@ -138,6 +140,38 @@ cargo run --example windows_capture
 - PID namespace: ≥ 2.6.24
 
 **运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_pivot_root`）
+
+### linux_cgroups_v2 — cgroups v2 全面能力演示（Linux）
+
+分 9 个阶段全面演示 Linux cgroups v2 (unified hierarchy) 的各项能力，覆盖所有主要控制器和核心机制。
+
+| 阶段 | 内容 | 验证方式 |
+|------|------|----------|
+| Stage 1 | 基础层级操作 | 检测 cgroup v2 挂载、创建/删除子 cgroup、读写 controllers/subtree_control |
+| Stage 2 | 进程迁移 | fork 子进程迁入测试 cgroup，验证 /proc/pid/cgroup 变化，父进程不受影响 |
+| Stage 3 | CPU 控制器 | 设置 cpu.max/cpu.weight，fork CPU 密集子进程，读取 cpu.stat 验证节流 |
+| Stage 4 | Memory 控制器 | 设置 memory.max/memory.high，子进程分配内存，读取 memory.events/memory.stat |
+| Stage 5 | PIDs 控制器 | 设置 pids.max=5，管理器子进程 fork 孙进程触发超限拒绝 (EAGAIN)，读取 pids.events |
+| Stage 6 | IO 控制器 | 检测块设备，设置 io.max 带宽限制，读取 io.stat/io.pressure |
+| Stage 7 | clone3 + CLONE_INTO_CGROUP | 两层 cgroup + 管理器模式，clone3 原子将孙进程创建到目标 cgroup |
+| Stage 8 | cgroup.freeze / events | 冻结/解冻 cgroup，验证 cgroup.events/memory.events/pids.events/cgroup.stat |
+| Stage 9 | 多进程并行 CPU 统计 | N 个 worker 并行跑满所有 CPU 核心，验证 1 秒实际时间内 cgroup CPU 消耗 > 1 秒 |
+
+**关键技术点：**
+- cgroup v2 文件系统接口：所有操作通过 `/sys/fs/cgroup` 下的文件读写完成
+- `clone3(CLONE_INTO_CGROUP | CLONE_PIDFD)` 原始系统调用：使用 `O_PATH` fd 指定目标 cgroup
+- 两层 cgroup + 管理器子进程模式：解决 systemd delegation 边界下 `CLONE_INTO_CGROUP` 静默失败问题
+- CLOEXEC 管道握手协议：与 `linux_pidfd.rs` / `linux_namespaces.rs` 一致的父子同步机制
+- `clock_gettime(CLOCK_MONOTONIC)` 高精度计时：精确对比 wall clock 与 cgroup CPU 时间
+- 自动清理：每个阶段独立创建/删除测试 cgroup，避免残留
+
+**内核版本要求：**
+- cgroups v2 (unified hierarchy): ≥ 4.5
+- clone3 + CLONE_INTO_CGROUP: ≥ 5.7
+- cgroup.freeze: ≥ 5.2
+- memory.high: ≥ 5.8
+
+**运行要求：** 必须以 root 权限运行（`sudo cargo run --example linux_cgroups_v2`）
 
 ## 依赖
 
