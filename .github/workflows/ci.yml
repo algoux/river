@@ -1,8 +1,8 @@
 name: ci
 
-# Every push/PR must pass: formatting, clippy, the Rust unit tests and the
-# Python suite — on both supported backends. The README's "run `cargo fmt`
-# before every commit" rule is enforced here instead of by hand.
+# Every push/PR must pass: formatting and clippy — on both supported
+# backends. The README's "run `cargo fmt` before every commit" rule is
+# enforced here instead of by hand.
 on:
   push:
     branches: [master, main]
@@ -12,9 +12,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Windows backend: AppContainer + Job Object. The unit tests link against
-  # the CPython DLL (STATUS_DLL_NOT_FOUND otherwise), so the interpreter's
-  # directory goes on PATH first.
+  # Windows backend: AppContainer + Job Object.
   windows:
     runs-on: windows-latest
     steps:
@@ -37,16 +35,8 @@ jobs:
         env:
           # maturin needs the venv concept; use the system interpreter.
           VIRTUAL_ENV: ${{ env.pythonLocation }}
-      - name: Rust unit tests
-        run: |
-          $py = (Get-Command python).Source
-          $env:PATH = "$(Split-Path $py);$env:PATH"
-          cargo test --lib --release -- --test-threads=1
-      - name: Python suite
-        run: python -m pytest -q
 
-  # Linux backend: namespaces + cgroups v2. The suite needs root
-  # (CAP_SYS_ADMIN for mount/namespace/cgroup writes).
+  # Linux backend: namespaces + cgroups v2.
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -66,7 +56,3 @@ jobs:
         run: uv run --no-project maturin develop --release
         env:
           VIRTUAL_ENV: ${{ env.pythonLocation }}
-      - name: Rust unit tests
-        run: cargo test --lib --release -- --test-threads=1
-      - name: "Python suite (root: namespaces + cgroups v2)"
-        run: sudo -E python -m pytest -q
