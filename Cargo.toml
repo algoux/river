@@ -56,3 +56,5 @@ name = "linux_cgroups_v2"
 name = "windows_capture"
 [[example]]
 name = "windows_app_container"
+[[example]]
+name = "windows_app_container_runner"

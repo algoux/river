@@ -14,6 +14,7 @@
 | [`linux_pivot_root.rs`](linux_pivot_root.rs) | Linux | 演示 pivot_root 系统调用：完整容器化根文件系统切换流程，含 mount namespace + PID namespace 隔离验证，需 root 权限 |
 | [`linux_cgroups_v2.rs`](linux_cgroups_v2.rs) | Linux | 全面演示 cgroups v2 能力：层级操作、进程迁移、CPU/Memory/PIDs/IO 控制器、clone3(CLONE_INTO_CGROUP)、cgroup.freeze、多进程并行 CPU 统计，需 root 权限 |
 | [`windows_app_container.rs`](windows_app_container.rs) | Windows | 完整演示 AppContainer 沙箱能力：Profile 创建/删除、SID 获取、ACL 授权（读写/只读）、以 AppContainer 身份启动子进程、文件系统与环境变量隔离验证 |
+| [`windows_app_container_runner.rs`](windows_app_container_runner.rs) | Windows | 在 AppContainer 沙箱中执行指定命令，通过 runtimes 参数授予目标目录只读执行权限，适用于运行脚本等场景 |
 
 ## 运行方式
 
@@ -29,6 +30,7 @@ sudo cargo run --example linux_cgroups_v2      # 需要 root
 # Windows 示例
 cargo run --example windows_capture
 cargo run --example windows_app_container
+cargo run --example windows_app_container_runner
 ```
 
 > **注意：** 每个示例都包含平台检查，在非目标平台上运行会提示并退出。
@@ -194,6 +196,37 @@ cargo run --example windows_app_container
 - 环境变量白名单：AppContainer 子进程需要最少 `SystemRoot` + `LOCALAPPDATA` 才能启动 `cmd.exe`
 - ACL 合并语义：`SetEntriesInAclW` 按 trustee 合并 ACE，重复授权不会增加 DACL 条目数
 - 句柄限制：仅 stdio 三个句柄通过 `HANDLE_LIST` 属性继承，防止句柄泄露
+
+### windows_app_container_runner — AppContainer 命令执行器（Windows）
+
+在 AppContainer 沙箱限制下执行用户指定的命令，并通过 `runtimes` 参数为目标进程授予特定目录的只读执行权限。适用于在隔离环境中运行脚本、测试程序等场景。
+
+**配置方式（源码 `main` 函数）：**
+```rust
+// 要执行的命令
+let command = "python";
+let command_args = ["a.py"];
+
+// Runtimes 目录列表 - 这些目录将被授予只读执行权限
+let runtimes: Vec<std::path::PathBuf> = vec![
+    // Python 安装目录（必须授权才能执行 python）
+    std::path::PathBuf::from(r"C:\Users\MeiK\AppData\Local\Python\pythoncore-3.15-64"),
+    // 工作目录
+    std::path::PathBuf::from(r"E:\river"),
+];
+```
+
+**关键技术点：**
+- Profile 名称基于 PID 自动生成 (`river.runner.{pid}`)，避免冲突
+- 仅授予 `FILE_GENERIC_READ | FILE_GENERIC_EXECUTE` 权限，禁止写入
+- 程序结束时自动清理 AppContainer Profile
+- 环境变量白名单隔离，防止宿主敏感变量泄露
+- 捕获并输出子进程的 stdout/stderr，返回原始退出码
+
+**常见错误处理：**
+- `did not find executable at '...'`: 需要将可执行文件所在目录添加到 `runtimes`
+- `Permission denied`: 检查脚本/依赖库所在目录是否已授权
+- AppContainer 默认隔离几乎所有文件系统访问，所有需要的路径都必须显式授权
 
 ## 依赖
 
