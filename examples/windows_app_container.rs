@@ -18,23 +18,27 @@ mod imp {
     use std::ptr;
     use std::sync::Mutex;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Security::Authorization::{
-        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, SE_FILE_OBJECT,
-        SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_W,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
     };
-    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_CAPABILITIES};
+    use windows_sys::Win32::Security::Authorization::{
+        BuildTrusteeWithSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+        SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_CAPABILITIES,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_GENERIC_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, InitializeProcThreadAttributeList, UpdateProcThreadAttribute,
-        DeleteProcThreadAttributeList, GetExitCodeProcess, WaitForSingleObject,
-        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-        CREATE_SUSPENDED, EXTENDED_STARTUPINFO_PRESENT,
-        CREATE_UNICODE_ENVIRONMENT, ResumeThread,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, ResumeThread,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+        WaitForSingleObject,
     };
 
     // ======================== userenv API (AppContainer Profile) ========================
@@ -102,7 +106,9 @@ mod imp {
     impl AppContainerProfile {
         /// 创建或打开一个 AppContainer Profile
         fn create_or_open(name: &str) -> io::Result<Self> {
-            let _guard = PROFILE_CREATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = PROFILE_CREATE_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
 
             let wide_name = to_wide(name);
             let mut sid: PSID = ptr::null_mut();
@@ -236,9 +242,7 @@ mod imp {
         };
 
         let mut new_dacl: *mut ACL = ptr::null_mut();
-        let merge_err = unsafe {
-            SetEntriesInAclW(1, &entry, dacl, &mut new_dacl)
-        };
+        let merge_err = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut new_dacl) };
 
         let write_err = if merge_err == 0 {
             unsafe {
@@ -301,7 +305,8 @@ mod imp {
         env_vars: &[(String, String)],
     ) -> io::Result<(u32, String, String)> {
         // 创建管道捕获输出
-        let mut sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES = unsafe { std::mem::zeroed() };
+        let mut sa: windows_sys::Win32::Security::SECURITY_ATTRIBUTES =
+            unsafe { std::mem::zeroed() };
         sa.nLength = size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32;
         sa.bInheritHandle = 1;
         sa.lpSecurityDescriptor = ptr::null_mut();
@@ -315,7 +320,10 @@ mod imp {
             return Err(io::Error::last_os_error());
         }
         if unsafe { CreatePipe(&mut stderr_read, &mut stderr_write, &sa, 0) } == 0 {
-            unsafe { CloseHandle(stdout_read); CloseHandle(stdout_write) };
+            unsafe {
+                CloseHandle(stdout_read);
+                CloseHandle(stdout_write)
+            };
             return Err(io::Error::last_os_error());
         }
 
@@ -355,7 +363,8 @@ mod imp {
         let mut attr_buf = vec![0u8; attr_size];
         if unsafe {
             InitializeProcThreadAttributeList(attr_buf.as_mut_ptr() as *mut _, 2, 0, &mut attr_size)
-        } == 0 {
+        } == 0
+        {
             unsafe {
                 CloseHandle(stdout_read);
                 CloseHandle(stdout_write);
@@ -376,7 +385,8 @@ mod imp {
                 ptr::null_mut(),
                 ptr::null(),
             )
-        } == 0 {
+        } == 0
+        {
             unsafe {
                 DeleteProcThreadAttributeList(attr_buf.as_mut_ptr() as *mut _);
                 CloseHandle(stdout_read);
@@ -398,7 +408,8 @@ mod imp {
                 ptr::null_mut(),
                 ptr::null(),
             )
-        } == 0 {
+        } == 0
+        {
             unsafe {
                 DeleteProcThreadAttributeList(attr_buf.as_mut_ptr() as *mut _);
                 CloseHandle(stdout_read);
@@ -575,11 +586,20 @@ mod imp {
         let _ = std::fs::create_dir_all(&tmp_subdir);
 
         let env_vars = vec![
-            ("SystemRoot".to_string(), std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string())),
-            ("LOCALAPPDATA".to_string(), std::env::var("LOCALAPPDATA").unwrap_or_default()),
+            (
+                "SystemRoot".to_string(),
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+            ),
+            (
+                "LOCALAPPDATA".to_string(),
+                std::env::var("LOCALAPPDATA").unwrap_or_default(),
+            ),
             ("TEMP".to_string(), tmp_subdir.display().to_string()),
             ("TMP".to_string(), tmp_subdir.display().to_string()),
-            ("RIVER_SANDBOX_MARKER".to_string(), "sandbox-active".to_string()),
+            (
+                "RIVER_SANDBOX_MARKER".to_string(),
+                "sandbox-active".to_string(),
+            ),
         ];
 
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
@@ -639,7 +659,10 @@ mod imp {
         match spawn_in_appcontainer(
             &ac,
             &comspec,
-            &["/c", "echo MARKER=%RIVER_SANDBOX_MARKER% & echo PATH=%PATH%"],
+            &[
+                "/c",
+                "echo MARKER=%RIVER_SANDBOX_MARKER% & echo PATH=%PATH%",
+            ],
             Some(&test_dir),
             &env_vars,
         ) {

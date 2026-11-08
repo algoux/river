@@ -127,9 +127,7 @@ mod imp {
 
     #[allow(dead_code)]
     fn last_errno() -> i32 {
-        std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(-1)
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
     }
 
     // ========================================================================
@@ -165,7 +163,10 @@ mod imp {
         let root = Path::new(CGROUP_ROOT);
         // 先读取当前 subtree_control
         let current_subtree = cg_read(&root.join("cgroup.subtree_control"))?;
-        println!("  • 根 cgroup 当前 subtree_control: '{}'", current_subtree.trim());
+        println!(
+            "  • 根 cgroup 当前 subtree_control: '{}'",
+            current_subtree.trim()
+        );
 
         // 尝试启用 cpu memory pids
         match enable_subtree_control(root, "+cpu +memory +pids") {
@@ -208,10 +209,7 @@ mod imp {
 
         // 2.1 记录父进程的 cgroup（不应改变）
         let parent_cgroup = cg_read(Path::new("/proc/self/cgroup"))?;
-        println!(
-            "  • 父进程 /proc/self/cgroup: {}",
-            parent_cgroup.trim()
-        );
+        println!("  • 父进程 /proc/self/cgroup: {}", parent_cgroup.trim());
 
         // 2.2 fork 一个子进程用于迁移演示（父进程保持原位，避免 systemd 迁回问题）
         let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC).expect("pipe2 失败");
@@ -326,12 +324,18 @@ mod imp {
         // 3.3 设置 cpu.max = "50000 100000"（50% CPU）
         cg_write(&test_cg.join("cpu.max"), "50000 100000\n")?;
         let cpu_max_new = cg_read(&test_cg.join("cpu.max"))?;
-        println!("  ✅ 设置 cpu.max = '50000 100000' → 读回: {}", cpu_max_new.trim());
+        println!(
+            "  ✅ 设置 cpu.max = '50000 100000' → 读回: {}",
+            cpu_max_new.trim()
+        );
 
         // 3.4 设置 cpu.weight = 50
         cg_write(&test_cg.join("cpu.weight"), "50\n")?;
         let cpu_weight_new = cg_read(&test_cg.join("cpu.weight"))?;
-        println!("  ✅ 设置 cpu.weight = 50 → 读回: {}", cpu_weight_new.trim());
+        println!(
+            "  ✅ 设置 cpu.weight = 50 → 读回: {}",
+            cpu_weight_new.trim()
+        );
 
         // 3.5 将子进程迁入并验证 CPU 限制
         let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC).expect("pipe2 失败");
@@ -409,13 +413,19 @@ mod imp {
         let high_64m = 64 * 1024 * 1024;
         cg_write(&test_cg.join("memory.high"), &format!("{high_64m}\n"))?;
         let mem_high_new = cg_read(&test_cg.join("memory.high"))?;
-        println!("  ✅ 设置 memory.high = {high_64m} (64MB) → 读回: {}", mem_high_new.trim());
+        println!(
+            "  ✅ 设置 memory.high = {high_64m} (64MB) → 读回: {}",
+            mem_high_new.trim()
+        );
 
         // 4.3 设置 memory.max = 128MB（硬限制）
         let max_128m = 128 * 1024 * 1024;
         cg_write(&test_cg.join("memory.max"), &format!("{max_128m}\n"))?;
         let mem_max_new = cg_read(&test_cg.join("memory.max"))?;
-        println!("  ✅ 设置 memory.max = {max_128m} (128MB) → 读回: {}", mem_max_new.trim());
+        println!(
+            "  ✅ 设置 memory.max = {max_128m} (128MB) → 读回: {}",
+            mem_max_new.trim()
+        );
 
         // 4.4 读取 memory.events
         let mem_events = cg_read(&test_cg.join("memory.events"))?;
@@ -425,11 +435,7 @@ mod imp {
         let mem_stat = cg_read(&test_cg.join("memory.stat"))?;
         let key_stats: Vec<&str> = ["anon", "file", "kernel", "shmem"]
             .iter()
-            .filter_map(|key| {
-                mem_stat
-                    .lines()
-                    .find(|l| l.starts_with(key))
-            })
+            .filter_map(|key| mem_stat.lines().find(|l| l.starts_with(key)))
             .collect();
         println!("  • memory.stat (关键指标):");
         for stat in &key_stats {
@@ -464,7 +470,10 @@ mod imp {
 
             // 读取 memory.events 查看是否有事件
             let mem_events_after = cg_read(&test_cg.join("memory.events"))?;
-            println!("  • memory.events (分配后):\n{}", indent_lines(&mem_events_after, "    "));
+            println!(
+                "  • memory.events (分配后):\n{}",
+                indent_lines(&mem_events_after, "    ")
+            );
 
             // 回收
             let mut status: libc::c_int = 0;
@@ -633,7 +642,11 @@ mod imp {
             match cg_write(&test_cg.join("io.max"), &io_max_value) {
                 Ok(()) => {
                     let io_max_read = cg_read(&test_cg.join("io.max"))?;
-                    println!("  ✅ 设置 io.max = '{}' → 读回: {}", io_max_value.trim(), io_max_read.trim());
+                    println!(
+                        "  ✅ 设置 io.max = '{}' → 读回: {}",
+                        io_max_value.trim(),
+                        io_max_read.trim()
+                    );
                 }
                 Err(e) => println!("  ⚠️  设置 io.max 失败: {e}"),
             }
@@ -744,8 +757,7 @@ mod imp {
             if grandchild_pid == 0 {
                 // ---- 孙进程 ----
                 // 验证自己在内层 cgroup 中
-                let my_cgroup = std::fs::read_to_string("/proc/self/cgroup")
-                    .unwrap_or_default();
+                let my_cgroup = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
                 let in_target = my_cgroup.contains("clone_inner");
                 let result: u8 = if in_target { 1 } else { 0 };
                 let _ = rustix::io::write(&status_w, &[result]);
@@ -866,7 +878,10 @@ mod imp {
             // 8.4 冻结 cgroup
             cg_write(&test_cg.join("cgroup.freeze"), "1\n")?;
             let freeze_after = cg_read(&test_cg.join("cgroup.freeze"))?;
-            println!("  ✅ 设置 cgroup.freeze = 1 → 读回: {}", freeze_after.trim());
+            println!(
+                "  ✅ 设置 cgroup.freeze = 1 → 读回: {}",
+                freeze_after.trim()
+            );
 
             // 读取 frozen 事件
             let events_frozen = cg_read(&test_cg.join("cgroup.events"))?;
@@ -876,8 +891,8 @@ mod imp {
             );
 
             // 8.5 验证子进程被冻结（检查 /proc/<pid>/status 中的 State）
-            let proc_status = std::fs::read_to_string(format!("/proc/{pid_raw}/status"))
-                .unwrap_or_default();
+            let proc_status =
+                std::fs::read_to_string(format!("/proc/{pid_raw}/status")).unwrap_or_default();
             let state_line = proc_status
                 .lines()
                 .find(|l| l.starts_with("State:"))
@@ -887,7 +902,10 @@ mod imp {
             // 8.6 解冻
             cg_write(&test_cg.join("cgroup.freeze"), "0\n")?;
             let freeze_unfrozen = cg_read(&test_cg.join("cgroup.freeze"))?;
-            println!("  ✅ 设置 cgroup.freeze = 0 → 读回: {}", freeze_unfrozen.trim());
+            println!(
+                "  ✅ 设置 cgroup.freeze = 0 → 读回: {}",
+                freeze_unfrozen.trim()
+            );
 
             // 8.7 读取 memory.events
             let mem_events = cg_read(&test_cg.join("memory.events"))?;
@@ -945,7 +963,10 @@ mod imp {
 
     /// 高精度时钟（微秒）
     fn now_usec() -> u64 {
-        let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
         unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
         ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1_000
     }
@@ -1016,7 +1037,10 @@ mod imp {
             } else if pid > 0 {
                 worker_pids.push(pid);
             } else {
-                return Err(format!("fork worker #{i} 失败: {}", std::io::Error::last_os_error()));
+                return Err(format!(
+                    "fork worker #{i} 失败: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
         drop(ready_w);
@@ -1046,7 +1070,10 @@ mod imp {
         let wall_elapsed_us = wall_end - wall_start;
         let wall_elapsed_s = wall_elapsed_us as f64 / 1_000_000.0;
         println!("  ✅ 所有 worker 已完成");
-        println!("  • 实际经过时间 (wall clock): {:.3} s ({wall_elapsed_us} µs)", wall_elapsed_s);
+        println!(
+            "  • 实际经过时间 (wall clock): {:.3} s ({wall_elapsed_us} µs)",
+            wall_elapsed_s
+        );
 
         // 9.7 读取最终 cpu.stat
         let cpu_stat_after = cg_read(&test_cg.join("cpu.stat"))?;
@@ -1068,7 +1095,8 @@ mod imp {
         let mem_current = cg_read(&test_cg.join("memory.current"))?;
         let mem_peak = cg_read(&test_cg.join("memory.peak")).unwrap_or_else(|_| "N/A".into());
         let mem_stat = cg_read(&test_cg.join("memory.stat"))?;
-        let anon = mem_stat.lines()
+        let anon = mem_stat
+            .lines()
             .find(|l| l.starts_with("anon "))
             .map(|l| l.split_whitespace().nth(1).unwrap_or("0"))
             .unwrap_or("0");
@@ -1102,7 +1130,10 @@ mod imp {
         }
 
         // 打印完整 cpu.stat 供参考
-        println!("\n  • 完整 cpu.stat:\n{}", indent_lines(&cpu_stat_after, "    "));
+        println!(
+            "\n  • 完整 cpu.stat:\n{}",
+            indent_lines(&cpu_stat_after, "    ")
+        );
 
         // 清理
         cg_rmdir(&test_cg)?;
@@ -1215,7 +1246,10 @@ mod imp {
         if failures.is_empty() {
             println!("║     ✅ 所有 9 个阶段均通过                     ║");
         } else {
-            println!("║     ⚠️  {} 个阶段失败                          ║", failures.len());
+            println!(
+                "║     ⚠️  {} 个阶段失败                          ║",
+                failures.len()
+            );
             for (name, err) in &failures {
                 println!("║     ❌ {name}: {err}");
             }

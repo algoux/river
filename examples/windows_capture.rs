@@ -14,19 +14,19 @@ mod imp {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::ptr;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
     use std::time::{Duration, Instant};
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, ReadFile, WriteFile, CREATE_ALWAYS, FILE_GENERIC_WRITE, FILE_SHARE_READ,
+        CREATE_ALWAYS, CreateFileW, FILE_GENERIC_WRITE, FILE_SHARE_READ, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, TerminateProcess, WaitForSingleObject,
-        PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOW,
+        CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
+        STARTUPINFOW, TerminateProcess, WaitForSingleObject,
     };
 
     // ======================== 配置 ========================
@@ -288,7 +288,8 @@ mod imp {
             let mut last_report = Instant::now();
 
             loop {
-                let wait_result = WaitForSingleObject(child_process, MONITOR_INTERVAL.as_millis() as u32);
+                let wait_result =
+                    WaitForSingleObject(child_process, MONITOR_INTERVAL.as_millis() as u32);
                 const WAIT_OBJECT_0: u32 = 0;
                 let child_exited = wait_result == WAIT_OBJECT_0;
 

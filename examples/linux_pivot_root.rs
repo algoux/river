@@ -79,14 +79,12 @@ mod imp {
     /// 读取 /proc/self/ns/<ns_type> 的 inode 号
     fn read_ns_inode(ns_type: &str) -> Option<u64> {
         let path = format!("/proc/self/ns/{ns_type}");
-        std::fs::read_link(&path)
-            .ok()
-            .and_then(|link| {
-                let s = link.to_string_lossy();
-                s.split(':')
-                    .nth(1)
-                    .and_then(|n| n.trim_end_matches(']').parse().ok())
-            })
+        std::fs::read_link(&path).ok().and_then(|link| {
+            let s = link.to_string_lossy();
+            s.split(':')
+                .nth(1)
+                .and_then(|n| n.trim_end_matches(']').parse().ok())
+        })
     }
 
     // ========================================================================
@@ -141,11 +139,11 @@ mod imp {
         println!("  [child] 步骤 1b: 挂载 tmpfs 到 {new_root}");
         let ret = unsafe {
             libc::mount(
-                b"tmpfs\0".as_ptr() as *const libc::c_char,
+                c"tmpfs".as_ptr(),
                 c_new_root.as_ptr(),
-                b"tmpfs\0".as_ptr() as *const libc::c_char,
+                c"tmpfs".as_ptr(),
                 0,
-                b"size=64M\0".as_ptr() as *const libc::c_void,
+                c"size=64M".as_ptr() as *const libc::c_void,
             )
         };
         if ret != 0 {
@@ -160,8 +158,8 @@ mod imp {
         println!("  [child] 步骤 2: mount --make-rprivate /");
         let ret = unsafe {
             libc::mount(
-                b"none\0".as_ptr() as *const libc::c_char,
-                b"/\0".as_ptr() as *const libc::c_char,
+                c"none".as_ptr(),
+                c"/".as_ptr(),
                 std::ptr::null(),
                 libc::MS_REC | libc::MS_PRIVATE,
                 std::ptr::null(),
@@ -204,16 +202,14 @@ mod imp {
         };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
-            println!(
-                "  [child] ❌ pivot_root(\"{new_root}\", \"{old_root_in_new}\") 失败: {err}"
-            );
+            println!("  [child] ❌ pivot_root(\"{new_root}\", \"{old_root_in_new}\") 失败: {err}");
             return Err(err.raw_os_error().unwrap_or(-1));
         }
         println!("  [child] ✅ pivot_root 成功！");
 
         // ---- 步骤 5: chdir 到新根 ----
         println!("  [child] 步骤 5: chdir(\"/\")");
-        if unsafe { libc::chdir(b"/\0".as_ptr() as *const libc::c_char) } != 0 {
+        if unsafe { libc::chdir(c"/".as_ptr()) } != 0 {
             let err = std::io::Error::last_os_error();
             println!("  [child] ❌ chdir(/) 失败: {err}");
             return Err(err.raw_os_error().unwrap_or(-1));
@@ -222,12 +218,7 @@ mod imp {
 
         // ---- 步骤 6: umount2 卸载旧根 ----
         println!("  [child] 步骤 6: umount2(\"/.oldroot\", MNT_DETACH)");
-        let ret = unsafe {
-            libc::umount2(
-                b"/.oldroot\0".as_ptr() as *const libc::c_char,
-                libc::MNT_DETACH,
-            )
-        };
+        let ret = unsafe { libc::umount2(c"/.oldroot".as_ptr(), libc::MNT_DETACH) };
         if ret != 0 {
             let err = std::io::Error::last_os_error();
             println!("  [child] ❌ umount2 /.oldroot 失败: {err}");
@@ -237,7 +228,7 @@ mod imp {
 
         // 删除旧根挂载点目录
         unsafe {
-            libc::rmdir(b"/.oldroot\0".as_ptr() as *const libc::c_char);
+            libc::rmdir(c"/.oldroot".as_ptr());
         }
 
         // ---- 步骤 7: 验证隔离性 ----
@@ -262,9 +253,9 @@ mod imp {
 
                 // 新根应该只有我们创建的目录 (proc, dev)
                 // 不应该有 host 的文件系统 (etc, usr, var 等)
-                let has_host_dirs = names.iter().any(|n| {
-                    matches!(n.as_str(), "etc" | "usr" | "var" | "home" | "bin" | "lib")
-                });
+                let has_host_dirs = names
+                    .iter()
+                    .any(|n| matches!(n.as_str(), "etc" | "usr" | "var" | "home" | "bin" | "lib"));
                 if has_host_dirs {
                     println!("  [child] ⚠️  根目录仍包含宿主文件系统目录！");
                 } else {
@@ -290,9 +281,9 @@ mod imp {
         println!("  [child] 验证 3: 挂载 /proc 并检查");
         let ret = unsafe {
             libc::mount(
-                b"proc\0".as_ptr() as *const libc::c_char,
-                b"/proc\0".as_ptr() as *const libc::c_char,
-                b"proc\0".as_ptr() as *const libc::c_char,
+                c"proc".as_ptr(),
+                c"/proc".as_ptr(),
+                c"proc".as_ptr(),
                 0,
                 std::ptr::null(),
             )
@@ -465,8 +456,7 @@ mod imp {
         // 执行 pivot_root 测试
         println!("=== pivot_root 完整流程测试 ===");
 
-        let (status_r, status_w) =
-            pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
+        let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
 
         let mut pidfd_raw: c_int = -1;
         let args = CloneArgs {

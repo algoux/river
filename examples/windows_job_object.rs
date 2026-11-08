@@ -16,28 +16,27 @@ mod imp {
     use std::ptr;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Threading::{
-        CreateProcessW, GetExitCodeProcess, WaitForSingleObject,
-        PROCESS_INFORMATION, STARTUPINFOW, CREATE_SUSPENDED, ResumeThread,
-    };
     use windows_sys::Win32::System::JobObjects::{
-        CreateJobObjectW, AssignProcessToJobObject, TerminateJobObject,
-        QueryInformationJobObject, SetInformationJobObject,
-        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_SECURITY_LIMIT_INFORMATION,
-        JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
-        JobObjectBasicLimitInformation, JobObjectExtendedLimitInformation,
-        JobObjectBasicUIRestrictions, JobObjectSecurityLimitInformation,
-        JobObjectBasicAccountingInformation,
-        JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_LIMIT_JOB_TIME,
-        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
-        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
-        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS,
-        JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
-        JOB_OBJECT_SECURITY_NO_ADMIN, JOB_OBJECT_SECURITY_RESTRICTED_TOKEN,
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+        JOB_OBJECT_LIMIT_JOB_TIME, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_TIME, JOB_OBJECT_SECURITY_NO_ADMIN,
+        JOB_OBJECT_SECURITY_RESTRICTED_TOKEN, JOB_OBJECT_UILIMIT_DESKTOP,
+        JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
+        JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_LIMIT_INFORMATION, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOBOBJECT_SECURITY_LIMIT_INFORMATION,
+        JobObjectBasicAccountingInformation, JobObjectBasicLimitInformation,
+        JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation,
+        JobObjectSecurityLimitInformation, QueryInformationJobObject, SetInformationJobObject,
+        TerminateJobObject,
     };
     use windows_sys::Win32::System::Threading::INFINITE;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_SUSPENDED, CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, ResumeThread,
+        STARTUPINFOW, WaitForSingleObject,
+    };
 
     // ======================== 辅助函数 ========================
 
@@ -52,9 +51,7 @@ mod imp {
     /// 创建命名 Job Object
     fn create_job(name: &str) -> io::Result<HANDLE> {
         let wide_name = to_wide(name);
-        let handle = unsafe {
-            CreateJobObjectW(ptr::null_mut(), wide_name.as_ptr())
-        };
+        let handle = unsafe { CreateJobObjectW(ptr::null_mut(), wide_name.as_ptr()) };
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -179,17 +176,25 @@ mod imp {
                 &ext_limit as *const _ as *const _,
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
-        } != 0 {
+        } != 0
+        {
             println!("  ✅ 已设置 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE");
         } else {
-            println!("  ⚠️  设置 KILL_ON_JOB_CLOSE 失败: {}", io::Error::last_os_error());
+            println!(
+                "  ⚠️  设置 KILL_ON_JOB_CLOSE 失败: {}",
+                io::Error::last_os_error()
+            );
         }
 
         // 启动一个子进程并分配到 Job
         let comspec = std::env::var("ComSpec").unwrap_or_else(|_| "cmd.exe".to_string());
         println!("\n  🧪 启动子进程并分配到 Job...");
 
-        let (proc, thread) = match spawn_suspended(&comspec, &["/c", "echo Hello from Job & timeout /t 2 >nul"], false) {
+        let (proc, thread) = match spawn_suspended(
+            &comspec,
+            &["/c", "echo Hello from Job & timeout /t 2 >nul"],
+            false,
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("  ❌ 启动子进程失败: {}", e);
@@ -216,13 +221,23 @@ mod imp {
                 size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
                 ptr::null_mut(),
             )
-        } != 0 {
+        } != 0
+        {
             println!("  📊 Job 统计信息:");
-            println!("     - 总用户时间: {} ms", accounting.TotalUserTime / 10_000);
-            println!("     - 总内核时间: {} ms", accounting.TotalKernelTime / 10_000);
+            println!(
+                "     - 总用户时间: {} ms",
+                accounting.TotalUserTime / 10_000
+            );
+            println!(
+                "     - 总内核时间: {} ms",
+                accounting.TotalKernelTime / 10_000
+            );
             println!("     - 页面错误数: {}", accounting.TotalPageFaultCount);
             println!("     - 活跃进程数: {}", accounting.ActiveProcesses);
-            println!("     - 已终止进程数: {}", accounting.TotalTerminatedProcesses);
+            println!(
+                "     - 已终止进程数: {}",
+                accounting.TotalTerminatedProcesses
+            );
         } else {
             println!("  ⚠️  查询 Job 信息失败: {}", io::Error::last_os_error());
         }
@@ -254,7 +269,8 @@ mod imp {
                 &limit_info as *const _ as *const _,
                 size_of::<JOBOBJECT_BASIC_LIMIT_INFORMATION>() as u32,
             )
-        } != 0 {
+        } != 0
+        {
             println!("     ✅ 已设置活跃进程数上限为 2");
         } else {
             println!("     ❌ 设置失败: {}", io::Error::last_os_error());
@@ -270,7 +286,11 @@ mod imp {
                         procs.push((p, t));
                         println!("     - 进程 {} 已启动并分配", i + 1);
                     } else {
-                        println!("     - 进程 {} 分配失败 (预期行为): {}", i + 1, io::Error::last_os_error());
+                        println!(
+                            "     - 进程 {} 分配失败 (预期行为): {}",
+                            i + 1,
+                            io::Error::last_os_error()
+                        );
                         unsafe {
                             CloseHandle(p);
                             CloseHandle(t);
@@ -295,7 +315,8 @@ mod imp {
         // 2b. CPU 时间限制
         println!("  🧪 测试 CPU 时间限制 (100ms)");
         let mut ext_limit2: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        ext_limit2.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_PROCESS_TIME | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        ext_limit2.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_PROCESS_TIME | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         ext_limit2.BasicLimitInformation.PerProcessUserTimeLimit = 100 * 10_000; // 100ms in 100ns units
 
         if unsafe {
@@ -305,14 +326,24 @@ mod imp {
                 &ext_limit2 as *const _ as *const _,
                 size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
             )
-        } != 0 {
+        } != 0
+        {
             println!("     ✅ 已设置每进程 CPU 时间上限为 100ms");
         } else {
             println!("     ❌ 设置失败: {}", io::Error::last_os_error());
         }
 
         // 启动一个消耗 CPU 的进程 (PowerShell busy-loop)
-        match spawn_suspended("powershell", &["-NoProfile", "-NonInteractive", "-Command", "while($true){}"], false) {
+        match spawn_suspended(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while($true){}",
+            ],
+            false,
+        ) {
             Ok((p, t)) => {
                 if unsafe { AssignProcessToJobObject(job, p) } != 0 {
                     resume_thread(t);
@@ -373,7 +404,12 @@ mod imp {
             // 启动 4 个 CPU 密集进程 (cmd busy-loop, stdin 从 nul 读取)
             // PowerShell busy-loop: 不依赖 stdin，纯 CPU 消耗
             let cpu_cmd = "powershell";
-            let cpu_args: &[&str] = &["-NoProfile", "-NonInteractive", "-Command", "while($true){}"];
+            let cpu_args: &[&str] = &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while($true){}",
+            ];
             let mut procs_a = Vec::new();
             for i in 0..4 {
                 match spawn_suspended(cpu_cmd, cpu_args, false) {
@@ -382,7 +418,10 @@ mod imp {
                             resume_thread(t);
                             procs_a.push((p, t));
                         } else {
-                            unsafe { CloseHandle(p); CloseHandle(t); }
+                            unsafe {
+                                CloseHandle(p);
+                                CloseHandle(t);
+                            }
                         }
                     }
                     Err(e) => eprintln!("     进程 {} 启动失败: {}", i, e),
@@ -413,18 +452,29 @@ mod imp {
             let total_cpu_ms = total_user_ms + total_kernel_ms;
 
             println!("     ⏱️  墙钟耗时: {} ms", wall_elapsed.as_millis());
-            println!("     📊 Job 累计 CPU: 用户={} ms, 内核={} ms, 合计={} ms",
-                     total_user_ms, total_kernel_ms, total_cpu_ms);
+            println!(
+                "     📊 Job 累计 CPU: 用户={} ms, 内核={} ms, 合计={} ms",
+                total_user_ms, total_kernel_ms, total_cpu_ms
+            );
             println!("     📋 已终止进程数: {}", acct_a.TotalTerminatedProcesses);
 
             if total_cpu_ms > 5000 {
-                println!("     ✅ 验证通过: 总 CPU ({} ms) >> 3s，确认 PerProcess 是各进程独立计算", total_cpu_ms);
+                println!(
+                    "     ✅ 验证通过: 总 CPU ({} ms) >> 3s，确认 PerProcess 是各进程独立计算",
+                    total_cpu_ms
+                );
             } else {
-                println!("     ⚠️  总 CPU ({} ms) 未显著超过单进程限额，结果可能受调度影响", total_cpu_ms);
+                println!(
+                    "     ⚠️  总 CPU ({} ms) 未显著超过单进程限额，结果可能受调度影响",
+                    total_cpu_ms
+                );
             }
 
             for (p, t) in procs_a {
-                unsafe { CloseHandle(t); CloseHandle(p); }
+                unsafe {
+                    CloseHandle(t);
+                    CloseHandle(p);
+                }
             }
             unsafe { CloseHandle(job_a) };
         }
@@ -451,7 +501,12 @@ mod imp {
 
             // 启动 4 个 CPU 密集进程 (cmd busy-loop, stdin 从 nul 读取)
             let cpu_cmd = "powershell";
-            let cpu_args: &[&str] = &["-NoProfile", "-NonInteractive", "-Command", "while($true){}"];
+            let cpu_args: &[&str] = &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "while($true){}",
+            ];
             let mut procs_b = Vec::new();
             for i in 0..4 {
                 match spawn_suspended(cpu_cmd, cpu_args, false) {
@@ -460,7 +515,10 @@ mod imp {
                             resume_thread(t);
                             procs_b.push((p, t));
                         } else {
-                            unsafe { CloseHandle(p); CloseHandle(t); }
+                            unsafe {
+                                CloseHandle(p);
+                                CloseHandle(t);
+                            }
                         }
                     }
                     Err(e) => eprintln!("     进程 {} 启动失败: {}", i, e),
@@ -491,8 +549,10 @@ mod imp {
             let total_cpu_ms = total_user_ms + total_kernel_ms;
 
             println!("     ⏱️  墙钟耗时: {} ms", wall_elapsed.as_millis());
-            println!("     📊 Job 累计 CPU: 用户={} ms, 内核={} ms, 合计={} ms",
-                     total_user_ms, total_kernel_ms, total_cpu_ms);
+            println!(
+                "     📊 Job 累计 CPU: 用户={} ms, 内核={} ms, 合计={} ms",
+                total_user_ms, total_kernel_ms, total_cpu_ms
+            );
             println!("     📋 已终止进程数: {}", acct_b.TotalTerminatedProcesses);
 
             // 注意: PerJobUserTimeLimit 仅限制用户态时间，且 Job CPU 计量存在周期性刷新延迟
@@ -500,14 +560,25 @@ mod imp {
             // 关键对比: 实验 A (PerProcess) 的总 CPU 应显著高于实验 B (PerJob)
             println!("     ℹ️  对比: PerProcess 独立限额 vs PerJob 共享限额");
             if total_cpu_ms < 70_000 {
-                println!("     ✅ 验证通过: 总 CPU ({} ms) 低于实验 A，确认 PerJob 是所有进程共享限额", total_cpu_ms);
-                println!("     ℹ️  注: 超出 3s 限额的部分来自 Job CPU 计量的周期性刷新延迟 (约 100ms~1s)");
+                println!(
+                    "     ✅ 验证通过: 总 CPU ({} ms) 低于实验 A，确认 PerJob 是所有进程共享限额",
+                    total_cpu_ms
+                );
+                println!(
+                    "     ℹ️  注: 超出 3s 限额的部分来自 Job CPU 计量的周期性刷新延迟 (约 100ms~1s)"
+                );
             } else {
-                println!("     ⚠️  总 CPU ({} ms) 与实验 A 接近，PerJob 限制可能未完全生效", total_cpu_ms);
+                println!(
+                    "     ⚠️  总 CPU ({} ms) 与实验 A 接近，PerJob 限制可能未完全生效",
+                    total_cpu_ms
+                );
             }
 
             for (p, t) in procs_b {
-                unsafe { CloseHandle(t); CloseHandle(p); }
+                unsafe {
+                    CloseHandle(t);
+                    CloseHandle(p);
+                }
             }
             unsafe { CloseHandle(job_b) };
         }
@@ -534,7 +605,8 @@ mod imp {
                 &ui_restrictions as *const _ as *const _,
                 size_of::<JOBOBJECT_BASIC_UI_RESTRICTIONS>() as u32,
             )
-        } != 0 {
+        } != 0
+        {
             println!("  ✅ 已设置 UI 限制:");
             println!("     - 禁止访问外部 USER 句柄");
             println!("     - 禁止读写剪贴板");
@@ -575,7 +647,8 @@ mod imp {
 
         // 设置安全限制：禁止管理员权限 + 受限令牌
         let mut sec_limit: JOBOBJECT_SECURITY_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        sec_limit.SecurityLimitFlags = JOB_OBJECT_SECURITY_NO_ADMIN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN;
+        sec_limit.SecurityLimitFlags =
+            JOB_OBJECT_SECURITY_NO_ADMIN | JOB_OBJECT_SECURITY_RESTRICTED_TOKEN;
 
         if unsafe {
             SetInformationJobObject(
@@ -584,12 +657,16 @@ mod imp {
                 &sec_limit as *const _ as *const _,
                 size_of::<JOBOBJECT_SECURITY_LIMIT_INFORMATION>() as u32,
             )
-        } != 0 {
+        } != 0
+        {
             println!("  ✅ 已设置安全限制:");
             println!("     - JOB_OBJECT_SECURITY_NO_ADMIN: 禁止管理员权限");
             println!("     - JOB_OBJECT_SECURITY_RESTRICTED_TOKEN: 使用受限令牌");
         } else {
-            println!("  ⚠️  设置安全限制失败 (可能需要管理员权限): {}", io::Error::last_os_error());
+            println!(
+                "  ⚠️  设置安全限制失败 (可能需要管理员权限): {}",
+                io::Error::last_os_error()
+            );
         }
 
         // 在安全受限 Job 中启动进程并检查其权限
@@ -622,20 +699,17 @@ mod imp {
         // 启动多个长时间运行的进程
         let mut batch_procs = Vec::new();
         for i in 0..3 {
-            match spawn_suspended(&comspec, &["/c", "timeout /t 60 >nul"], false) {
-                Ok((p, t)) => {
-                    if unsafe { AssignProcessToJobObject(job, p) } != 0 {
-                        resume_thread(t);
-                        batch_procs.push((p, t));
-                        println!("  - 后台进程 {} 已启动", i + 1);
-                    } else {
-                        unsafe {
-                            CloseHandle(p);
-                            CloseHandle(t);
-                        }
+            if let Ok((p, t)) = spawn_suspended(&comspec, &["/c", "timeout /t 60 >nul"], false) {
+                if unsafe { AssignProcessToJobObject(job, p) } != 0 {
+                    resume_thread(t);
+                    batch_procs.push((p, t));
+                    println!("  - 后台进程 {} 已启动", i + 1);
+                } else {
+                    unsafe {
+                        CloseHandle(p);
+                        CloseHandle(t);
                     }
                 }
-                Err(_) => {}
             }
         }
 
@@ -644,7 +718,10 @@ mod imp {
             if unsafe { TerminateJobObject(job, 42) } != 0 {
                 println!("  ✅ Job 内所有进程已终止 (退出码: 42)");
             } else {
-                println!("  ❌ TerminateJobObject 失败: {}", io::Error::last_os_error());
+                println!(
+                    "  ❌ TerminateJobObject 失败: {}",
+                    io::Error::last_os_error()
+                );
             }
 
             // 验证进程确实被终止

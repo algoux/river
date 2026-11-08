@@ -67,9 +67,7 @@ mod imp {
     // ========================================================================
 
     fn last_errno() -> i32 {
-        std::io::Error::last_os_error()
-            .raw_os_error()
-            .unwrap_or(-1)
+        std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
     }
 
     fn check_root() {
@@ -89,15 +87,13 @@ mod imp {
     /// 读取 /proc/self/ns/<ns_type> 的 inode 号
     fn read_ns_inode(ns_type: &str) -> Option<u64> {
         let path = format!("/proc/self/ns/{ns_type}");
-        std::fs::read_link(&path)
-            .ok()
-            .and_then(|link| {
-                // 格式: "pid:[4026531836]"
-                let s = link.to_string_lossy();
-                s.split(':')
-                    .nth(1)
-                    .and_then(|n| n.trim_end_matches(']').parse().ok())
-            })
+        std::fs::read_link(&path).ok().and_then(|link| {
+            // 格式: "pid:[4026531836]"
+            let s = link.to_string_lossy();
+            s.split(':')
+                .nth(1)
+                .and_then(|n| n.trim_end_matches(']').parse().ok())
+        })
     }
 
     // ========================================================================
@@ -109,8 +105,7 @@ mod imp {
     fn clone_into_namespace(flags: u64, label: &str) -> (OwnedFd, Pid) {
         println!("--- {label} ---");
 
-        let (status_r, status_w) =
-            pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
+        let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
 
         let mut pidfd_raw: c_int = -1;
         let args = CloneArgs {
@@ -246,8 +241,8 @@ mod imp {
         // 先使挂载事件变为私有，避免传播到父 namespace
         let ret = unsafe {
             libc::mount(
-                b"none\0".as_ptr() as *const libc::c_char,
-                b"/\0".as_ptr() as *const libc::c_char,
+                c"none".as_ptr(),
+                c"/".as_ptr(),
                 std::ptr::null(),
                 libc::MS_REC | libc::MS_PRIVATE,
                 std::ptr::null(),
@@ -264,11 +259,11 @@ mod imp {
         // 挂载一个私有 tmpfs
         let ret = unsafe {
             libc::mount(
-                b"tmpfs\0".as_ptr() as *const libc::c_char,
-                b"/tmp\0".as_ptr() as *const libc::c_char,
-                b"tmpfs\0".as_ptr() as *const libc::c_char,
+                c"tmpfs".as_ptr(),
+                c"/tmp".as_ptr(),
+                c"tmpfs".as_ptr(),
                 0,
-                b"size=1M\0".as_ptr() as *const libc::c_void,
+                c"size=1M".as_ptr() as *const libc::c_void,
             )
         };
         if ret != 0 {
@@ -291,10 +286,7 @@ mod imp {
 
         // 清理
         unsafe {
-            libc::umount2(
-                b"/tmp\0".as_ptr() as *const libc::c_char,
-                libc::MNT_DETACH,
-            );
+            libc::umount2(c"/tmp".as_ptr(), libc::MNT_DETACH);
         }
         Ok(())
     }
@@ -333,8 +325,10 @@ mod imp {
         } else if ifaces.is_empty() {
             println!("  ⚠️  netlink 查询失败或无接口");
         } else {
-            println!("  ℹ️  存在非 lo 接口: {:?}", 
-                ifaces.iter().filter(|n| *n != "lo").collect::<Vec<_>>());
+            println!(
+                "  ℹ️  存在非 lo 接口: {:?}",
+                ifaces.iter().filter(|n| *n != "lo").collect::<Vec<_>>()
+            );
         }
         Ok(())
     }
@@ -404,27 +398,33 @@ mod imp {
         let mut ifaces = Vec::new();
 
         loop {
-            let n = unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n =
+                unsafe { libc::recv(sock, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             if n <= 0 {
                 break;
             }
             let len = n as usize;
             let mut offset = 0;
             while offset + mem::size_of::<libc::nlmsghdr>() <= len {
-                let nlh: &libc::nlmsghdr = unsafe { &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr) };
-                if i32::from(nlh.nlmsg_type) == libc::NLMSG_DONE || i32::from(nlh.nlmsg_type) == libc::NLMSG_ERROR {
+                let nlh: &libc::nlmsghdr =
+                    unsafe { &*(buf.as_ptr().add(offset) as *const libc::nlmsghdr) };
+                if i32::from(nlh.nlmsg_type) == libc::NLMSG_DONE
+                    || i32::from(nlh.nlmsg_type) == libc::NLMSG_ERROR
+                {
                     break;
                 }
-                if nlh.nlmsg_type == libc::RTM_NEWLINK as u16 {
+                if nlh.nlmsg_type == libc::RTM_NEWLINK {
                     // ifinfomsg 紧跟 nlmsghdr
                     let ifm_offset = offset + mem::size_of::<libc::nlmsghdr>();
                     // 属性从 ifinfomsg 之后开始（需对齐到 NLMSG_ALIGN）
-                    let attr_offset = ifm_offset + libc::NLMSG_ALIGN(mem::size_of::<libc::ifinfomsg>()) as usize;
+                    let attr_offset =
+                        ifm_offset + libc::NLMSG_ALIGN(mem::size_of::<libc::ifinfomsg>()) as usize;
                     let msg_end = offset + nlh.nlmsg_len as usize;
                     let mut a_off = attr_offset;
                     while a_off + mem::size_of::<libc::nlattr>() <= msg_end {
-                        let nla: &libc::nlattr = unsafe { &*(buf.as_ptr().add(a_off) as *const libc::nlattr) };
-                        if nla.nla_type == libc::IFLA_IFNAME as u16 {
+                        let nla: &libc::nlattr =
+                            unsafe { &*(buf.as_ptr().add(a_off) as *const libc::nlattr) };
+                        if nla.nla_type == libc::IFLA_IFNAME {
                             let name_start = a_off + mem::size_of::<libc::nlattr>();
                             let name_end = a_off + nla.nla_len as usize;
                             if name_end <= msg_end {
@@ -448,7 +448,8 @@ mod imp {
             let mut done = false;
             let mut off2 = 0;
             while off2 + mem::size_of::<libc::nlmsghdr>() <= len {
-                let nlh2: &libc::nlmsghdr = unsafe { &*(buf.as_ptr().add(off2) as *const libc::nlmsghdr) };
+                let nlh2: &libc::nlmsghdr =
+                    unsafe { &*(buf.as_ptr().add(off2) as *const libc::nlmsghdr) };
                 if i32::from(nlh2.nlmsg_type) == libc::NLMSG_DONE {
                     done = true;
                     break;
@@ -470,9 +471,7 @@ mod imp {
         let uid = unsafe { libc::getuid() };
         let euid = unsafe { libc::geteuid() };
         let gid = unsafe { libc::getgid() };
-        println!(
-            "  [child] User namespace: uid={uid}, euid={euid}, gid={gid}"
-        );
+        println!("  [child] User namespace: uid={uid}, euid={euid}, gid={gid}");
         // 在 root 创建的 user namespace 中，UID 映射取决于父进程的设置
         // 这里仅验证我们确实处于新的 user namespace
         println!("  ✅ User namespace: 已进入新用户命名空间");
@@ -577,8 +576,7 @@ mod imp {
     fn clone_user_namespace() -> (OwnedFd, Pid) {
         println!("--- User Namespace (带 UID/GID 映射) ---");
 
-        let (status_r, status_w) =
-            pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
+        let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");
         // 额外管道：父→子，通知映射已完成
         let (map_done_r, map_done_w) =
             pipe_with(PipeFlags::CLOEXEC).expect("pipe2(O_CLOEXEC) 失败");

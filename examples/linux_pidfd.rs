@@ -15,9 +15,7 @@
 mod imp {
     use rustix::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use rustix::pipe::{PipeFlags, pipe_with};
-    use rustix::process::{
-        Pid, Signal, WaitId, WaitidOptions, pidfd_send_signal, waitid,
-    };
+    use rustix::process::{Pid, Signal, WaitId, WaitidOptions, pidfd_send_signal, waitid};
     use seccompiler::{
         BpfProgram, SeccompAction, SeccompFilter, SeccompRule, apply_filter_all_threads,
     };
@@ -33,7 +31,7 @@ mod imp {
     #[derive(Default)]
     struct CloneArgs {
         flags: u64,
-        pidfd: u64,       // 输出：设置 CLONE_PIDFD 时写入 pidfd
+        pidfd: u64, // 输出：设置 CLONE_PIDFD 时写入 pidfd
         child_tid: u64,
         parent_tid: u64,
         exit_signal: u64,
@@ -189,19 +187,19 @@ mod imp {
     /// 包括握手本身使用的系统调用（write/close/exit_group）。
     fn build_seccomp_filter() -> Result<BpfProgram, i32> {
         let allow: &[libc::c_long] = &[
-            libc::SYS_write,           // 就绪确认
-            libc::SYS_close,           // 关闭状态管道
-            libc::SYS_exit_group,      // _exit(42) / _exit(127)
+            libc::SYS_write,      // 就绪确认
+            libc::SYS_close,      // 关闭状态管道
+            libc::SYS_exit_group, // _exit(42) / _exit(127)
             libc::SYS_exit,
             libc::SYS_clock_nanosleep, // glibc sleep()
             libc::SYS_nanosleep,
             libc::SYS_restart_syscall,
-            libc::SYS_rt_sigreturn,    // 从信号处理程序返回
+            libc::SYS_rt_sigreturn, // 从信号处理程序返回
             libc::SYS_futex,
             libc::SYS_sched_yield,
         ];
         let rules: BTreeMap<i64, Vec<SeccompRule>> =
-            allow.iter().map(|&nr| (nr as i64, Vec::new())).collect();
+            allow.iter().map(|&nr| (nr, Vec::new())).collect();
 
         let filter = SeccompFilter::new(
             rules,
@@ -320,10 +318,7 @@ mod imp {
 
         // 阻塞等待退出
         println!("  阻塞等待子进程退出...");
-        match waitid(
-            WaitId::PidFd(pidfd.as_fd()),
-            WaitidOptions::EXITED,
-        ) {
+        match waitid(WaitId::PidFd(pidfd.as_fd()), WaitidOptions::EXITED) {
             Ok(Some(status)) => {
                 println!("  ✅ waitid(P_PIDFD) 已回收 pid {:?}:", child_pid);
                 print_waitid_status(&status);
