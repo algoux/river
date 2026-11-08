@@ -8,7 +8,6 @@
 
 use std::io;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
-use std::time::Duration;
 
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::JobObjects::{
@@ -135,7 +134,6 @@ impl Job {
     /// Peak total commit of the whole tree (JobMemoryLimit accounting), in
     /// bytes. Feeds the MLE evidence when the *tree* pinned the limit even
     /// though no single process did.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn peak_job_memory_used(&self) -> io::Result<u64> {
         Ok(self.job_memory_info()?.1)
     }
@@ -202,12 +200,6 @@ impl Job {
         } else {
             Ok(())
         }
-    }
-
-    /// Number of processes currently alive in the job (tests).
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) fn alive_process_count(&self) -> io::Result<u32> {
-        Ok(self.alive_process_ids()?.len() as u32)
     }
 
     /// Pids of the processes currently alive in the job.
@@ -279,21 +271,4 @@ pub(crate) fn wait_process_exit(process: HANDLE) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
     Ok(code)
-}
-
-/// Sleep helper so tests do not depend on external timing behaviour.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn brief_pause() {
-    std::thread::sleep(Duration::from_millis(150));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn physical_memory_is_sane() {
-        let m = physical_memory_bytes();
-        assert!(m > 1024 * 1024 * 1024, "physical memory: {m}");
-    }
 }

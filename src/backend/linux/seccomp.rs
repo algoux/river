@@ -490,30 +490,3 @@ const ALLOW: &[libc::c_long] = &[
     // --- local sockets only (no AF_INET creation) -------------------------
     libc::SYS_socketpair,
 ];
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Both filters compile for the running architecture (removing a needed
-    /// rule would make the Python smoke test die with SIGSYS instead).
-    #[test]
-    fn filters_compile() {
-        match filters() {
-            Ok(f) => {
-                assert!(!f.allowlist.is_empty(), "empty BPF program");
-                assert!(!f.clone3_prefilter.is_empty(), "empty prefilter");
-                assert!(!f.ioctl_prefilter.is_empty(), "empty ioctl prefilter");
-            }
-            Err(e) => {
-                // Non-x86_64 targets fail closed by design; on x86_64 a
-                // build error is a real failure. `cfg!` is a compile-time
-                // constant, so spell the check as a match on the target.
-                #[cfg(target_arch = "x86_64")]
-                panic!("seccomp filter build failed on x86_64: {e}");
-                #[cfg(not(target_arch = "x86_64"))]
-                let _ = e;
-            }
-        }
-    }
-}

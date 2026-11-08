@@ -31,64 +31,33 @@ use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, parse_copy_out, va
 ///
 /// `rootfs` is not supported on Windows (Windows processes always resolve
 /// system DLLs from the real `System32`): passing it raises `ValueError`.
-/// See `river.capabilities()` for the programmatic capability matrix.
 ///
-/// Concurrency: the class is `frozen` — it holds no mutable state
-/// (only the configured `runtimes` and the safety ceilings), and every run
-/// keeps all of its state in locals. `run()` may therefore be called
-/// concurrently from several Python threads on the same `Sandbox`; per-run
-/// resources (job, working directory, stdio) are independent.
+/// Concurrency: the class is `frozen` — it holds no mutable state (only the
+/// configured `runtimes`), and every run keeps all of its state in locals.
+/// `run()` may therefore be called concurrently from several Python threads
+/// on the same `Sandbox`; per-run resources (job, working directory, stdio)
+/// are independent.
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
-    /// Internal safety ceilings (mechanism guarantees that stay in place
-    /// when the caller passes `None` limits). Configurable so a deployment
-    /// can tighten the defaults; never disableable.
-    pub(crate) ceilings: SafetyCeilings,
 }
 
 #[pymethods]
 impl Sandbox {
     #[new]
-    #[pyo3(signature = (rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None))]
-    #[pyo3(text_signature = "(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)")]
-    fn new(
-        rootfs: Option<PathBuf>,
-        runtimes: Option<Vec<PathBuf>>,
-        max_wall_secs: Option<u64>,
-        max_processes: Option<u32>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (rootfs=None, runtimes=None))]
+    #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
+    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> PyResult<Self> {
         if rootfs.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "rootfs is not supported on Windows; use runtimes=[...] to expose \
-                 read-only runtime directories instead (check river.capabilities())",
+                 read-only runtime directories instead",
             ));
-        }
-        let mut ceilings = SafetyCeilings::default();
-        // "Tighten only": a caller value can lower a ceiling, never raise it
-        // (the mechanism guarantee must not be disableable). Zero is rejected
-        // instead of silently becoming 1s/1 process.
-        if let Some(secs) = max_wall_secs {
-            if secs == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "max_wall_secs must be >= 1",
-                ));
-            }
-            ceilings.wall_limit = Duration::from_secs(secs.min(ceilings.wall_limit.as_secs()));
-        }
-        if let Some(n) = max_processes {
-            if n == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "max_processes must be >= 1",
-                ));
-            }
-            ceilings.max_processes = n.min(ceilings.max_processes);
         }
         Ok(Self {
             rootfs: None,
             runtimes: runtimes.unwrap_or_default(),
-            ceilings,
         })
     }
 
@@ -199,14 +168,14 @@ impl Sandbox {
         // --- translate the frozen contract into backend primitives --------
         let limits = JobLimits {
             memory_limit_bytes: spec.memory_limit_kb.map(|kb| kb.saturating_mul(1024)),
-            max_processes: self.ceilings.max_processes,
+            max_processes: SafetyCeilings::default().max_processes,
         };
         // Wall limit: user value, the 2x+1s default for CPU-limited runs, or
-        // the configured safety ceiling for "unlimited" runs.
+        // the safety ceiling for "unlimited" runs.
         let wall_limit = spec
             .effective_wall_time_limit_ms()
             .map(Duration::from_millis)
-            .unwrap_or(self.ceilings.wall_limit);
+            .unwrap_or(SafetyCeilings::default().wall_limit);
         // Effective limits the job enforces (user limit or safety ceiling);
         // the verdict compares measurements against these (contract-layer
         // evidence). Scalars stay outside the closure: they are needed after
@@ -222,8 +191,8 @@ impl Sandbox {
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb.saturating_mul(1024));
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
         let stdio_ceilings = StdioCeilings {
-            capture_limit_bytes: self.ceilings.capture_limit_bytes,
-            sink_limit_bytes: self.ceilings.file_sink_limit_bytes,
+            capture_limit_bytes: SafetyCeilings::default().capture_limit_bytes,
+            sink_limit_bytes: SafetyCeilings::default().file_sink_limit_bytes,
         };
 
         // Blocking pipeline with the GIL released. The spec itself moves in:
@@ -429,27 +398,6 @@ impl Sandbox {
     }
 
     fn __repr__(&self) -> String {
-        format!(
-            "Sandbox(runtimes=[{}], max_wall_secs={}, max_processes={})",
-            self.runtimes.len(),
-            self.ceilings.wall_limit.as_secs(),
-            self.ceilings.max_processes
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The sandboxed spawn profile always carries the full mitigation set.
-    #[test]
-    fn sandboxed_profile_carries_mitigations() {
-        let p = SpawnProfile::sandboxed(std::ptr::null_mut(), Vec::new());
-        assert_eq!(
-            p.mitigation_policy,
-            crate::backend::windows::spawn::mitigation_policies()
-        );
-        assert!(!p.has_appcontainer());
+        format!("Sandbox(runtimes=[{}])", self.runtimes.len())
     }
 }

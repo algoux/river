@@ -5,13 +5,11 @@ import types
 from collections.abc import Buffer, Mapping, Sequence
 from typing import Literal, Self, TypeAlias
 
-__all__ = ["Sandbox", "Status", "capabilities", "doctor"]
+__all__ = ["Sandbox", "Status"]
 
 _StrOrPath: TypeAlias = str | os.PathLike[str]
 _CopyInSource: TypeAlias = Buffer | _StrOrPath
 _Verdict: TypeAlias = Literal["AC", "TLE", "MLE", "OLE", "RE", "SE"]
-
-_Capabilities: TypeAlias = dict[str, object]  # see capabilities() below
 
 
 class Status:
@@ -54,17 +52,22 @@ class Sandbox:
     Internal safety ceilings (mechanism guarantees that stay in place when
     a run passes `None` limits) default to a 24h wall clock, 64 live
     processes, a 64 MiB per-channel memory-capture ceiling and a 1 GiB
-    per-channel file-sink ceiling; `max_wall_secs` / `max_processes` may
-    tighten (never disable) the first two per Sandbox — larger values are
-    clamped to the defaults and `0` raises `ValueError`. Check
-    `river.capabilities()` for the platform capability matrix instead of
-    probing with try/except.
+    per-channel file-sink ceiling. They cannot be raised or disabled by the
+    caller.
+
+    Network access is denied unconditionally on every platform.
 
     Platform support: **Windows and Linux** are implemented (macOS is not
     yet). `rootfs` is supported on Linux only: it replaces the sandbox root
     with a caller-supplied read-only root tree (see below). It is not
     supported on Windows (processes always resolve system DLLs from the real
     `System32`) or macOS.
+
+    Concurrency: a `Sandbox` may always be used from several threads
+    concurrently (it is frozen; every run keeps its state in locals).
+    Simultaneous `run()` calls are unbounded on Linux (each run gets its own
+    cgroup) and capped on Windows by the AppContainer profile slot pool
+    (runs beyond the cap block until a slot frees).
 
     Linux specifics: the process runs as a per-run leased uid inside mount/pid/net/ipc/
     uts/cgroup namespaces under a seccomp allowlist with `no_new_privs`;
@@ -81,17 +84,16 @@ class Sandbox:
     `copy_out` maps sandbox-relative product paths to host destinations —
     collected after the run, never following symlinks, and `OLE` when the
     collected bytes pass `copy_out_limit_kb`.
-    Construction fails closed when cgroups v2, `memory.peak`,
-    `memory.swap.max` or seccomp are unavailable (see `doctor()`); the
-    backend must run as root.
+    On Linux the backend requires cgroups v2 with the `memory`/`pids`
+    controllers plus `memory.peak`, `memory.swap.max` and seccomp support;
+    a missing mechanism surfaces when a run starts. The backend must run as
+    root.
     """
 
     def __init__(
         self,
         rootfs: _StrOrPath | None = None,
         runtimes: Sequence[_StrOrPath] | None = None,
-        max_wall_secs: int | None = None,
-        max_processes: int | None = None,
     ) -> None: ...
 
     def __enter__(self) -> Self: ...
@@ -122,44 +124,3 @@ class Sandbox:
         stdout_file: _StrOrPath | None = None,
         stderr_file: _StrOrPath | None = None,
     ) -> Status: ...
-
-
-def capabilities() -> _Capabilities:
-    """Capability matrix of the running backend (frozen keys):
-
-    - `platform`: `"windows" | "linux" | "macos"`
-    - `rootfs`: whether `Sandbox(rootfs=...)` is supported
-    - `default_max_processes`: default live-process cap per run
-    - `internal_wall_limit_secs`: safety wall-clock ceiling for
-      caller-unlimited runs
-    - `max_concurrent_runs`: hard ceiling on simultaneously running `run()`
-      calls per session (`4294967295` = no fixed ceiling; Windows reports
-      its AppContainer profile slot pool size, Linux is unbounded)
-
-    Network access is denied unconditionally on every platform, and a
-    `Sandbox` may always be used from several threads concurrently (it is
-    frozen; every run keeps its state in locals) — neither is a capability
-    key. Concurrency is *capped* on Windows by the slot pool (runs beyond
-    the cap block until a slot frees).
-    """
-
-
-def doctor() -> dict[str, object]:
-    """Deployment self-check (kernel / cgroup / seccomp / filesystem facts).
-
-    Returns a dict with at least:
-
-    - `platform`: `"windows" | "linux" | "macos"`
-    - `ok`: whether every required mechanism is available
-    - `errors`: list of blocking problems (empty when `ok`)
-    - `warnings`: list of non-blocking caveats (may be non-empty when `ok`)
-
-    Linux also reports `kernel`, `cgroup_root`, `cgroups_v2`, `controllers`,
-    `memory_peak`, `memory_swap_max`, `cgroup_kill`, `seccomp`,
-    `seccomp_actions`, `pidfd_open`, `userns_allowed`,
-    `apparmor_userns_restrict` and `workdir_root`. `pidfd_open` tells
-    whether the monitor is event-driven (Linux 5.3+); without it every run
-    pays the polling fallback's wakeups. Windows reports `app_container`,
-    `job_object` and `workdir_root`. `Sandbox(...)` runs the same checks
-    and fails closed when `ok` is false.
-    """

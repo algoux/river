@@ -102,61 +102,30 @@ fn child_limits(cpu_limit_ms: Option<u64>, uid: libc::uid_t, gid: libc::gid_t) -
 /// `runtimes` entry is still layered on top, read-only. `executable` and the
 /// `runtimes` paths are then interpreted in **sandbox coordinates** (paths
 /// inside the rootfs); only `copy_in` values and `*_file` I/O stay host
-/// paths. Check `river.capabilities()`.
+/// paths.
 ///
 /// Concurrency: the class is `frozen` — it holds no mutable state (only the
-/// configured `runtimes` and the safety ceilings), and every run keeps all
-/// of its state in locals. `run()` may therefore be called concurrently from
-/// several Python threads on the same `Sandbox`.
+/// configured `runtimes`), and every run keeps all of its state in locals.
+/// `run()` may therefore be called concurrently from several Python threads
+/// on the same `Sandbox`.
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
-    /// Internal safety ceilings (mechanism guarantees that stay in place
-    /// when the caller passes `None` limits). Configurable so a deployment
-    /// can tighten the defaults; never disableable.
-    pub(crate) ceilings: SafetyCeilings,
 }
 
 #[pymethods]
 impl Sandbox {
     #[new]
-    #[pyo3(signature = (rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None))]
-    #[pyo3(text_signature = "(rootfs=None, runtimes=None, max_wall_secs=None, max_processes=None)")]
-    fn new(
-        rootfs: Option<PathBuf>,
-        runtimes: Option<Vec<PathBuf>>,
-        max_wall_secs: Option<u64>,
-        max_processes: Option<u32>,
-    ) -> PyResult<Self> {
+    #[pyo3(signature = (rootfs=None, runtimes=None))]
+    #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
+    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> PyResult<Self> {
         if let Some(fs) = &rootfs {
             validate_rootfs(fs).map_err(pyo3::exceptions::PyValueError::new_err)?;
-        }
-        // Fail closed: a missing mechanism (cgroups v2, memory.peak,
-        // seccomp) must surface here, not as a silent per-run degradation.
-        crate::backend::linux::preflight().map_err(pyo3::exceptions::PyRuntimeError::new_err)?;
-        let mut ceilings = SafetyCeilings::default();
-        // "Tighten only": a caller value can lower a ceiling, never raise it.
-        if let Some(secs) = max_wall_secs {
-            if secs == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "max_wall_secs must be >= 1",
-                ));
-            }
-            ceilings.wall_limit = Duration::from_secs(secs.min(ceilings.wall_limit.as_secs()));
-        }
-        if let Some(n) = max_processes {
-            if n == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "max_processes must be >= 1",
-                ));
-            }
-            ceilings.max_processes = n.min(ceilings.max_processes);
         }
         Ok(Self {
             rootfs,
             runtimes: runtimes.unwrap_or_default(),
-            ceilings,
         })
     }
 
@@ -285,11 +254,11 @@ impl Sandbox {
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb.saturating_mul(1024));
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb.saturating_mul(1024));
         // Wall limit: user value, the 2x+1s default for CPU-limited runs, or
-        // the configured safety ceiling for "unlimited" runs.
+        // the safety ceiling for "unlimited" runs.
         let wall_limit = spec
             .effective_wall_time_limit_ms()
             .map(Duration::from_millis)
-            .unwrap_or(self.ceilings.wall_limit);
+            .unwrap_or(SafetyCeilings::default().wall_limit);
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
         // Compile (once per process) the seccomp filter set (allowlist +
         // clone3 prefilter); a failure must not silently disable it.
@@ -363,12 +332,16 @@ impl Sandbox {
                 stderr_limit,
                 stdout_file,
                 stderr_file,
-                self.ceilings.into(),
+                SafetyCeilings::default().into(),
             )?;
             // Per-run cgroup: limits must exist before the program runs.
             // pids.max covers the supervisor too (+1), so the program's own
-            // allowance stays exactly `max_processes` (DESIGN §3.6).
-            let cgroup = Cgroup::create(memory_limit_bytes, self.ceilings.max_processes + 1)?;
+            // allowance stays exactly the internal live-process cap
+            // (DESIGN §3.6).
+            let cgroup = Cgroup::create(
+                memory_limit_bytes,
+                SafetyCeilings::default().max_processes + 1,
+            )?;
             let procs_c = cgroup.procs_path_c()?;
             let child = ns::spawn(
                 &exe,
@@ -488,18 +461,11 @@ impl Sandbox {
     fn __repr__(&self) -> String {
         match &self.rootfs {
             Some(rootfs) => format!(
-                "Sandbox(rootfs={:?}, runtimes=[{}], max_wall_secs={}, max_processes={})",
+                "Sandbox(rootfs={:?}, runtimes=[{}])",
                 rootfs.display().to_string(),
-                self.runtimes.len(),
-                self.ceilings.wall_limit.as_secs(),
-                self.ceilings.max_processes
+                self.runtimes.len()
             ),
-            None => format!(
-                "Sandbox(runtimes=[{}], max_wall_secs={}, max_processes={})",
-                self.runtimes.len(),
-                self.ceilings.wall_limit.as_secs(),
-                self.ceilings.max_processes
-            ),
+            None => format!("Sandbox(runtimes=[{}])", self.runtimes.len()),
         }
     }
 }

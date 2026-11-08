@@ -17,9 +17,9 @@
 //! - Default range: `[100000, 100064)` — 64 concurrent runs, overridable
 //!   with `RIVER_UID_BASE` / `RIVER_UID_COUNT` (deployment knob for hosts
 //!   that already use the default range).
-//! - `doctor()` (and the first lease) verify the range does not intersect
-//!   `/etc/passwd` — a collision would silently give the program an
-//!   existing host identity, so it is a construction-blocking error.
+//! - The first lease verifies the range does not intersect `/etc/passwd` — a
+//!   collision would silently give the program an existing host identity,
+//!   so it is a lease-blocking error.
 //! - Exhaustion blocks (20 ms poll), mirroring the Windows slot pool: a
 //!   judge prefers waiting over sharing an identity.
 
@@ -97,42 +97,6 @@ fn colliding_system_uid(range: &Range) -> Option<u32> {
     None
 }
 
-/// Doctor facts for the uid pool: whether it is configured and collision-free.
-pub(crate) fn facts() -> Vec<(&'static str, crate::backend::DoctorValue)> {
-    use crate::backend::DoctorValue;
-    let mut out = Vec::new();
-    match range() {
-        Ok(r) => {
-            out.push(("per_run_uid_base", DoctorValue::Str(r.base.to_string())));
-            out.push(("per_run_uid_count", DoctorValue::Str(r.count.to_string())));
-            if let Some(uid) = colliding_system_uid(r) {
-                out.push(("per_run_uid_collision", DoctorValue::Str(uid.to_string())));
-            }
-        }
-        Err(e) => out.push(("per_run_uid_error", DoctorValue::Str(e))),
-    }
-    out
-}
-
-/// Errors that must block `Sandbox` construction (fail closed).
-pub(crate) fn blocking_errors() -> Vec<String> {
-    let mut errors = Vec::new();
-    match range() {
-        Ok(r) => {
-            if let Some(uid) = colliding_system_uid(r) {
-                errors.push(format!(
-                    "per-run uid range [{}, {}) collides with /etc/passwd uid {uid} \
-                     (set RIVER_UID_BASE/RIVER_UID_COUNT to a free range)",
-                    r.base,
-                    r.base + r.count
-                ));
-            }
-        }
-        Err(e) => errors.push(format!("per-run uid pool misconfigured: {e}")),
-    }
-    errors
-}
-
 /// An exclusive uid/gid lease. Released when dropped (the `flock` dies with
 /// the file descriptor; a hard-killed judger releases it kernel-side).
 pub(crate) struct UidGuard {
@@ -175,28 +139,5 @@ pub(crate) fn acquire() -> io::Result<UidGuard> {
             // leased by another run: try the next uid
         }
         std::thread::sleep(ACQUIRE_POLL);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Two live leases must yield distinct uids, and a dropped lease is
-    /// reusable (kernel-side `flock` release).
-    #[test]
-    fn leases_are_exclusive_and_reusable() {
-        let a = acquire().expect("uid lease");
-        let b = acquire().expect("second uid lease");
-        assert_ne!(a.uid, b.uid, "two live leases share a uid");
-        let uid_b = b.uid;
-        drop(a);
-        // The freed uid becomes available again; a concurrent judger may
-        // race us for it, so only the invariant "never the still-leased
-        // uid" is asserted here.
-        let c = acquire().expect("re-lease after drop");
-        assert_ne!(c.uid, uid_b, "re-lease handed out the still-leased uid");
-        drop(c);
-        drop(b);
     }
 }

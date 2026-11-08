@@ -23,8 +23,7 @@
 //!   most `slots` package SIDs per session, and each gets its `runtimes`
 //!   grants once;
 //! - concurrent runs are capped at `slots` (default: CPU parallelism clamped
-//!   to 4..=60); the ceiling is exposed through `river.capabilities()` as
-//!   `max_concurrent_runs`.
+//!   to 4..=60).
 
 use std::io;
 use std::path::PathBuf;
@@ -137,7 +136,7 @@ fn session_id() -> u32 {
     sid
 }
 
-pub(crate) fn slot_count() -> usize {
+fn slot_count() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(MIN_SLOTS)
