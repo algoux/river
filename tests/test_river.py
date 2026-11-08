@@ -69,8 +69,14 @@ def backend_usable() -> bool:
         return COMSPEC.exists()
     if IS_LINUX:
         # The Linux backend needs root (mount/namespace/cgroup writes) and
-        # cgroups v2.
-        return os.geteuid() == 0 and Path("/sys/fs/cgroup/cgroup.controllers").exists()
+        # cgroups v2 with the memory/pids controllers delegated.
+        if os.geteuid() != 0:
+            return False
+        try:
+            controllers = Path("/sys/fs/cgroup/cgroup.controllers").read_text()
+        except OSError:
+            return False
+        return {"memory", "pids"} <= set(controllers.split())
     return False
 
 

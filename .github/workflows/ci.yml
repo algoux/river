@@ -1,8 +1,8 @@
 name: ci
 
-# Every push/PR must pass: formatting and clippy — on both supported
-# backends. The README's "run `cargo fmt` before every commit" rule is
-# enforced here instead of by hand.
+# Every push/PR must pass: formatting, clippy and the Python suite — on both
+# supported backends. The README's "run `cargo fmt` before every commit"
+# rule is enforced here instead of by hand.
 on:
   push:
     branches: [master, main]
@@ -30,13 +30,16 @@ jobs:
         # Warnings are errors: the `never_loop` finding used to make this
         # step fail outright, which is exactly what we want to keep.
         run: cargo clippy --all-targets -- -D warnings
+      - name: Set up environment
+        run: uv sync --extra test
       - name: Build extension
         run: uv run --no-project maturin develop --release
-        env:
-          # maturin needs the venv concept; use the system interpreter.
-          VIRTUAL_ENV: ${{ env.pythonLocation }}
+      - name: Python suite
+        run: uv run --no-project python -m pytest -q
 
-  # Linux backend: namespaces + cgroups v2.
+  # Linux backend: namespaces + cgroups v2. The suite needs root
+  # (CAP_SYS_ADMIN for mount/namespace/cgroup writes), so the interpreter
+  # of the project environment is run under sudo.
   linux:
     runs-on: ubuntu-latest
     steps:
@@ -52,7 +55,9 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Set up environment
+        run: uv sync --extra test
       - name: Build extension
         run: uv run --no-project maturin develop --release
-        env:
-          VIRTUAL_ENV: ${{ env.pythonLocation }}
+      - name: "Python suite (root: namespaces + cgroups v2)"
+        run: sudo -E "$PWD/.venv/bin/python" -m pytest -q
