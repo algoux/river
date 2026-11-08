@@ -15,6 +15,7 @@
 | [`linux_cgroups_v2.rs`](linux_cgroups_v2.rs) | Linux | 全面演示 cgroups v2 能力：层级操作、进程迁移、CPU/Memory/PIDs/IO 控制器、clone3(CLONE_INTO_CGROUP)、cgroup.freeze、多进程并行 CPU 统计，需 root 权限 |
 | [`windows_app_container.rs`](windows_app_container.rs) | Windows | 完整演示 AppContainer 沙箱能力：Profile 创建/删除、SID 获取、ACL 授权（读写/只读）、以 AppContainer 身份启动子进程、文件系统与环境变量隔离验证 |
 | [`windows_app_container_runner.rs`](windows_app_container_runner.rs) | Windows | 在 AppContainer 沙箱中执行指定命令，通过 runtimes 参数授予目标目录只读执行权限，适用于运行脚本等场景 |
+| [`windows_job_object.rs`](windows_job_object.rs) | Windows | 全面演示 Job Object 能力：基础进程管理、资源限制（PerProcess/PerJob CPU 时间对比验证）、UI 限制、安全限制、批量终止 |
 
 ## 运行方式
 
@@ -31,6 +32,7 @@ sudo cargo run --example linux_cgroups_v2      # 需要 root
 cargo run --example windows_capture
 cargo run --example windows_app_container
 cargo run --example windows_app_container_runner
+cargo run --example windows_job_object
 ```
 
 > **注意：** 每个示例都包含平台检查，在非目标平台上运行会提示并退出。
@@ -227,6 +229,30 @@ let runtimes: Vec<std::path::PathBuf> = vec![
 - `did not find executable at '...'`: 需要将可执行文件所在目录添加到 `runtimes`
 - `Permission denied`: 检查脚本/依赖库所在目录是否已授权
 - AppContainer 默认隔离几乎所有文件系统访问，所有需要的路径都必须显式授权
+
+### windows_job_object — Job Object 能力演示（Windows）
+
+全面演示 Windows Job Object 的核心能力，涵盖基础进程管理、资源限制、UI 限制、安全限制和批量终止。
+
+| 阶段 | 内容 | 验证方式 |
+|------|------|----------|
+| Stage 1 | 基础进程管理 | `CreateJobObjectW` 创建 Job、`AssignProcessToJobObject` 分配进程、`QueryInformationJobObject` 查询统计信息（CPU 时间/页面错误/活跃进程数）、`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` |
+| Stage 2a | 活跃进程数限制 | `JOB_OBJECT_LIMIT_ACTIVE_PROCESS=2`，尝试启动 3 个进程，第 3 个被拒绝 (ERROR_QUOTA_EXCEEDED) |
+| Stage 2b | PerProcess CPU 时间限制 | `JOB_OBJECT_LIMIT_PROCESS_TIME=100ms`，PowerShell busy-loop 进程超限后被自动终止 |
+| Stage 2c | PerProcess vs PerJob 对比验证 | 4 个并行 PowerShell busy-loop：PerProcess=3s 时总 CPU ~70s（各进程独立），PerJob=3s 时总 CPU ~28s（共享限额），实测验证多核并行下 1s 墙钟可消耗远超 1s CPU |
+| Stage 3 | UI 限制 | `JOBOBJECT_BASIC_UI_RESTRICTIONS`：禁止外部 USER 句柄、剪贴板读写、系统参数修改、注销/关机、全局 Atom、桌面创建、显示设置修改 |
+| Stage 4 | 安全限制 | `JOBOBJECT_SECURITY_LIMIT_INFORMATION`：`JOB_OBJECT_SECURITY_NO_ADMIN` + `JOB_OBJECT_SECURITY_RESTRICTED_TOKEN`，在独立 Job 中演示以避免不可逆影响 |
+| Stage 5 | 批量终止 | `TerminateJobObject(job, 42)` 一次性终止所有进程并验证退出码 |
+
+**关键技术点：**
+- `PerProcessUserTimeLimit` vs `PerJobUserTimeLimit`：前者是每个进程独立的 CPU 额度，后者是 Job 内所有进程共享的总额度。实测 4 进程并行时 PerProcess 模式总 CPU 约为 PerJob 模式的 2.5 倍
+- Job CPU 计量存在周期性刷新延迟（约 100ms~1s），不是实时强制终止，因此在计量间隔内多个进程可以短暂"超额"消耗
+- `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION` 中的 `TotalUserTime`/`TotalKernelTime` 是 `i64`（100ns 单位），非 `LARGE_INTEGER` 结构体
+- `spawn_suspended` 支持将 stdin 重定向到 NUL 设备，避免 cmd.exe 在非控制台 stdin 下的 "Input redirection is not supported" 错误
+- 安全限制 (`JOB_OBJECT_SECURITY_*`) 一旦设置便不可撤销，示例中使用独立 Job 隔离演示
+- `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 确保 Job 句柄关闭时自动终止所有关联进程，防止孤儿进程泄露
+
+**运行要求：** 无需管理员权限（安全限制部分在非管理员环境下会提示失败，不影响其他演示）
 
 ## 依赖
 
