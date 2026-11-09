@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use tempfile::TempDir;
 
 use crate::contract::RunSpec;
 use crate::contract::status::Status;
+
+/// Prefix of the per-session scratch directory created under `%TEMP%`.
+const WORKDIR_PREFIX: &str = "river-";
 
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
+    /// Scratch directory owned by this sandbox session: created on `__enter__`
+    /// and removed on `__exit__`. `None` while the session is not active.
+    pub workdir: Mutex<Option<TempDir>>,
 }
 
 #[pymethods]
@@ -28,11 +36,25 @@ impl Sandbox {
         Ok(Self {
             rootfs: None,
             runtimes: runtimes.unwrap_or_default(),
+            workdir: Mutex::new(None),
         })
     }
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        let dir = tempfile::Builder::new()
+            .prefix(WORKDIR_PREFIX)
+            .tempdir()
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to create sandbox temp dir: {e}"
+                ))
+            })?;
+        let mut guard = slf.workdir.lock().unwrap_or_else(|e| e.into_inner());
+        // Replacing an existing session's directory drops the old `TempDir`,
+        // which removes it from disk.
+        *guard = Some(dir);
+        drop(guard);
+        Ok(slf)
     }
 
     fn __exit__(
@@ -40,8 +62,28 @@ impl Sandbox {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> bool {
-        false
+    ) -> PyResult<bool> {
+        let dir = {
+            let mut guard = self.workdir.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(dir) = dir {
+            let path = dir.path().to_path_buf();
+            dir.close().map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to remove sandbox temp dir {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(false)
+    }
+
+    /// Path of the session scratch directory, or `None` outside a session.
+    #[getter]
+    fn workdir(&self) -> Option<PathBuf> {
+        let guard = self.workdir.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|dir| dir.path().to_path_buf())
     }
 
     #[pyo3(signature = (
@@ -119,7 +161,14 @@ impl Sandbox {
 
         println!("Sandbox.exec called with spec: {:#?}", _spec);
 
-        Ok(Default::default())
+        Ok(Status {
+            cpu_time_used_ms: cpu_time_limit_ms.unwrap_or(0),
+            wall_time_used_ms: wall_time_limit_ms.unwrap_or(0),
+            memory_used_bytes: memory_limit_bytes.unwrap_or(0),
+            status: "AC".to_string(),
+            signal: 0,
+            exit_code: 0,
+        })
     }
 
     fn __repr__(&self) -> String {

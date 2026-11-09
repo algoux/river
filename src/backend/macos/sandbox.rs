@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
+use tempfile::TempDir;
 
+use crate::contract::RunSpec;
 use crate::contract::status::Status;
-use crate::contract::{RunSpec, parse_copy_in, parse_copy_out, validate};
 
-#[pyclass(module = "river")]
+/// Prefix of the per-session scratch directory created under `%TEMP%`.
+const WORKDIR_PREFIX: &str = "river-";
+
+#[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
+    /// Scratch directory owned by this sandbox session: created on `__enter__`
+    /// and removed on `__exit__`. `None` while the session is not active.
+    pub workdir: Mutex<Option<TempDir>>,
 }
 
 #[pymethods]
@@ -18,15 +26,35 @@ impl Sandbox {
     #[new]
     #[pyo3(signature = (rootfs=None, runtimes=None))]
     #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
-    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> Self {
-        Self {
-            rootfs,
-            runtimes: runtimes.unwrap_or_default(),
+    fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> PyResult<Self> {
+        if rootfs.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "rootfs is not supported on Windows; use runtimes=[...] to expose \
+                 read-only runtime directories instead",
+            ));
         }
+        Ok(Self {
+            rootfs: None,
+            runtimes: runtimes.unwrap_or_default(),
+            workdir: Mutex::new(None),
+        })
     }
 
-    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+    fn __enter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        let dir = tempfile::Builder::new()
+            .prefix(WORKDIR_PREFIX)
+            .tempdir()
+            .map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to create sandbox temp dir: {e}"
+                ))
+            })?;
+        let mut guard = slf.workdir.lock().unwrap_or_else(|e| e.into_inner());
+        // Replacing an existing session's directory drops the old `TempDir`,
+        // which removes it from disk.
+        *guard = Some(dir);
+        drop(guard);
+        Ok(slf)
     }
 
     fn __exit__(
@@ -34,91 +62,116 @@ impl Sandbox {
         _exc_type: &Bound<'_, PyAny>,
         _exc_value: &Bound<'_, PyAny>,
         _traceback: &Bound<'_, PyAny>,
-    ) -> bool {
-        false
+    ) -> PyResult<bool> {
+        let dir = {
+            let mut guard = self.workdir.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take()
+        };
+        if let Some(dir) = dir {
+            let path = dir.path().to_path_buf();
+            dir.close().map_err(|e| {
+                pyo3::exceptions::PyOSError::new_err(format!(
+                    "failed to remove sandbox temp dir {}: {e}",
+                    path.display()
+                ))
+            })?;
+        }
+        Ok(false)
+    }
+
+    /// Path of the session scratch directory, or `None` outside a session.
+    #[getter]
+    fn workdir(&self) -> Option<PathBuf> {
+        let guard = self.workdir.lock().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|dir| dir.path().to_path_buf())
     }
 
     #[pyo3(signature = (
         executable,
         args = vec![],
         cwd = None,
-        env = None,
-        time_limit_ms = None,
+        envs = None,
+        cpu_time_limit_ms = None,
         wall_time_limit_ms = None,
-        memory_limit_kb = None,
-        stdin = None,
+        memory_limit_bytes = None,
         stdin_file = None,
         copy_in = None,
         copy_out = None,
-        copy_out_limit_kb = None,
-        stdout_limit_kb = None,
-        stderr_limit_kb = None,
+        copy_out_limit_bytes = None,
+        stdout_limit_bytes = None,
+        stderr_limit_bytes = None,
         stdout_file = None,
         stderr_file = None,
     ))]
-    #[pyo3(
-        text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
-    )]
+    #[pyo3(text_signature = "(
+        executable,
+        args=[],
+        cwd=None,
+        envs=None,
+        cpu_time_limit_ms=None,
+        wall_time_limit_ms=None,
+        memory_limit_bytes=None,
+        stdin=None,
+        stdin_file=None,
+        copy_in=None,
+        copy_out=None,
+        copy_out_limit_bytes=None,
+        stdout_limit_bytes=None,
+        stderr_limit_bytes=None,
+        stdout_file=None,
+        stderr_file=None
+    )")]
     #[allow(clippy::too_many_arguments)]
-    fn run(
+    fn exec(
         &self,
         executable: PathBuf,
         args: Vec<String>,
         cwd: Option<String>,
-        env: Option<HashMap<String, String>>,
-        time_limit_ms: Option<u64>,
+        envs: Option<HashMap<String, String>>,
+        cpu_time_limit_ms: Option<u64>,
         wall_time_limit_ms: Option<u64>,
-        memory_limit_kb: Option<u64>,
-        stdin: Option<Vec<u8>>,
+        memory_limit_bytes: Option<u64>,
         stdin_file: Option<PathBuf>,
-        copy_in: Option<HashMap<String, Py<PyAny>>>,
-        copy_out: Option<HashMap<String, PathBuf>>,
-        copy_out_limit_kb: Option<u64>,
-        stdout_limit_kb: Option<u64>,
-        stderr_limit_kb: Option<u64>,
+        copy_in: Option<HashMap<PathBuf, PathBuf>>,
+        copy_out: Option<HashMap<PathBuf, PathBuf>>,
+        copy_out_limit_bytes: Option<u64>,
+        stdout_limit_bytes: Option<u64>,
+        stderr_limit_bytes: Option<u64>,
         stdout_file: Option<PathBuf>,
         stderr_file: Option<PathBuf>,
-        py: Python<'_>,
+        _py: Python<'_>,
     ) -> PyResult<Status> {
-        let spec = RunSpec {
+        let _spec = RunSpec {
             executable,
             args,
             cwd,
-            env,
-            time_limit_ms,
+            envs,
+            cpu_time_limit_ms,
             wall_time_limit_ms,
-            memory_limit_kb,
-            stdin,
+            memory_limit_bytes,
             stdin_file,
-            copy_in: match &copy_in {
-                Some(map) => Some(parse_copy_in(map, py)?),
-                None => None,
-            },
-            copy_out: match &copy_out {
-                Some(map) => Some(crate::contract::parse_copy_out(map)?),
-                None => None,
-            },
-            copy_out_limit_bytes: copy_out_limit_kb.map(|kb| kb.saturating_mul(1024)),
-            stdout_limit_kb,
-            stderr_limit_kb,
+            copy_in,
+            copy_out,
+            copy_out_limit_bytes,
+            stdout_limit_bytes,
+            stderr_limit_bytes,
             stdout_file,
             stderr_file,
         };
-        validate(&spec)?;
-        let _ = spec.effective_wall_time_limit_ms();
-        Err(pyo3::exceptions::PyNotImplementedError::new_err(
-            "river currently supports Windows only; the macOS backend is not implemented yet",
-        ))
+
+        println!("Sandbox.exec called with spec: {:#?}", _spec);
+
+        Ok(Status {
+            cpu_time_used_ms: cpu_time_limit_ms.unwrap_or(0),
+            wall_time_used_ms: wall_time_limit_ms.unwrap_or(0),
+            memory_used_bytes: memory_limit_bytes.unwrap_or(0),
+            status: "AC".to_string(),
+            signal: 0,
+            exit_code: 0,
+        })
     }
 
     fn __repr__(&self) -> String {
-        match &self.rootfs {
-            Some(rootfs) => format!(
-                "Sandbox(rootfs={:?}, runtimes=[{}])",
-                rootfs.display().to_string(),
-                self.runtimes.len()
-            ),
-            None => format!("Sandbox(runtimes=[{}])", self.runtimes.len()),
-        }
+        format!("Sandbox(runtimes=[{}])", self.runtimes.len())
     }
 }

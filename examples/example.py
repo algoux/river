@@ -1,12 +1,18 @@
 import river
 
-PROJECT_ROOT = "E:/river"
+from pathlib import Path
 
+PROJECT_ROOT = "./"
+
+workdir = None
 with river.Sandbox(
     runtimes=[
         PROJECT_ROOT + "/.venv/Scripts",
     ]
 ) as sandbox:
+    workdir = sandbox.workdir
+    if Path(workdir).exists():
+        print("Workdir exists:", workdir)
     status = sandbox.exec(
         "python",
         args=["-c", "print('Hello, World!')"],
@@ -35,3 +41,6 @@ with river.Sandbox(
     print("CPU Time Used (ms):", status.cpu_time_used_ms)
     print("Wall Time Used (ms):", status.wall_time_used_ms)
     print("Memory Used (bytes):", status.memory_used_bytes)
+
+if workdir and Path(workdir).exists() is False:
+    print("Workdir has been cleaned up:", workdir)

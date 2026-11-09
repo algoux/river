@@ -120,6 +120,21 @@ def test_sandbox_is_a_context_manager():
         assert isinstance(box, river.Sandbox)
 
 
+@pytest.mark.skipif(not IS_WINDOWS, reason="the workdir field is a Windows-backend feature")
+def test_workdir_is_created_on_enter_and_removed_on_exit():
+    box = river.Sandbox()
+    assert box.workdir is None
+
+    with box:
+        workdir = box.workdir
+        assert workdir is not None
+        assert Path(workdir).is_dir()
+        assert Path(workdir).name.startswith("river-")
+
+    assert box.workdir is None
+    assert not Path(workdir).exists()
+
+
 @pytest.mark.skipif(not IS_WINDOWS, reason="rootfs is rejected on Windows only")
 def test_rootfs_is_rejected_on_windows():
     with pytest.raises(ValueError, match="rootfs"):

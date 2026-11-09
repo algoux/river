@@ -17,6 +17,7 @@ class Status:
     exit_code: int
 
 class Sandbox:
+    workdir: str | None
     def __init__(
         self,
         rootfs: _StrOrPath | None = None,
