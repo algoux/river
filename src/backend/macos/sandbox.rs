@@ -7,15 +7,6 @@ use pyo3::types::PyAny;
 use crate::contract::status::Status;
 use crate::contract::{RunSpec, parse_copy_in, parse_copy_out, validate};
 
-/// macOS sandbox — **not implemented yet**.
-///
-/// The Windows backend is the current target; this module exists so the crate
-/// keeps the platform split, and `run()` raises `NotImplementedError` rather
-/// than pretending to sandbox anything.
-///
-/// The intended design (see DESIGN.md §1): with `rootfs` the sandbox would
-/// execute inside a sandbox-exec profile restricted to it, and paths in
-/// `runtimes` would be exposed read-only on top of it.
 #[pyclass(module = "river")]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
@@ -38,8 +29,6 @@ impl Sandbox {
         slf
     }
 
-    /// Exit protocol: no leftover sandboxed processes, temporary working
-    /// directories removed, profiles/tokens released. Always returns `false`.
     fn __exit__(
         &self,
         _exc_type: &Bound<'_, PyAny>,
@@ -49,19 +38,6 @@ impl Sandbox {
         false
     }
 
-    /// Run an untrusted executable inside the sandbox and collect its status.
-    ///
-    /// Coordinate systems: `executable` is a host path when no `rootfs` is
-    /// set, else a path inside the rootfs; `cwd` and `copy_in` keys are
-    /// relative to the per-run private working directory.
-    ///
-    /// Limits: `None` means no caller-imposed limit (internal safety ceilings
-    /// still apply). `wall_time_limit_ms` defaults to `2 * time_limit_ms +
-    /// 1000` when only a CPU time limit is given.
-    ///
-    /// `stdin` / `stdin_file` are mutually exclusive. `*_file` output
-    /// parameters receive the full captured stream (host paths); the returned
-    /// `Status` still carries truncated copies plus truncation flags.
     #[pyo3(signature = (
         executable,
         args = vec![],
@@ -130,9 +106,6 @@ impl Sandbox {
         };
         validate(&spec)?;
         let _ = spec.effective_wall_time_limit_ms();
-        // The macOS backend is not implemented yet (see DESIGN.md §1). Fail
-        // loudly instead of returning an empty Status that would look like a
-        // silent no-op run.
         Err(pyo3::exceptions::PyNotImplementedError::new_err(
             "river currently supports Windows only; the macOS backend is not implemented yet",
         ))

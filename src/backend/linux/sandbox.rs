@@ -17,26 +17,12 @@ use crate::contract::status::Status;
 use crate::contract::verdict::{KillOrigin, RunEvidence, classify};
 use crate::contract::{RunSpec, SafetyCeilings, parse_copy_in, parse_copy_out, validate};
 
-/// How long a cgroup may take to become empty after the main process was
-/// reaped before its leftovers count as residual descendants (anti-cheat).
-/// The kernel removes tasks from `cgroup.procs` asynchronously, so a short
-/// grace period avoids the Windows §5.4 false positive.
 const RESIDUAL_GRACE: Duration = Duration::from_millis(100);
 
-/// `RLIMIT_FSIZE` for the sandboxed program: a single file it writes cannot
-/// grow past this, so a runaway writer dies on `SIGXFSZ` instead of filling
-/// the host disk. (Total `cwd` usage still relies on the caller's disk.)
 const CHILD_FSIZE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// `RLIMIT_NOFILE` for the sandboxed program.
 const CHILD_NOFILE: u64 = 1024;
 
-/// Constructor-time validation of a caller-supplied rootfs: an absolute
-/// host path to an existing directory or squashfs image file, and not `/`
-/// (binding the host root would erase the whole isolation model, same rule
-/// as `runtimes=["/"]` in `ns::MountPlan`). Image magic is verified per
-/// run in `MountPlan::build` (the file may change between construction and
-/// `run`).
 fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err(format!(
@@ -61,53 +47,16 @@ fn validate_rootfs(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Translate the contract limits and the leased identity into the
-/// child-side limits.
 fn child_limits(cpu_limit_ms: Option<u64>, uid: libc::uid_t, gid: libc::gid_t) -> ns::ChildLimits {
     ns::ChildLimits {
         fsize_bytes: CHILD_FSIZE_BYTES,
         nofile: CHILD_NOFILE,
-        // RLIMIT_CPU backstop: the judger's 10ms `cpu.stat` poll is the
-        // primary enforcement; this only guarantees the kernel kills a
-        // multi-process escape eventually.
-        //
-        // `saturating_add` + `div_ceil`: the naive `(ms + 999) / 1000`
-        // overflows a u64 for an absurd limit (`time_limit_ms = 2**64-1`),
-        // which panicked in debug builds and wrapped to a nonsense value
-        // in release builds. Saturating keeps the intent ("no CPU limit
-        // the kernel could enforce") instead of a wrapped 0.
         cpu_secs: cpu_limit_ms.map(|ms| ms.saturating_add(999).div_ceil(1000) + 1),
-        // Per-run leased identity (see `uidpool`): distinct from every other
-        // run and from host accounts.
         uid,
         gid,
     }
 }
 
-/// Linux sandbox.
-///
-/// The sandbox filesystem model:
-/// - a fresh private writable working directory per `run`, pivoted into a
-///   mount namespace so the rest of the host filesystem is invisible;
-/// - each path in `runtimes` exposed read-only (+execute) via bind mounts;
-/// - `copy_in` files provisioned into the working directory (read-only for
-///   the program: mode 0444, **root-owned** so it can neither write nor
-///   `chmod` them; the program itself runs as a per-run leased uid);
-/// - network access denied unconditionally (empty network namespace).
-///
-/// `rootfs` (a caller-supplied root tree) replaces the tmpfs root when
-/// given: it is bind-mounted **read-only** (`nosuid,nodev`) and the program
-/// is pivoted into it instead. The host system directories are *not* merged
-/// in — the rootfs must be self-contained (dynamic loader, libc, ...). Each
-/// `runtimes` entry is still layered on top, read-only. `executable` and the
-/// `runtimes` paths are then interpreted in **sandbox coordinates** (paths
-/// inside the rootfs); only `copy_in` values and `*_file` I/O stay host
-/// paths.
-///
-/// Concurrency: the class is `frozen` — it holds no mutable state (only the
-/// configured `runtimes`), and every run keeps all of its state in locals.
-/// `run()` may therefore be called concurrently from several Python threads
-/// on the same `Sandbox`.
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
     pub rootfs: Option<PathBuf>,
@@ -130,18 +79,11 @@ impl Sandbox {
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        // Defensive net: reclaim directories/cgroups abandoned by a
-        // *different* judger process that was hard-killed (its Drop never
-        // ran). Never touches live owners, including ourselves.
         workdir::sweep_stale_workdirs();
         cgroup::sweep_stale_cgroups();
         slf
     }
 
-    /// Exit protocol: everything a `run` leaves behind is owned by per-run
-    /// RAII guards (the workdir, the cgroup directory, the stdio pipes), so a
-    /// normal block exit has nothing left to do. Always returns `false`
-    /// (never suppresses block exceptions).
     fn __exit__(
         &self,
         _exc_type: &Bound<'_, PyAny>,
@@ -153,23 +95,6 @@ impl Sandbox {
         false
     }
 
-    /// Run an untrusted executable inside the sandbox and collect its status.
-    ///
-    /// Coordinate systems: without `rootfs`, `executable` is a host path;
-    /// with one, it is a path inside the rootfs. `cwd` and `copy_in` keys
-    /// are relative to the per-run private working directory either way.
-    ///
-    /// Limits: `None` means no caller-imposed limit (internal safety ceilings
-    /// still apply). `wall_time_limit_ms` defaults to `2 * time_limit_ms +
-    /// 1000` when only a CPU time limit is given.
-    ///
-    /// `stdin` / `stdin_file` are mutually exclusive. `*_file` output
-    /// parameters receive the full captured stream (host paths); the returned
-    /// `Status` still carries truncated copies plus truncation flags.
-    ///
-    /// `copy_out` maps sandbox-relative product paths to host destinations
-    /// (collected after the run, never following symlinks); when the
-    /// collected bytes pass `copy_out_limit_kb` the verdict is `OLE`.
     #[pyo3(signature = (
         executable,
         args = vec![],
@@ -191,8 +116,6 @@ impl Sandbox {
     #[pyo3(
         text_signature = "(executable, args=[], cwd=None, env=None, time_limit_ms=None, wall_time_limit_ms=None, memory_limit_kb=None, stdin=None, stdin_file=None, copy_in=None, copy_out=None, copy_out_limit_kb=None, stdout_limit_kb=None, stderr_limit_kb=None, stdout_file=None, stderr_file=None)"
     )]
-    // The signature mirrors the frozen Python contract (one parameter per
-    // run() keyword); collapsing it into a struct would hide that mapping.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -240,12 +163,6 @@ impl Sandbox {
         };
         validate(&spec)?;
 
-        // --- translate the frozen contract into backend primitives --------
-        // Effective limits the sandbox enforces (user limit or safety
-        // fallback); the verdict compares measurements against these
-        // (contract-layer evidence). Scalars stay outside the closure (all
-        // `Copy`); the spec itself moves in below, so big `copy_in` inputs
-        // are not cloned a second time.
         let memory_limit_bytes = spec
             .memory_limit_kb
             .map(|kb| kb.saturating_mul(1024))
@@ -253,23 +170,16 @@ impl Sandbox {
         let cpu_time_limit_ms = spec.time_limit_ms;
         let stdout_limit = spec.stdout_limit_kb.map(|kb| kb.saturating_mul(1024));
         let stderr_limit = spec.stderr_limit_kb.map(|kb| kb.saturating_mul(1024));
-        // Wall limit: user value, the 2x+1s default for CPU-limited runs, or
-        // the safety ceiling for "unlimited" runs.
         let wall_limit = spec
             .effective_wall_time_limit_ms()
             .map(Duration::from_millis)
             .unwrap_or(SafetyCeilings::default().wall_limit);
         let copy_out_limit_bytes = spec.copy_out_limit_bytes;
-        // Compile (once per process) the seccomp filter set (allowlist +
-        // clone3 prefilter); a failure must not silently disable it.
         let seccomp = match seccomp::filters() {
             Ok(program) => Some(program),
             Err(e) => return Ok(Status::infra_se(e)),
         };
 
-        // Blocking pipeline with the GIL released. All threads (stdio
-        // feeder/readers) are created inside this closure, after the fork
-        // (fork-safety rule: no threads before the fork).
         let result = py.detach(move || -> io::Result<_> {
             let RunSpec {
                 executable: exe,
@@ -290,30 +200,16 @@ impl Sandbox {
                 _ => StdinSource::Null,
             };
             let env_map = env.unwrap_or_default();
-            // Per-run working directory: the only writable place the program
-            // sees. `WorkDir` removes itself on drop (also on error paths).
-            // The program reaches it as `/cwd` inside the sandbox.
             let workdir = WorkDir::create()?;
             if let Some(files) = &copy_in {
                 workdir.provision(files)?;
             }
-            // TMPDIR target: `/cwd/tmp` from the program's point of view.
             let tmp_dir = workdir.path().join("tmp");
             std::fs::create_dir(&tmp_dir)?;
-            // Lease the per-run identity first: the workdir ownership and
-            // the child's setuid both come from it. The guard lives until
-            // the end of the closure, so the uid stays exclusive for the
-            // whole run (dropped after copy_out, before the workdir).
             let identity = uidpool::acquire()?;
-            // The program must own the cwd root (and only the `tmp/`
-            // subdir) to create files there. `copy_in` entries stay
-            // root-owned 0444/0755 — readable, never modifiable (DESIGN
-            // §3.3: an owned 0440 file could be chmod'ed and overwritten).
             workdir.grant_to(identity.uid, identity.gid)?;
             WorkDir::grant_dir_to(&tmp_dir, identity.uid, identity.gid)?;
 
-            // Whitelisted environment, in **sandbox coordinates** (the
-            // program never sees host paths). Base + caller overrides.
             let mut env_vars: Vec<(String, String)> = vec![
                 (
                     "PATH".to_string(),
@@ -334,10 +230,6 @@ impl Sandbox {
                 stderr_file,
                 SafetyCeilings::default().into(),
             )?;
-            // Per-run cgroup: limits must exist before the program runs.
-            // pids.max covers the supervisor too (+1), so the program's own
-            // allowance stays exactly the internal live-process cap
-            // (DESIGN §3.6).
             let cgroup = Cgroup::create(
                 memory_limit_bytes,
                 SafetyCeilings::default().max_processes + 1,
@@ -364,16 +256,12 @@ impl Sandbox {
                 Some(&cgroup),
                 cpu_time_limit_ms,
             )?;
-            // The whole tree is gone once the supervisor (or its pid-ns
-            // init) exited; force-kill any survivor, then take the
-            // measurements before the cgroup directory disappears.
             let residual = cgroup.wait_until_empty(RESIDUAL_GRACE)?;
             if residual > 0 {
                 cgroup.kill_all()?;
                 let _ = cgroup.wait_until_empty(RESIDUAL_GRACE);
             }
             let oom_killed = cgroup.oom_killed().unwrap_or(false);
-            // copy_out: collect the products before the workdir disappears.
             let collected = match &copy_out {
                 Some(entries) => workdir.collect(entries, copy_out_limit_bytes)?,
                 None => crate::backend::linux::workdir::Collected::default(),
@@ -384,7 +272,6 @@ impl Sandbox {
                 .unwrap_or(outcome.cpu_time_ms);
             let peak_bytes = cgroup.peak_bytes().unwrap_or(outcome.peak_memory_bytes);
             let (out, err, overflowed) = set.finish()?;
-            // Normal end: stop and reap the judger-death watchdog.
             child.disarm();
             Ok((
                 outcome,
@@ -411,13 +298,6 @@ impl Sandbox {
                 overflowed,
                 quota_exceeded,
             )) => {
-                // Evidence-priority verdict (contract layer): the backend
-                // reports what it observed; the contract classifies it.
-                //
-                // Output-limit evidence is *direct observation*: a fast
-                // writer can exit before the monitor sees the reader's flag,
-                // so the complete result from `finish` has the last word.
-                // (OLE outranks inferred memory/time evidence by contract.)
                 let kill = if overflowed {
                     KillOrigin::OutputLimit
                 } else if quota_exceeded {
@@ -430,7 +310,6 @@ impl Sandbox {
                     exit_code: outcome.exit_code,
                     residual_processes: residual,
                     oom_killed,
-                    output_limit_hit: overflowed,
                     cpu_time_limit_ms,
                     cpu_time_used_ms: cpu_used_ms,
                     memory_limit_bytes: Some(memory_limit_bytes),
@@ -450,11 +329,7 @@ impl Sandbox {
                 status.stderr_file_truncated = err.sink_truncated;
                 Ok(status)
             }
-            Err(e) => {
-                // Infra failure: report as SE per the frozen contract
-                // (validation errors raise; runtime failures surface here).
-                Ok(Status::infra_se(e.to_string()))
-            }
+            Err(e) => Ok(Status::infra_se(e.to_string())),
         }
     }
 

@@ -1,32 +1,3 @@
-//! Per-run private working directory.
-//!
-//! The only writable place the sandboxed program sees. Created fresh per
-//! run, provisioned with `copy_in` files (read-only for the program), and
-//! removed on drop — also on every error path (RAII, mirroring the Windows
-//! `WorkDir` guard).
-//!
-//! `copy_in` read-only enforcement: the provisioned entries stay
-//! **root-owned** — files mode 0444, directories mode 0755 — so the
-//! sandboxed program can read and traverse them but can never modify or
-//! `chmod` them. (An *owned* 0444 file could be `chmod`ed by its owner and
-//! then overwritten; verified.) Only the workdir root and its `tmp/`
-//! subdirectory are handed to the sandbox uid — the program owns its own
-//! cwd and creates files there.
-//!
-//! Known Unix limit: the program owns the parent directory, so it may still
-//! *delete or rename* a `copy_in` entry (unlink permission comes from the
-//! directory, not from the entry). Deleting one's own input cannot change
-//! its content and does not leak anything, so this is accepted rather than
-//! paid for with per-file read-only mounts.
-//!
-//! Per-run isolation: every run leases a **distinct** uid/gid from a fixed
-//! high range (see `uidpool`), so no other run and no host account shares
-//! the workdir's identity — an unrelated host process cannot traverse the
-//! tree by path, and it cannot write to the entries either.
-//!
-//! The workdir is created mode 0700 (root-owned) so nothing can read it
-//! before the run starts.
-
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -35,33 +6,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::contract::{CopyInSource, CopyOutEntry};
 
-/// Monotonic per-process counter so concurrent runs never collide on the
-/// same directory name (pid alone is reused over time; pid + counter +
-/// nanos makes an accidental collision practically impossible).
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Per-run working directory; removes itself on drop.
-///
-/// Liveness for the stale sweep is proven by an **exclusive flock on a
-/// sibling `<dir>.lock` file**, not by the pid in the name: pids are reused
-/// within milliseconds, so `/proc/<pid>` alone would make a just-killed
-/// judger's directory look alive (observed in the lifecycle test).
-///
-/// The lock file lives **outside** the workdir on purpose. It used to be
-/// `.owner` *inside* the directory, but the program owns that directory (so
-/// it can create files), and on Unix unlink permission comes from the parent
-/// — a program could therefore `unlink("/cwd/.owner")` (verified live),
-/// which silently degraded the sweep to the unreliable pid check.
 pub(crate) struct WorkDir {
     path: PathBuf,
-    /// Held for the run's lifetime; the lock is released by the kernel when
-    /// the judger dies (that is the sweep's "owner is gone" signal).
     _owner: std::fs::File,
 }
 
-/// Path of the ownership lock belonging to the workdir at `dir`.
-///
-/// A sibling of the directory, never inside it (see [`WorkDir`]).
 fn owner_path(dir: &Path) -> PathBuf {
     let mut s = dir.as_os_str().to_os_string();
     s.push(".lock");
@@ -69,14 +20,10 @@ fn owner_path(dir: &Path) -> PathBuf {
 }
 
 impl WorkDir {
-    /// Create a fresh private working directory under the system temp dir.
     pub(crate) fn create() -> io::Result<Self> {
         let base = std::env::temp_dir();
         let mut last_err = None;
         for _ in 0..8 {
-            // `as_nanos` (not `subsec_nanos`) keeps the full resolution: the
-            // earlier sum of seconds + subsecond nanos collapsed the time
-            // component to whole seconds.
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -85,9 +32,6 @@ impl WorkDir {
             let path = base.join(format!("river-{}-{}-{:x}", std::process::id(), n, nanos));
             match create_private_dir(&path) {
                 Ok(()) => {
-                    // The lock lives beside the directory, not inside it:
-                    // the program owns the directory and could unlink an
-                    // entry there (see `WorkDir`).
                     let owner = fs::OpenOptions::new()
                         .create(true)
                         .truncate(false)
@@ -113,17 +57,6 @@ impl WorkDir {
         &self.path
     }
 
-    /// Provision `copy_in` entries into the working directory. Keys are
-    /// sandbox-relative paths (validated upstream by `contract::validate`);
-    /// parent directories are created as needed. Every file ends up mode
-    /// 0444 and stays root-owned (see [`Self::grant_to`]): readable by the
-    /// untrusted program, never modifiable — `chmod` by the program fails
-    /// because it is not the owner.
-    ///
-    /// A `CopyInSource::Path` value pointing at a host **directory** is
-    /// provisioned recursively (regular files and subdirectories; symlinks
-    /// are skipped — a trusted-source convenience that must never become a
-    /// link-farm).
     pub(crate) fn provision(
         &self,
         files: &std::collections::HashMap<String, CopyInSource>,
@@ -155,16 +88,6 @@ impl WorkDir {
         Ok(())
     }
 
-    /// Collect `copy_out` products from the working directory into their
-    /// host destinations (called after the run ended, before the Drop).
-    ///
-    /// **Never follows symlinks**: the program could plant a link pointing
-    /// at any host path, and the judger runs as root — following it would
-    /// be an arbitrary-host-file exfiltration channel. Symlinked entries
-    /// are skipped entirely; missing sources are skipped (optional
-    /// products). Collection stops at the first file that would push the
-    /// total past `quota_bytes` (that file is *not* collected — no partial
-    /// files).
     pub(crate) fn collect(
         &self,
         entries: &[CopyOutEntry],
@@ -178,7 +101,7 @@ impl WorkDir {
             let src = self.path.join(&entry.src_rel);
             let md = match fs::symlink_metadata(&src) {
                 Ok(md) => md,
-                Err(_) => continue, // missing source: optional product
+                Err(_) => continue,
             };
             if md.file_type().is_symlink() {
                 continue;
@@ -192,29 +115,11 @@ impl WorkDir {
         Ok(out)
     }
 
-    /// Hand the working directory to the unprivileged program.
-    ///
-    /// Only the **workdir root** is chowned (and `tmp/` separately, see
-    /// [`Self::grant_dir_to`]): the program owns its private cwd and can
-    /// create files there. `copy_in` entries stay **root-owned** — files
-    /// 0444, directories 0755 — so the program can read and traverse them
-    /// but can never modify or chmod them (an owned 0440 file could be
-    /// `chmod`ed by its owner and overwritten; verified). The ownership lock
-    /// lives **outside** this directory (a root-owned sibling), so the
-    /// program can neither see nor unlink the sweep's liveness probe.
-    ///
-    /// Known Unix limit: the program owns the parent directory, so it may
-    /// still *delete or rename* a `copy_in` entry (unlink permission comes
-    /// from the directory). Deleting one's own input cannot change its
-    /// content and does not leak anything, so this is accepted and
-    /// documented rather than paid for with per-file read-only mounts.
     pub(crate) fn grant_to(&self, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
         chown(&self.path, uid, gid)?;
         chmod(&self.path, 0o700)
     }
 
-    /// Hand one writable subdirectory (the `tmp/` inside the cwd) to the
-    /// sandbox uid. `copy_in` directories are deliberately *not* passed here.
     pub(crate) fn grant_dir_to(dir: &Path, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
         chown(dir, uid, gid)?;
         chmod(dir, 0o700)
@@ -223,37 +128,23 @@ impl WorkDir {
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        // Best effort: a leftover directory is recovered by the stale-dir
-        // sweep (stage L5) rather than masking the real error of a run.
-        //
-        // The lock file is a sibling and must go too — otherwise every run
-        // would leave an empty `river-*.lock` in the temp dir. It is
-        // removed *after* the directory so a concurrent sweep never sees a
-        // directory without its lock (which would push it onto the
-        // unreliable pid fallback).
         let _ = fs::remove_dir_all(&self.path);
         let _ = fs::remove_file(owner_path(&self.path));
     }
 }
 
-/// Outcome of a `copy_out` collection.
 #[derive(Default)]
 pub(crate) struct Collected {
-    /// Total bytes written to the host destinations.
     pub total_bytes: u64,
-    /// True when the quota stopped the collection early.
     pub quota_exceeded: bool,
 }
 
-/// Recursively provision a host source directory into the working
-/// directory (`copy_in` with a directory value). Regular files and
-/// subdirectories only; symlinks are skipped.
 fn provision_dir(src: &Path, dst: &Path) -> io::Result<()> {
     fs::create_dir_all(dst)?;
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         if entry.file_type()?.is_symlink() {
-            continue; // never provision link farms
+            continue;
         }
         let md = entry.metadata()?;
         let target = dst.join(entry.file_name());
@@ -267,7 +158,6 @@ fn provision_dir(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Recursively collect a source directory into the host destination.
 fn collect_dir(
     src: &Path,
     dst: &Path,
@@ -281,7 +171,7 @@ fn collect_dir(
         }
         let entry = entry?;
         if entry.file_type()?.is_symlink() {
-            continue; // an exfiltration channel: never follow, never copy
+            continue;
         }
         let md = entry.metadata()?;
         let target = dst.join(entry.file_name());
@@ -294,9 +184,6 @@ fn collect_dir(
     Ok(())
 }
 
-/// Copy a single regular file to the host destination, updating the quota
-/// accounting. Opened with `O_NOFOLLOW` — a symlink swapped in place of a
-/// regular file after `symlink_metadata` is refused, not followed (TOCTOU).
 fn copy_one(
     src: &Path,
     dst: &Path,
@@ -312,8 +199,6 @@ fn copy_one(
     if let Some(quota) = quota_bytes
         && out.total_bytes + size > quota
     {
-        // Do not collect a file that would breach the quota (no partial
-        // files); the caller sees `quota_exceeded` and reports OLE.
         out.quota_exceeded = true;
         return Ok(());
     }
@@ -326,21 +211,15 @@ fn copy_one(
     Ok(())
 }
 
-/// Best-effort read-only: world-readable, never writable (0444). The file
-/// stays **root-owned** (see [`WorkDir::grant_to`]): the sandbox uid is not
-/// its owner, so `chmod` fails and the content is immutable.
 fn make_read_only(path: &Path) -> io::Result<()> {
     chmod(path, 0o444)
 }
 
-/// Create the workdir mode 0700: before the run starts nothing on the host
-/// (not even another run) can read the provisioned inputs.
 fn create_private_dir(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new().mode(0o700).create(path)
 }
 
-/// `chown(2)` with a path that may contain arbitrary bytes.
 fn chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -351,18 +230,11 @@ fn chown(path: &Path, uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
     Ok(())
 }
 
-/// `chmod(2)` on a path.
 fn chmod(path: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
-/// Try to take (or release) the ownership lock on a workdir.
-///
-/// `flock` is per open-file-description and survives fork/exec (the program
-/// does not need it, but only the judger holds the fd), so the lock
-/// disappears exactly when the last judger fd closes — including on
-/// SIGKILL.
 fn lock_owner(file: &std::fs::File, exclusive: bool) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     let op = if exclusive {
@@ -377,27 +249,10 @@ fn lock_owner(file: &std::fs::File, exclusive: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Does a process with this pid currently exist?
 fn pid_is_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
-/// Best-effort sweep of working directories abandoned by a **dead** judger
-/// process (e.g. the judger was hard-killed mid-run: `Drop` never ran; the
-/// sandboxed processes died via the watchdog, but the directory remained).
-///
-/// Ownership is decided by the sibling `<dir>.lock` flock, not by the pid:
-/// - lock acquirable  => the owner process is gone => remove the directory;
-/// - lock held (EWOULDBLOCK) => a live run => leave it alone;
-/// - no lock file (directory from an older build, whose lock was the
-///   in-directory `.owner`) => fall back to the `river-{pid}-...` name check.
-///
-/// Only **directories** are considered: the lock files themselves are
-/// siblings named `river-*.lock` and are skipped (they are removed together
-/// with their directory).
-///
-/// Concurrency: two sweeps racing on the same directory are serialized
-/// through a process-global lock.
 pub(crate) fn sweep_stale_workdirs() {
     static SWEEP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _guard = SWEEP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -413,8 +268,6 @@ pub(crate) fn sweep_stale_workdirs() {
             continue;
         }
         let path = entry.path();
-        // Skip the lock files (and any other non-directory): only workdirs
-        // are reclaimable.
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if !is_dir {
             continue;
@@ -427,18 +280,14 @@ pub(crate) fn sweep_stale_workdirs() {
                     let _ = fs::remove_dir_all(&path);
                     let _ = fs::remove_file(owner_path(&path));
                 }
-                Err(_) => continue, // live owner
+                Err(_) => continue,
             },
             Err(_) => {
-                // No sibling lock: either an older build (in-directory
-                // `.owner`) or a foreign directory. Fall back to the pid.
-                if path.join(".owner").exists() {
-                    // Older build: try the legacy lock first.
-                    if let Ok(owner) = fs::OpenOptions::new().write(true).open(path.join(".owner"))
-                        && lock_owner(&owner, true).is_err()
-                    {
-                        continue; // a live older-build owner
-                    }
+                if path.join(".owner").exists()
+                    && let Ok(owner) = fs::OpenOptions::new().write(true).open(path.join(".owner"))
+                    && lock_owner(&owner, true).is_err()
+                {
+                    continue;
                 }
                 let Some(pid) = owner_pid_of(name) else {
                     continue;
@@ -452,7 +301,6 @@ pub(crate) fn sweep_stale_workdirs() {
     }
 }
 
-/// Owner pid encoded in a `river-{pid}-...` working-directory name.
 fn owner_pid_of(dir_name: &str) -> Option<u32> {
     dir_name
         .strip_prefix("river-")?

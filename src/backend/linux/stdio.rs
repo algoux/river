@@ -1,17 +1,3 @@
-//! stdio plumbing: stdin feeding, stdout/stderr capture with kill
-//! thresholds, truncation flags, and full-stream archive files.
-//!
-//! Mirrors `backend::windows::stdio` semantics (the frozen contract, DESIGN
-//! §2.2): `*_limit` is a kill threshold (the reader fires past it, the
-//! monitor reaps the process, verdict `OLE`), `*_file` receives the
-//! complete stream up to the kill, and the returned buffer is the truncated
-//! sample (at most `limit` bytes) with a per-channel truncation flag.
-//!
-//! Fork-safety note: the pipes are created before
-//! the fork, but **all threads are started after it** — the reader and
-//! feeder threads exist only in the parent, and the parent drops the child
-//! ends immediately after the fork so EOF semantics work.
-
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -19,31 +5,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Where the child's stdin comes from.
 #[derive(Clone)]
 pub(crate) enum StdinSource {
-    /// Nothing (child reads EOF immediately).
     Null,
-    /// Feed these bytes, then EOF.
     Bytes(Vec<u8>),
-    /// Stream a host file (zero-copy intent), then EOF.
     File(PathBuf),
 }
 
-/// Per-channel overflow flags the monitor watches (the Linux counterpart of
-/// the Windows overflow event: set by a reader thread, observed by the
-/// monitor loop).
-///
-/// Besides the atomics there is an `eventfd`: a reader that crosses a kill
-/// threshold writes one byte to it, which wakes the monitor's `poll()`
-/// immediately. The atomics remain the source of truth (a run whose
-/// `eventfd` could not be created still works — the monitor then falls back
-/// to its legacy polling loop) and are re-checked on every wake, so a lost
-/// wakeup cannot delay an output kill.
 pub(crate) struct OverflowFlags {
     pub(crate) stdout: AtomicBool,
     pub(crate) stderr: AtomicBool,
-    /// Wakeup channel for the monitor (`None` if `eventfd` is unavailable).
     event: Option<OwnedFd>,
 }
 
@@ -58,7 +29,6 @@ impl Default for OverflowFlags {
 }
 
 fn make_eventfd() -> Option<OwnedFd> {
-    // SAFETY: plain syscall; the fd is owned from here on.
     let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
     if fd < 0 {
         None
@@ -72,17 +42,13 @@ impl OverflowFlags {
         self.stdout.load(Ordering::Relaxed) || self.stderr.load(Ordering::Relaxed)
     }
 
-    /// File descriptor the monitor can `poll` for overflow wakeups.
     pub(crate) fn event_fd(&self) -> Option<RawFd> {
         self.event.as_ref().map(|fd| fd.as_raw_fd())
     }
 
-    /// Drain the eventfd (it is level-triggered per `read`, not per write).
     pub(crate) fn drain_event(&self) {
         if let Some(fd) = &self.event {
             let mut buf = [0u8; 8];
-            // SAFETY: 8-byte buffer for the eventfd counter; EAGAIN when
-            // already drained is fine (and expected).
             unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), 8) };
         }
     }
@@ -96,54 +62,33 @@ impl OverflowFlags {
         flag.store(true, Ordering::Relaxed);
         if let Some(fd) = &self.event {
             let one: u64 = 1;
-            // SAFETY: 8-byte write to the eventfd; a full counter
-            // (EAGAIN) only means a wakeup is already pending, which is
-            // enough — the flag is the source of truth.
             unsafe { libc::write(fd.as_raw_fd(), (&one as *const u64).cast(), 8) };
         }
     }
 }
 
-/// One captured channel after the run finished.
 pub(crate) struct ChannelResult {
-    /// Truncated sample: at most `limit` bytes, or the internal capture
-    /// ceiling when no user limit was set.
     pub(crate) data: Vec<u8>,
     pub(crate) truncated: bool,
-    /// The `*_file` archive stopped early (sink ceiling reached).
     pub(crate) sink_truncated: bool,
 }
 
-/// One output channel: parent-held read end + archive writer + kill limit.
 struct ChannelPipe {
     read_end: OwnedFd,
-    /// Kill threshold in bytes; `None` = no caller-imposed limit.
     limit: Option<u64>,
-    /// Memory-capture ceiling (user limit, or the internal safety ceiling).
     capture_ceiling: u64,
-    /// File-archive ceiling (internal safety net against filling the disk).
     sink_ceiling: u64,
-    /// Optional full-stream archive (host path, `*_file` parameter).
     archive: Option<File>,
 }
 
-/// The full stdio set for one run.
 pub(crate) struct StdioSet {
     stdin: StdinSource,
-    /// Parent write end (feeder thread); child got a dup2'd copy on fd 0.
-    /// `None` once ownership passed to the feeder thread.
     stdin_write: Option<OwnedFd>,
-    /// Child read end; dropped by the parent right after the fork.
     stdin_read: Option<OwnedFd>,
-    /// Child write ends for stdout/stderr; dropped by the parent right
-    /// after the fork (child got dup2'd copies on fds 1 / 2).
     stdout_write: Option<OwnedFd>,
     stderr_write: Option<OwnedFd>,
     channels: Vec<ChannelPipe>,
     overflow: Arc<OverflowFlags>,
-    /// Started by `after_fork` (parent side, after the fork), joined by
-    /// `finish`. Readers run **during** the run so a fountain is killed by
-    /// the monitor instead of blocking on a full pipe.
     feeder: Option<std::thread::JoinHandle<io::Result<()>>>,
     readers: Vec<std::thread::JoinHandle<io::Result<ChannelResult>>>,
     readers_started: bool,
@@ -158,8 +103,6 @@ impl StdioSet {
         stderr_file: Option<PathBuf>,
         ceilings: crate::contract::StdioCeilings,
     ) -> io::Result<Self> {
-        // Every parent-held end is CLOEXEC; the child's ends survive only as
-        // dup2'd copies on 0/1/2 (dup2 clears CLOEXEC on the target fd).
         let (stdin_read, stdin_write) = pipe_cloexec()?;
         let (stdout_read, stdout_write) = pipe_cloexec()?;
         let (stderr_read, stderr_write) = pipe_cloexec()?;
@@ -198,8 +141,6 @@ impl StdioSet {
         })
     }
 
-    /// Child-side fds for dup2 in the forked child: (stdin, stdout, stderr).
-    /// Raw fds are valid until `after_fork`.
     pub(crate) fn child_fds(&self) -> (RawFd, RawFd, RawFd) {
         let as_raw = |fd: &Option<OwnedFd>| fd.as_ref().unwrap().as_raw_fd();
         (
@@ -209,23 +150,6 @@ impl StdioSet {
         )
     }
 
-    /// Called by the parent right after the fork: drops the child-side pipe
-    /// ends (the child has its dup2'd copies), then starts the feeder and
-    /// the two output readers. Starting the readers here (not at `finish`)
-    /// is what makes an output fountain killable: a full pipe would
-    /// otherwise block the child until the wall watchdog.
-    ///
-    /// The feeder takes **ownership** of the stdin write end: wrapping a
-    /// borrowed raw fd in a `File` would double-close it when `StdioSet`
-    /// drops (the IO-safety abort).
-    ///
-    /// Thread creation can fail (`EAGAIN`/`ENOMEM` under fd or memory
-    /// pressure). That is an **infrastructure** failure, not a panic: the
-    /// caller must learn about it as an `io::Error` so the run can be
-    /// classified `SE`. Panicking here would abort the *judger* — and on a
-    /// thread that does not hold the GIL (this runs inside `py.detach`), a
-    /// panic terminates the process with SIGSEGV instead of surfacing as a
-    /// `PanicException`.
     pub(crate) fn after_fork(&mut self) -> io::Result<()> {
         drop(self.stdin_read.take());
         drop(self.stdout_write.take());
@@ -248,20 +172,10 @@ impl StdioSet {
         Ok(())
     }
 
-    /// Overflow flags shared with the monitor.
     pub(crate) fn overflow(&self) -> Arc<OverflowFlags> {
         Arc::clone(&self.overflow)
     }
 
-    /// Join every stdio thread and collect the per-channel results. Must be
-    /// called after the child exited (or was killed) so EOF is guaranteed;
-    /// the feeder is joined first, then the readers.
-    ///
-    /// The returned `overflowed` flag is the *complete* observation: a fast
-    /// writer can exit before the monitor notices the flag mid-run, so the
-    /// caller must treat "bytes past a kill threshold were read" as an
-    /// output-limit kill regardless of when the reader noticed (evidence
-    /// outranks the exit code — contract §classify priority 2).
     pub(crate) fn finish(self) -> io::Result<(ChannelResult, ChannelResult, bool)> {
         let StdioSet {
             stdin_write,
@@ -270,11 +184,8 @@ impl StdioSet {
             overflow,
             ..
         } = self;
-        // Drop the parent's stdin write end first: if the feeder already
-        // finished (or there is none), the child's stdin hits EOF.
         drop(stdin_write);
         if let Some(handle) = feeder {
-            // EPIPE from a child that died early is not an error.
             handle
                 .join()
                 .map_err(|_| io::Error::other("stdin feeder panicked"))??;
@@ -293,11 +204,6 @@ impl StdioSet {
     }
 }
 
-/// Feed stdin from a dedicated thread; the fd is consumed as a `File`.
-///
-/// Thread creation can fail (fd/memory pressure). The error is returned so
-/// the caller can classify the run `SE` instead of panicking the judge (see
-/// [`StdioSet::after_fork`]).
 fn start_feeder(
     source: &StdinSource,
     write_end: OwnedFd,
@@ -309,11 +215,7 @@ fn start_feeder(
             let bytes = bytes.clone();
             let handle = std::thread::Builder::new()
                 .name("river-stdin".into())
-                .spawn(move || {
-                    // BrokenPipe = the child died without reading; not
-                    // an infrastructure failure.
-                    writer.write_all(&bytes).or_else(ignore_epipe)
-                })
+                .spawn(move || writer.write_all(&bytes).or_else(ignore_epipe))
                 .map_err(|e| io::Error::other(format!("spawn stdin feeder thread: {e}")))?;
             Ok(Some(handle))
         }
@@ -326,7 +228,6 @@ fn start_feeder(
                         Ok(f) => f,
                         Err(e) => return Err(e),
                     };
-                    // BrokenPipe = the child died without reading.
                     io::copy(&mut file, &mut writer)
                         .map(|_| ())
                         .or_else(ignore_epipe)
@@ -345,10 +246,6 @@ fn ignore_epipe(e: io::Error) -> io::Result<()> {
     }
 }
 
-/// Drain one output channel to EOF: archive up to the sink ceiling, keep at
-/// most `capture_ceiling` bytes as the sample, fire the overflow flag only
-/// past an explicit *user* limit (the internal ceilings are safety nets,
-/// not kill thresholds).
 fn drain_channel(
     ch: ChannelPipe,
     index: usize,
@@ -366,18 +263,12 @@ fn drain_channel(
     let mut total: u64 = 0;
     let mut sink_bytes: u64 = 0;
     let mut sink_truncated = false;
-    // 64 KiB: a 1 GiB archive costs ~16k reads instead of ~131k with the
-    // 8 KiB buffer; truncation slices by limit, so the buffer size never
-    // changes the captured byte count.
     let mut buf = [0u8; 64 * 1024];
     loop {
         let n = reader.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        // Archive up to the sink ceiling ("full archive" is the caller
-        // semantic; the ceiling is the safety net so an output fountain
-        // cannot fill the host disk before the run is reaped).
         if let Some(archive) = archive.as_mut() {
             if sink_bytes < sink_ceiling {
                 let room = ((sink_ceiling - sink_bytes) as usize).min(n);

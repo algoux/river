@@ -1,39 +1,11 @@
-//! Per-run uid/gid leases (the Linux analogue of the Windows profile slot
-//! pool).
-//!
-//! Every run used to drop to the fixed `nobody` (65534) identity. That left
-//! a documented confidentiality hole: the per-run workdir is 0700 and owned
-//! by the sandbox uid, so *any other process running as that same uid* —
-//! a concurrent run on the same judger, or an unrelated host service —
-//! could read **and overwrite** a live run's inputs and products (verified
-//! live: `setpriv --reuid=65534 cat <workdir>/secret.txt` succeeded).
-//!
-//! Each run now leases an exclusive uid (and matching gid) from a fixed
-//! high range. The lease is an `flock` on a per-uid lock file under
-//! `<tmp>/river-uidpool/`: the kernel releases it when the leasing process
-//! dies, so a hard-killed judger leaks nothing (the next acquirer gets the
-//! flock immediately — no sweep needed, unlike workdirs/cgroups).
-//!
-//! - Default range: `[100000, 100064)` — 64 concurrent runs, overridable
-//!   with `RIVER_UID_BASE` / `RIVER_UID_COUNT` (deployment knob for hosts
-//!   that already use the default range).
-//! - The first lease verifies the range does not intersect `/etc/passwd` — a
-//!   collision would silently give the program an existing host identity,
-//!   so it is a lease-blocking error.
-//! - Exhaustion blocks (20 ms poll), mirroring the Windows slot pool: a
-//!   judge prefers waiting over sharing an identity.
-
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Default first uid of the lease range (well above system accounts).
 const DEFAULT_BASE: u32 = 100_000;
-/// Default pool size (concurrent Linux runs before acquire blocks).
 const DEFAULT_COUNT: u32 = 64;
-/// Poll interval while every uid in the pool is leased.
 const ACQUIRE_POLL: Duration = Duration::from_millis(20);
 
 struct Range {
@@ -63,7 +35,6 @@ fn range() -> Result<&'static Range, String> {
                 }
                 Err(_) => DEFAULT_COUNT,
             };
-            // uid_t is i32 on Linux; keep the whole range representable.
             if u64::from(base) + u64::from(count) > libc::uid_t::MAX as u64 {
                 return Err("RIVER_UID_BASE + RIVER_UID_COUNT overflows uid_t".to_string());
             }
@@ -73,17 +44,12 @@ fn range() -> Result<&'static Range, String> {
         .map_err(|e| e.clone())
 }
 
-/// The per-uid lock directory (`<tmp>/river-uidpool`), created on demand.
 fn pool_dir() -> io::Result<PathBuf> {
     let dir = std::env::temp_dir().join("river-uidpool");
     std::fs::create_dir_all(&dir)?;
     Ok(dir)
 }
 
-/// Fail-closed check: no account in `/etc/passwd` may use a uid from the
-/// lease range (a collision would hand the program an existing host
-/// identity — file ownership, cron deliveries, `nobody`-style shared
-/// access). Returns the offending uid on collision.
 fn colliding_system_uid(range: &Range) -> Option<u32> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     for line in passwd.lines() {
@@ -97,18 +63,14 @@ fn colliding_system_uid(range: &Range) -> Option<u32> {
     None
 }
 
-/// An exclusive uid/gid lease. Released when dropped (the `flock` dies with
-/// the file descriptor; a hard-killed judger releases it kernel-side).
 pub(crate) struct UidGuard {
     pub(crate) uid: libc::uid_t,
     pub(crate) gid: libc::gid_t,
     _lock: File,
 }
 
-/// Lease a free uid from the pool, blocking while all are taken.
 pub(crate) fn acquire() -> io::Result<UidGuard> {
     let range = range().map_err(io::Error::other)?;
-    // First use double-checks the /etc/passwd collision (cheap: one read).
     if let Some(uid) = colliding_system_uid(range) {
         return Err(io::Error::other(format!(
             "per-run uid range [{}, {}) collides with /etc/passwd uid {uid}",
@@ -136,7 +98,6 @@ pub(crate) fn acquire() -> io::Result<UidGuard> {
             if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
                 return Err(err);
             }
-            // leased by another run: try the next uid
         }
         std::thread::sleep(ACQUIRE_POLL);
     }

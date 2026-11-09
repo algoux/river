@@ -1,62 +1,13 @@
-//! seccomp-bpf allowlist (stage L8).
-//!
-//! The sandboxed program runs under a **default-deny** filter whose mismatch
-//! action is `EPERM` (not `KILL`): ordinary programs keep running, denied
-//! operations fail with a normal errno. The allowlist is compiled once per
-//! judger process ([`filters`]) and applied by the child just before
-//! `execve`; the compiled BPF programs are passed across the fork, so the
-//! child itself never allocates.
-//!
-//! **`clone3` prefilter**: seccomp cannot dereference the `struct clone_args`
-//! pointer `clone3` receives, so its `CLONE_NEW*` flags cannot be masked the
-//! way `clone`'s are — and an unconditional allow lets
-//! `clone3(CLONE_NEWUSER)` create a user namespace whose creator regains
-//! `CAP_SYS_ADMIN` over it (verified live: `CapEff` all-ones inside the ns,
-//! and the host's AppArmor userns restriction did not stop it). A tiny
-//! second filter is therefore stacked **on top of** the allowlist that makes
-//! `clone3` fail with `ENOSYS` unconditionally: glibc's `pthread_create`
-//! falls back to `clone` on `ENOSYS` (but not on `EPERM`), so ordinary
-//! threads keep working while the namespace-creation route closes. Programs
-//! calling `clone3` directly (rare; container runtimes) get `ENOSYS`.
-//!
-//! What the allowlist closes on top of namespaces (the
-//! "not isolated by namespaces" set):
-//!
-//! - `keyctl`/`add_key`/`request_key` — uid-scoped keyring persistence
-//! - `AF_VSOCK` / any socket creation (`socket` denied; `socketpair` stays
-//!   for local IPC)
-//! - `io_uring_*` — bypasses socket address-family checks
-//! - `flock` — shared-inode lock side channel on the read-only runtime trees
-//! - `ptrace`, `process_vm_*`, `pidfd_*`, `kcmp`
-//! - `mount*`, `pivot_root`, `chroot`, `unshare`, `setns`, `fsopen`,
-//!   `open_tree`, `move_mount`, `mount_setattr` (defense in depth: no
-//!   user-namespace creation either)
-//! - `bpf`, `perf_event_open`, `userfaultfd`, `mknod*`, module loading,
-//!   `reboot`, `kexec*`, `swapon/off`, `clock_settime`, `sethostname`
-//!
-//! Everything else — the syscalls CPython, the dynamic loader, shells and
-//! ordinary compiled programs need — is allowed unconditionally.
-
 use std::collections::BTreeMap;
 
-/// Compiled filter for the current process's architecture.
 pub(crate) type Program = seccompiler::BpfProgram;
 
-/// The stacked filter set applied to every sandboxed program: the big
-/// default-deny allowlist plus the `clone3`→`ENOSYS` prefilter and the
-/// terminal-injection `ioctl` prefilter.
 pub(crate) struct Filters {
-    /// Default-deny allowlist (`EPERM` on mismatch).
     pub(crate) allowlist: Program,
-    /// Forces `clone3` to `ENOSYS` (see the module docs).
     pub(crate) clone3_prefilter: Program,
-    /// Denies the terminal-injection `ioctl` requests (`TIOCSTI`,
-    /// `TIOCLINUX`) that the allowlist would otherwise pass.
     pub(crate) ioctl_prefilter: Program,
 }
 
-/// Compile the filter set once per process (the filters are immutable and
-/// apply to the whole process tree, so one set is reused by every run).
 pub(crate) fn filters() -> Result<&'static Filters, String> {
     static FILTERS: std::sync::OnceLock<Result<Filters, String>> = std::sync::OnceLock::new();
     FILTERS.get_or_init(build).as_ref().map_err(|e| e.clone())
@@ -69,8 +20,6 @@ fn build() -> Result<Filters, String> {
         SeccompRule, TargetArch,
     };
 
-    // SeccompRule requires at least one condition; a zero mask compares
-    // `arg0 & 0 == 0`, i.e. "always true" — the unconditional allow rule.
     let always = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::MaskedEq(0), 0)
         .map_err(|e| format!("seccomp condition: {e:?}"))?;
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
@@ -80,18 +29,6 @@ fn build() -> Result<Filters, String> {
         rules.entry(*syscall).or_default().push(rule);
     }
 
-    // `clone` is allowed only when **no** namespace-creation flag is set
-    // (x86_64 passes the flags in arg0). Otherwise a program could do
-    // `clone(CLONE_NEWUSER)` and get CAP_SYS_ADMIN inside a fresh user
-    // namespace, re-opening kernel surface the allowlist deliberately
-    // closed (`unshare` is denied outright, but clone was allowed
-    // unconditionally — verified: the child landed in a distinct userns).
-    //
-    // `clone3` cannot be masked this way (seccomp cannot dereference the
-    // `struct clone_args` pointer), so it is forced to `ENOSYS` by the
-    // stacked prefilter instead — see the module docs. glibc >= 2.34 uses
-    // clone3 for pthread_create but falls back to `clone` on ENOSYS, so
-    // threads keep working.
     let namespace_flags = (libc::CLONE_NEWNS
         | libc::CLONE_NEWUSER
         | libc::CLONE_NEWPID
@@ -121,10 +58,6 @@ fn build() -> Result<Filters, String> {
         .try_into()
         .map_err(|e| format!("seccomp compile: {e:?}"))?;
 
-    // The clone3 prefilter: `clone3` → ENOSYS, everything else allowed.
-    // Stacked filters execute most-recent-first and a syscall only proceeds
-    // when *every* filter allows it, so installing this after the allowlist
-    // makes clone3 fail with ENOSYS no matter what the allowlist says.
     let mut deny_clone3: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     deny_clone3.insert(
         libc::SYS_clone3,
@@ -132,9 +65,7 @@ fn build() -> Result<Filters, String> {
     );
     let pre = SeccompFilter::new(
         deny_clone3,
-        // not in the map → allow (the allowlist still gets its say)
         SeccompAction::Allow,
-        // matched (clone3) → ENOSYS: glibc pthread_create falls back to clone
         SeccompAction::Errno(libc::ENOSYS as u32),
         TargetArch::x86_64,
     )
@@ -143,21 +74,6 @@ fn build() -> Result<Filters, String> {
         .try_into()
         .map_err(|e| format!("seccomp prefilter compile: {e:?}"))?;
 
-    // The ioctl prefilter: `ioctl` is allowed (CPython's script mode, and
-    // many runtimes, need it — without it `python3 <script>` fails with
-    // EPERM), but the two *terminal-injection* requests are denied:
-    //
-    // - `TIOCSTI` pushes bytes into the terminal input queue of another
-    //   process (the classic tty-injection primitive);
-    // - `TIOCLINUX` can reprogram the console / selection buffer.
-    //
-    // The sandbox has no controlling terminal (`setsid` in the supervisor),
-    // so neither is reachable today; denying them keeps the guarantee
-    // independent of that. This mirrors Docker's default seccomp profile,
-    // which also allows ioctl with a small denylist rather than blocking the
-    // whole syscall.
-    //
-    // The request code is `ioctl`'s **arg1** (arg0 is the fd).
     let mut deny_tty_inject: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
     let mut tty_rules = Vec::new();
     for request in [libc::TIOCSTI, libc::TIOCLINUX] {
@@ -169,9 +85,7 @@ fn build() -> Result<Filters, String> {
     deny_tty_inject.insert(libc::SYS_ioctl, tty_rules);
     let ioctl_pre = SeccompFilter::new(
         deny_tty_inject,
-        // not matched (every other ioctl request) → allow
         SeccompAction::Allow,
-        // matched (TIOCSTI / TIOCLINUX) → EPERM
         SeccompAction::Errno(libc::EPERM as u32),
         TargetArch::x86_64,
     )
@@ -189,18 +103,9 @@ fn build() -> Result<Filters, String> {
 
 #[cfg(not(target_arch = "x86_64"))]
 fn build() -> Result<Filters, String> {
-    // Fail closed: an unimplemented allowlist must not silently mean "no
-    // seccomp". The backend rejects construction instead.
     Err("river: the seccomp allowlist is implemented for x86_64 only".to_string())
 }
 
-/// Apply the compiled filter set to the calling process (and its future
-/// children). The prefilters are installed *after* the allowlist so they run
-/// first (filters execute most-recent-first; a syscall only proceeds when
-/// every filter allows it).
-///
-/// Returns 0 on success, -1 on failure (errno set) — called between fork and
-/// exec, so no allocation, no formatting.
 pub(crate) fn apply(filters: &Filters) -> libc::c_int {
     match seccompiler::apply_filter(&filters.allowlist)
         .and_then(|_| seccompiler::apply_filter(&filters.clone3_prefilter))
@@ -211,29 +116,11 @@ pub(crate) fn apply(filters: &Filters) -> libc::c_int {
     }
 }
 
-/// Syscalls the sandboxed program may call. Deliberately absent: everything
-/// in the "closes" list of the module docs, plus socket/AF_VSOCK and the
-/// network syscalls (network denial is unconditional: no interfaces in the
-/// network namespace, and no way to create a socket).
 #[cfg(target_arch = "x86_64")]
 const ALLOW: &[libc::c_long] = &[
-    // --- process / signals ------------------------------------------------
-    // NOTE: neither `clone` nor `clone3` is in this list: `clone` is added
-    // with an argument condition in `build()` (no CLONE_NEW* flags), and
-    // `clone3` is forced to ENOSYS by the stacked prefilter (see the module
-    // docs for the glibc fallback rationale).
     libc::SYS_fork,
     libc::SYS_vfork,
     libc::SYS_execve,
-    // `execveat` is NOT here on purpose. It executes an image named by an
-    // `fd` (+`AT_EMPTY_PATH`), which combined with `memfd_create` gives a
-    // complete "run an arbitrary in-memory ELF" primitive (verified live:
-    // a memfd holding a real ELF was exec'd and ran). That is not a sandbox
-    // escape — the new image keeps the same namespaces, uid, seccomp filter
-    // and `no_new_privs` — but the program can already run code it wrote to
-    // its own cwd, so the fd-based route adds no capability the judge needs.
-    // `fexecve` is `execveat` under the hood on modern glibc, so this also
-    // closes the `fexecve` path.
     libc::SYS_exit,
     libc::SYS_exit_group,
     libc::SYS_wait4,
@@ -263,7 +150,6 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_get_robust_list,
     libc::SYS_restart_syscall,
     libc::SYS_seccomp,
-    // --- identity ---------------------------------------------------------
     libc::SYS_getuid,
     libc::SYS_geteuid,
     libc::SYS_getgid,
@@ -285,7 +171,6 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_prctl,
     libc::SYS_arch_prctl,
     libc::SYS_getcpu,
-    // --- memory -----------------------------------------------------------
     libc::SYS_brk,
     libc::SYS_mmap,
     libc::SYS_munmap,
@@ -304,7 +189,6 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_pkey_mprotect,
     libc::SYS_pkey_alloc,
     libc::SYS_pkey_free,
-    // --- files / directories ---------------------------------------------
     libc::SYS_read,
     libc::SYS_write,
     libc::SYS_readv,
@@ -371,16 +255,6 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_tee,
     libc::SYS_vmsplice,
     libc::SYS_fcntl,
-    // `ioctl` is needed: CPython's **script mode** (`python3 <file>`) issues
-    // it during startup, so without it every `python3 main.py` run fails with
-    // EPERM ("can't open file ... Operation not permitted") — verified live.
-    // `-c` mode happens not to use it, which is why the original allowlist
-    // (built from `-c` probes) missed it.
-    //
-    // Allowing the syscall wholesale is a deliberate trade-off; the
-    // dangerous terminal-injection requests are denied by the stacked
-    // `ioctl_prefilter` (see `build()`), and the program has no controlling
-    // terminal, no capabilities and no device nodes to drive.
     libc::SYS_ioctl,
     libc::SYS_utimensat,
     libc::SYS_utimes,
@@ -400,7 +274,6 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_removexattr,
     libc::SYS_lremovexattr,
     libc::SYS_fremovexattr,
-    // --- io multiplexing / timers / eventfd / inotify ---------------------
     libc::SYS_poll,
     libc::SYS_ppoll,
     libc::SYS_select,
@@ -438,17 +311,14 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_times,
     libc::SYS_gettimeofday,
     libc::SYS_time,
-    // --- synchronisation --------------------------------------------------
     libc::SYS_futex,
     libc::SYS_futex_waitv,
-    // --- filesystem file descriptors & pipes ------------------------------
     libc::SYS_dup,
     libc::SYS_dup2,
     libc::SYS_dup3,
     libc::SYS_pipe,
     libc::SYS_pipe2,
     libc::SYS_memfd_create,
-    // --- system information ----------------------------------------------
     libc::SYS_uname,
     libc::SYS_sysinfo,
     libc::SYS_getrlimit,
@@ -465,10 +335,8 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_sched_rr_get_interval,
     libc::SYS_getpriority,
     libc::SYS_umask,
-    // --- random / crypto helpers -----------------------------------------
     libc::SYS_getrandom,
     libc::SYS_adjtimex,
-    // --- SysV IPC (the IPC namespace makes them private) ------------------
     libc::SYS_shmget,
     libc::SYS_shmat,
     libc::SYS_shmctl,
@@ -487,6 +355,5 @@ const ALLOW: &[libc::c_long] = &[
     libc::SYS_mq_timedreceive,
     libc::SYS_mq_notify,
     libc::SYS_mq_getsetattr,
-    // --- local sockets only (no AF_INET creation) -------------------------
     libc::SYS_socketpair,
 ];
