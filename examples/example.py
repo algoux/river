@@ -1,6 +1,6 @@
-import river
-
 from pathlib import Path
+
+import river
 
 PROJECT_ROOT = "./"
 
