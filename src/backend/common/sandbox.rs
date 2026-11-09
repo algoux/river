@@ -9,11 +9,18 @@ use tempfile::TempDir;
 use crate::contract::RunSpec;
 use crate::contract::status::Status;
 
-/// Prefix of the per-session scratch directory created under `%TEMP%`.
+use super::{Backend, platform_backend};
+
+/// Prefix of the per-session scratch directory created under the platform's
+/// temp directory.
 const WORKDIR_PREFIX: &str = "river-";
 
+/// The platform-independent sandbox: owns the session scratch directory and
+/// the whole Python surface, and delegates everything platform-specific to
+/// the compiled-in [`Backend`] implementation.
 #[pyclass(module = "river", frozen)]
 pub struct Sandbox {
+    backend: Box<dyn Backend>,
     pub rootfs: Option<PathBuf>,
     pub runtimes: Vec<PathBuf>,
     /// Scratch directory owned by this sandbox session: created on `__enter__`
@@ -27,15 +34,13 @@ impl Sandbox {
     #[pyo3(signature = (rootfs=None, runtimes=None))]
     #[pyo3(text_signature = "(rootfs=None, runtimes=None)")]
     fn new(rootfs: Option<PathBuf>, runtimes: Option<Vec<PathBuf>>) -> PyResult<Self> {
-        if rootfs.is_some() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "rootfs is not supported on Windows; use runtimes=[...] to expose \
-                 read-only runtime directories instead",
-            ));
-        }
+        let runtimes = runtimes.unwrap_or_default();
+        let backend = platform_backend();
+        backend.validate_new(rootfs.as_deref(), &runtimes)?;
         Ok(Self {
-            rootfs: None,
-            runtimes: runtimes.unwrap_or_default(),
+            backend,
+            rootfs,
+            runtimes,
             workdir: Mutex::new(None),
         })
     }
@@ -49,6 +54,8 @@ impl Sandbox {
                     "failed to create sandbox temp dir: {e}"
                 ))
             })?;
+        slf.backend
+            .on_enter(slf.rootfs.as_deref(), &slf.runtimes, dir.path())?;
         let mut guard = slf.workdir.lock().unwrap_or_else(|e| e.into_inner());
         // Replacing an existing session's directory drops the old `TempDir`,
         // which removes it from disk.
@@ -68,6 +75,8 @@ impl Sandbox {
             guard.take()
         };
         if let Some(dir) = dir {
+            self.backend
+                .on_exit(self.rootfs.as_deref(), &self.runtimes, dir.path())?;
             let path = dir.path().to_path_buf();
             dir.close().map_err(|e| {
                 pyo3::exceptions::PyOSError::new_err(format!(
@@ -141,7 +150,7 @@ impl Sandbox {
         stderr_file: Option<PathBuf>,
         _py: Python<'_>,
     ) -> PyResult<Status> {
-        let _spec = RunSpec {
+        let spec = RunSpec {
             executable,
             args,
             cwd,
@@ -158,17 +167,16 @@ impl Sandbox {
             stdout_file,
             stderr_file,
         };
-
-        println!("Sandbox.exec called with spec: {:#?}", _spec);
-
-        Ok(Status {
-            cpu_time_used_ms: cpu_time_limit_ms.unwrap_or(0),
-            wall_time_used_ms: wall_time_limit_ms.unwrap_or(0),
-            memory_used_bytes: memory_limit_bytes.unwrap_or(0),
-            status: "AC".to_string(),
-            signal: 0,
-            exit_code: 0,
-        })
+        let workdir = {
+            let guard = self.workdir.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|dir| dir.path().to_path_buf())
+        };
+        self.backend.exec(
+            self.rootfs.as_deref(),
+            &self.runtimes,
+            spec,
+            workdir.as_deref(),
+        )
     }
 
     fn __repr__(&self) -> String {

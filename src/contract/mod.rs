@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
+#[expect(dead_code)]
 pub(crate) struct RunSpec {
     pub executable: PathBuf,
     pub args: Vec<String>,
