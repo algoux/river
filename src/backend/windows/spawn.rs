@@ -21,7 +21,7 @@ use windows_sys::Win32::System::Threading::{
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
     PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess,
-    UpdateProcThreadAttribute, WaitForSingleObject,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
 };
 
 use super::job::Job;
@@ -86,19 +86,48 @@ impl SpawnedChild {
     fn process_handle(&self) -> HANDLE {
         self.process.as_raw_handle() as HANDLE
     }
+
+    /// Waits for the child or for the stdio overflow event, whichever comes
+    /// first.
+    pub(crate) fn wait_with_overflow(
+        &self,
+        overflow: HANDLE,
+        timeout_ms: Option<u32>,
+    ) -> io::Result<WaitResult> {
+        let handles = [self.process_handle(), overflow];
+        let timeout = timeout_ms.unwrap_or(INFINITE);
+        // SAFETY: both handles are valid for the call and `handles` has two
+        // entries as declared.
+        let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, timeout) };
+        match result {
+            WAIT_OBJECT_0 => Ok(WaitResult::Exited(self.exit_code()?)),
+            WAIT_OUTPUT_OVERFLOW => Ok(WaitResult::OutputOverflow),
+            WAIT_TIMEOUT => Ok(WaitResult::TimedOut),
+            WAIT_FAILED => Err(io::Error::last_os_error()),
+            other => Err(io::Error::other(format!(
+                "WaitForMultipleObjects returned unexpected value {other}"
+            ))),
+        }
+    }
 }
+
+/// How a wait on the child plus the output-overflow event ended.
+#[derive(Clone, Copy)]
+pub(crate) enum WaitResult {
+    Exited(u32),
+    TimedOut,
+    OutputOverflow,
+}
+
+/// `WAIT_OBJECT_0 + 1`: the output-overflow event's index in the wait set.
+const WAIT_OUTPUT_OVERFLOW: u32 = WAIT_OBJECT_0 + 1;
 
 /// Spawns `config.executable`, assigns it to the job and returns it while
 /// still suspended. On any failure the not-yet-handed-off child is
 /// terminated (closing its handles alone would leave a suspended process
 /// running outside the job).
-pub(crate) fn spawn(config: SpawnConfig<'_>, stdio: StdioSet) -> io::Result<SpawnedChild> {
-    let handles = stdio.into_handles();
-    let raw_handles = [
-        handles[0].as_raw_handle() as HANDLE,
-        handles[1].as_raw_handle() as HANDLE,
-        handles[2].as_raw_handle() as HANDLE,
-    ];
+pub(crate) fn spawn(config: SpawnConfig<'_>, stdio: &StdioSet) -> io::Result<SpawnedChild> {
+    let raw_handles = stdio.raw_handles();
 
     let mut command_line = build_command_line(config.executable, config.args);
     let cwd_wide = config.cwd.map(wide_of_path);
@@ -176,8 +205,8 @@ pub(crate) fn spawn(config: SpawnConfig<'_>, stdio: StdioSet) -> io::Result<Spaw
     config.job.assign(guard.child().process_handle())?;
     let child = guard.disarm();
 
-    // `handles` is dropped here, closing the judger-side copies of the
-    // child-facing std handles after inheritance has happened.
+    // The child-facing handles stay owned by `stdio`; `StdioSet::finish`
+    // closes the judger's copies once the run is over.
     Ok(child)
 }
 

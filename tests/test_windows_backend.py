@@ -216,19 +216,151 @@ def test_invalid_cwd_is_rejected(cwd: str):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"stdin_file": "input.txt"},
         {"copy_in": {"input.txt": "input.txt"}},
         {"copy_out": {"output.txt": "output.txt"}},
         {"copy_out_limit_bytes": 1},
-        {"stdout_limit_bytes": 1},
-        {"stderr_limit_bytes": 1},
-        {"stdout_file": "stdout.txt"},
-        {"stderr_file": "stderr.txt"},
     ],
 )
 def test_unsupported_options_are_rejected(kwargs: dict):
     with pytest.raises(NotImplementedError):
         river.Sandbox().exec(str(COMSPEC), ["/c", "echo", "x"], **kwargs)
+
+
+def test_stdin_file_is_fed(tmp_path: Path):
+    source = tmp_path / "input.bin"
+    source.write_bytes(b"file-input")
+    stdout = tmp_path / "stdout.bin"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stdout.write(sys.stdin.read())"],
+        stdin_file=str(source),
+        stdout_file=str(stdout),
+    )
+    assert status.status == "AC"
+    assert stdout.read_bytes() == b"file-input"
+
+
+def test_stdin_file_is_fed_inside_an_appcontainer_session(tmp_path: Path):
+    directory, _ = runtime_dir(tmp_path)
+    source = tmp_path / "input.txt"
+    source.write_bytes(b"hello\r\n")
+    stdout = tmp_path / "out.txt"
+    with river.Sandbox(runtimes=[str(directory)]) as box:
+        (Path(box.workdir) / "sub").mkdir()
+        status = box.exec(
+            str(COMSPEC),
+            ["/c", "findstr", "hello"],
+            cwd="sub",
+            stdin_file=str(source),
+            stdout_file=str(stdout),
+        )
+    assert status.status == "AC"
+    assert stdout.read_bytes() == b"hello\r\n"
+
+
+def test_stdout_and_stderr_files_capture_separately(tmp_path: Path):
+    stdout = tmp_path / "stdout.bin"
+    stderr = tmp_path / "stderr.bin"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stdout.write('out'); sys.stderr.write('err')"],
+        stdout_file=str(stdout),
+        stderr_file=str(stderr),
+    )
+    assert status.status == "AC"
+    assert stdout.read_bytes() == b"out"
+    assert stderr.read_bytes() == b"err"
+
+
+def test_stdout_file_is_created_when_output_is_empty(tmp_path: Path):
+    stdout = tmp_path / "empty.bin"
+    status = river.Sandbox().exec(
+        sys.executable, ["-c", "pass"], stdout_file=str(stdout)
+    )
+    assert status.status == "AC"
+    assert stdout.read_bytes() == b""
+
+
+def test_stdout_file_works_inside_an_appcontainer_session(tmp_path: Path):
+    directory, _ = runtime_dir(tmp_path)
+    stdout = tmp_path / "appcontainer.bin"
+    stderr = tmp_path / "appcontainer.err"
+    with river.Sandbox(runtimes=[str(directory)]) as box:
+        status = box.exec(
+            str(COMSPEC),
+            ["/c", "echo", "captured"],
+            stdout_file=str(stdout),
+            stderr_file=str(stderr),
+        )
+    assert status.status == "AC"
+    assert stdout.read_bytes().strip() == b"captured"
+    assert stderr.read_bytes() == b""
+
+
+def test_stdout_limit_kills_with_ole_and_keeps_the_archive(tmp_path: Path):
+    stdout = tmp_path / "full.bin"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stdout.write('z' * 4096); sys.stdout.flush()"],
+        stdout_limit_bytes=1024,
+        stdout_file=str(stdout),
+    )
+    assert status.status == "OLE"
+    assert status.signal == 9
+    assert stdout.stat().st_size >= 1024
+
+
+def test_stdout_limit_without_a_file_is_ole():
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stdout.write('z' * 4096); sys.stdout.flush()"],
+        stdout_limit_bytes=1024,
+    )
+    assert status.status == "OLE"
+    assert status.signal == 9
+
+
+def test_stdout_limit_kills_a_flood_before_the_wall_limit(tmp_path: Path):
+    status = river.Sandbox().exec(
+        sys.executable,
+        [
+            "-c",
+            (
+                "import sys\n"
+                "while True:\n"
+                "    sys.stdout.write('x' * 65536)\n"
+                "    sys.stdout.flush()"
+            ),
+        ],
+        stdout_limit_bytes=64 * 1024,
+        wall_time_limit_ms=15_000,
+    )
+    assert status.status == "OLE"
+    assert status.signal == 9
+    assert status.wall_time_used_ms < 15_000
+
+
+def test_exactly_at_the_stdout_limit_is_ac():
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stdout.write('z' * 1024); sys.stdout.flush()"],
+        stdout_limit_bytes=1024,
+    )
+    assert status.status == "AC"
+    assert status.signal == 0
+
+
+def test_stderr_limit_is_independent(tmp_path: Path):
+    stdout = tmp_path / "stdout.bin"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import sys; sys.stderr.write('e' * 4096); sys.stderr.flush()"],
+        stderr_limit_bytes=1024,
+        stdout_file=str(stdout),
+    )
+    assert status.status == "OLE"
+    assert status.signal == 9
+    assert stdout.read_bytes() == b""
 
 
 def test_without_runtimes_is_a_plain_process(tmp_path: Path):

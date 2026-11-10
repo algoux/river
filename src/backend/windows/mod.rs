@@ -12,10 +12,12 @@
 //!   (user + kernel of the whole job);
 //! - peak memory limit / measurement (Job Object, whole-tree commit);
 //! - wall-clock limit / measurement;
-//! - read-only `runtimes` grants to the target AppContainer identity.
+//! - read-only `runtimes` grants to the target AppContainer identity;
+//! - `stdin_file` / `stdout_file` / `stderr_file` redirection and the
+//!   `stdout_limit_bytes` / `stderr_limit_bytes` kill thresholds (`OLE`).
 //!
-//! `stdin_file`, stdio capture and `copy_in` / `copy_out` are rejected
-//! explicitly; the child inherits the caller's standard streams.
+//! `copy_in` / `copy_out` are rejected explicitly. Without any redirection
+//! the child inherits the caller's standard streams.
 
 mod acl;
 mod job;
@@ -41,7 +43,7 @@ use crate::contract::status::Status;
 
 use self::job::{Job, JobLimits, KILL_EXIT_CODE};
 use self::profile::AppContainer;
-use self::spawn::{SpawnConfig, env_block, spawn};
+use self::spawn::{SpawnConfig, WaitResult, env_block, spawn};
 use self::stdio::StdioSet;
 
 /// Environment variables kept for an AppContainer child. Everything else
@@ -207,7 +209,13 @@ fn run(
         memory_limit_bytes: spec.memory_limit_bytes,
     })?;
 
-    let stdio = StdioSet::new()?;
+    let stdio = StdioSet::new(
+        spec.stdin_file.as_deref(),
+        spec.stdout_file.as_deref(),
+        spec.stderr_file.as_deref(),
+        spec.stdout_limit_bytes,
+        spec.stderr_limit_bytes,
+    )?;
 
     let child = spawn(
         SpawnConfig {
@@ -218,7 +226,7 @@ fn run(
             appcontainer_sid,
             job: &job,
         },
-        stdio,
+        &stdio,
     )
     .map_err(|error| {
         io::Error::new(
@@ -233,12 +241,13 @@ fn run(
     let wait_timeout = spec
         .wall_time_limit_ms
         .map(|limit| limit.min(u32::MAX as u64 - 1) as u32);
-    let first_wait = child.wait(wait_timeout)?;
+    let first_wait = child.wait_with_overflow(stdio.overflow_handle(), wait_timeout)?;
 
-    let timed_out = first_wait.is_none();
+    let mut output_limit_hit = matches!(first_wait, WaitResult::OutputOverflow);
+    let timed_out = matches!(first_wait, WaitResult::TimedOut);
     let exit_code = match first_wait {
-        Some(code) => code,
-        None => {
+        WaitResult::Exited(code) => code,
+        WaitResult::TimedOut | WaitResult::OutputOverflow => {
             job.terminate(KILL_EXIT_CODE)?;
             child
                 .wait(None)?
@@ -252,6 +261,17 @@ fn run(
     // is closed at the end of this scope, which would kill them anyway).
     let _ = job.terminate(KILL_EXIT_CODE);
 
+    // Drains the output pipes after the tree is gone. A fast writer can pass
+    // the limit between the last wait and this join, so the totals get the
+    // last word on the OLE verdict.
+    let (stdout_total, stderr_total) = stdio.finish()?;
+    output_limit_hit |= spec
+        .stdout_limit_bytes
+        .is_some_and(|limit| stdout_total > limit)
+        || spec
+            .stderr_limit_bytes
+            .is_some_and(|limit| stderr_total > limit);
+
     let cpu_time_used_ms = job.cpu_time_ms()?;
     let memory_used_bytes = job.peak_job_memory_used()?;
 
@@ -262,6 +282,7 @@ fn run(
         cpu_time_used_ms,
         spec.memory_limit_bytes,
         memory_used_bytes,
+        output_limit_hit,
     );
 
     Ok(Status {
@@ -284,7 +305,8 @@ const STATUS_QUOTA_EXCEEDED: u32 = 0xC000_0044;
 /// `ERROR_NOT_ENOUGH_QUOTA` / `STATUS_QUOTA_EXCEEDED`, the measured total CPU
 /// can also exceed the limit before the system's periodic check fires, and a
 /// memory cap makes allocations fail (so an abnormal end with the peak at the
-/// cap is the memory-limit signature).
+/// cap is the memory-limit signature). Output overflow is a direct observation
+/// by the reader threads, so it outranks the inferred kill causes.
 fn classify(
     exit_code: u32,
     timed_out: bool,
@@ -292,6 +314,7 @@ fn classify(
     cpu_used_ms: u64,
     memory_limit_bytes: Option<u64>,
     peak_memory_bytes: u64,
+    output_limit_hit: bool,
 ) -> (&'static str, i32) {
     let abnormal = timed_out || exit_code != 0;
     let cpu_over = cpu_limit_ms.is_some_and(|limit| cpu_used_ms > limit);
@@ -300,7 +323,9 @@ fn classify(
     let memory_hit = memory_limit_bytes
         .is_some_and(|limit| peak_memory_bytes.saturating_add(memory_slack(limit)) >= limit);
 
-    if abnormal && memory_hit {
+    if output_limit_hit {
+        ("OLE", 9)
+    } else if abnormal && memory_hit {
         ("MLE", 9)
     } else if timed_out || cpu_over || cpu_killed {
         ("TLE", 9)
@@ -321,9 +346,6 @@ fn memory_slack(limit_bytes: u64) -> u64 {
 
 fn reject_unsupported(spec: &RunSpec) -> PyResult<()> {
     let mut unsupported = Vec::new();
-    if spec.stdin_file.is_some() {
-        unsupported.push("stdin_file");
-    }
     if spec.copy_in.is_some() {
         unsupported.push("copy_in");
     }
@@ -332,18 +354,6 @@ fn reject_unsupported(spec: &RunSpec) -> PyResult<()> {
     }
     if spec.copy_out_limit_bytes.is_some() {
         unsupported.push("copy_out_limit_bytes");
-    }
-    if spec.stdout_limit_bytes.is_some() {
-        unsupported.push("stdout_limit_bytes");
-    }
-    if spec.stderr_limit_bytes.is_some() {
-        unsupported.push("stderr_limit_bytes");
-    }
-    if spec.stdout_file.is_some() {
-        unsupported.push("stdout_file");
-    }
-    if spec.stderr_file.is_some() {
-        unsupported.push("stderr_file");
     }
 
     if unsupported.is_empty() {
