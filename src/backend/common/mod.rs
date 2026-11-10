@@ -88,5 +88,5 @@ pub(crate) fn platform_backend() -> Box<dyn Backend> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn platform_backend() -> Box<dyn Backend> {
-    Box::new(super::windows::Windows)
+    Box::new(super::windows::Windows::new())
 }

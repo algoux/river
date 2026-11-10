@@ -4,7 +4,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug)]
-#[expect(dead_code)]
+// The Windows backend reads every field; the placeholder backends only read
+// the three limits, so suppress the unused-field lint there.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub(crate) struct RunSpec {
     pub executable: PathBuf,
     pub args: Vec<String>,
