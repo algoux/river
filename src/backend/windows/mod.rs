@@ -13,26 +13,31 @@
 //! - peak memory limit / measurement (Job Object, whole-tree commit);
 //! - wall-clock limit / measurement;
 //! - read-only `runtimes` grants to the target AppContainer identity;
+//! - `copy_in` provisioning into the session workdir (host files and
+//!   directories; read-only for the AppContainer identity);
+//! - `copy_out` recovery from the session workdir after a successful run
+//!   (host files and directories; links skipped; a total-byte cap that
+//!   reports `OLE` when breached);
 //! - `stdin_file` / `stdout_file` / `stderr_file` redirection and the
 //!   `stdout_limit_bytes` / `stderr_limit_bytes` kill thresholds (`OLE`).
 //!
-//! `copy_in` / `copy_out` are rejected explicitly. Without any redirection
-//! the child inherits the caller's standard streams.
+//! Without any redirection the child inherits the caller's standard streams.
 
 mod acl;
+mod copy;
 mod job;
 mod profile;
 mod spawn;
 mod stdio;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-use pyo3::exceptions::{PyNotImplementedError, PyOSError, PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_QUOTA;
 use windows_sys::Win32::Security::PSID;
@@ -161,14 +166,28 @@ impl Backend for Windows {
         &self,
         _rootfs: Option<&Path>,
         runtimes: &[PathBuf],
-        spec: RunSpec,
+        mut spec: RunSpec,
         workdir: Option<&Path>,
     ) -> PyResult<Status> {
-        reject_unsupported(&spec)?;
+        validate_copy_in(spec.copy_in.as_ref())?;
+        validate_copy_out(spec.copy_out.as_ref())?;
+        let copy_out = spec.copy_out.take().filter(|entries| !entries.is_empty());
+        let copy_out_limit_bytes = spec.copy_out_limit_bytes;
+        let copy_in = spec.copy_in.as_ref().filter(|entries| !entries.is_empty());
+        if copy_in.is_some() && workdir.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "copy_in requires an active sandbox session; run exec inside \
+                 `with Sandbox(...)`",
+            ));
+        }
+        if copy_out.is_some() && workdir.is_none() {
+            return Err(PyRuntimeError::new_err(
+                "copy_out requires an active sandbox session; run exec inside \
+                 `with Sandbox(...)`",
+            ));
+        }
 
-        let cwd = resolve_cwd(spec.cwd.as_deref(), workdir)?;
         let sandboxed = !runtimes.is_empty();
-        let environment = build_environment(spec.envs.as_ref(), workdir, sandboxed)?;
 
         // The profile belongs to the session, so a run with runtimes must
         // happen inside `with Sandbox(runtimes=[...])`. The guard keeps the
@@ -190,9 +209,34 @@ impl Backend for Windows {
             .and_then(|guard| guard.as_ref())
             .map(AppContainer::sid);
 
-        let result = run(spec, cwd.as_deref(), &environment, appcontainer_sid);
+        // Provision before resolving `cwd`: a `cwd` may point into the tree
+        // that `copy_in` just created.
+        if let (Some(workdir), Some(copy_in)) = (workdir, copy_in) {
+            copy::provision(workdir, copy_in, appcontainer_sid)
+                .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
+        }
+
+        let environment = build_environment(spec.envs.as_ref(), workdir, sandboxed)?;
+        let cwd = resolve_cwd(spec.cwd.as_deref(), workdir)?;
+
+        let mut status = run(spec, cwd.as_deref(), &environment, appcontainer_sid)
+            .map_err(|error| os_error("sandbox run failed", error))?;
+
+        // Products are recovered only from a successful run. A collection
+        // quota breach is a direct observation, so it outranks the AC verdict.
+        if status.status == "AC"
+            && let (Some(workdir), Some(copy_out)) = (workdir, copy_out)
+        {
+            let exceeded = copy::collect(workdir, &copy_out, copy_out_limit_bytes)
+                .map_err(|error| PyOSError::new_err(format!("copy_out failed: {error}")))?;
+            if exceeded {
+                status.status = "OLE".to_string();
+                status.signal = 9;
+            }
+        }
+
         drop(container_guard);
-        result.map_err(|error| os_error("sandbox run failed", error))
+        Ok(status)
     }
 }
 
@@ -344,35 +388,59 @@ fn memory_slack(limit_bytes: u64) -> u64 {
     (limit_bytes / 8).max(1024 * 1024)
 }
 
-fn reject_unsupported(spec: &RunSpec) -> PyResult<()> {
-    let mut unsupported = Vec::new();
-    if spec.copy_in.is_some() {
-        unsupported.push("copy_in");
+/// Validates the `copy_out` sources: relative to the workdir. Destinations
+/// are host paths and are not restricted.
+fn validate_copy_out(entries: Option<&HashMap<PathBuf, PathBuf>>) -> PyResult<()> {
+    let Some(entries) = entries else {
+        return Ok(());
+    };
+    for source in entries.keys() {
+        validate_relative_path("copy_out", source)?;
     }
-    if spec.copy_out.is_some() {
-        unsupported.push("copy_out");
-    }
-    if spec.copy_out_limit_bytes.is_some() {
-        unsupported.push("copy_out_limit_bytes");
-    }
-
-    if unsupported.is_empty() {
-        Ok(())
-    } else {
-        Err(PyNotImplementedError::new_err(format!(
-            "the Windows backend does not implement these exec options yet: {}",
-            unsupported.join(", ")
-        )))
-    }
+    Ok(())
 }
 
-/// `cwd` is relative to the session scratch directory (or to the caller's
-/// current directory when the sandbox runs outside a `with` block).
+/// Validates the `copy_in` destinations: relative to the workdir, unique, and
+/// not nested inside one another.
+fn validate_copy_in(entries: Option<&HashMap<PathBuf, PathBuf>>) -> PyResult<()> {
+    let Some(entries) = entries else {
+        return Ok(());
+    };
+    let mut destinations: HashSet<&Path> = HashSet::with_capacity(entries.len());
+    for destination in entries.values() {
+        validate_relative_path("copy_in", destination)?;
+        if !destinations.insert(destination.as_path()) {
+            return Err(PyValueError::new_err(format!(
+                "copy_in maps more than one source to the same destination: {}",
+                destination.display()
+            )));
+        }
+    }
+    for &destination in &destinations {
+        for ancestor in destination.ancestors().skip(1) {
+            if ancestor.as_os_str().is_empty() {
+                break;
+            }
+            if destinations.contains(ancestor) {
+                return Err(PyValueError::new_err(format!(
+                    "copy_in destinations overlap: {} is inside {}",
+                    destination.display(),
+                    ancestor.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `cwd` is relative to the session scratch directory; inside a session the
+/// default is that directory itself. Outside a `with` block there is no
+/// scratch directory and the child keeps the caller's current directory.
 fn resolve_cwd(cwd: Option<&str>, workdir: Option<&Path>) -> PyResult<Option<PathBuf>> {
     let Some(cwd) = cwd else {
-        return Ok(None);
+        return Ok(workdir.map(Path::to_path_buf));
     };
-    validate_relative_key("cwd", cwd)?;
+    validate_relative_path("cwd", Path::new(cwd))?;
 
     let base = match workdir {
         Some(workdir) => workdir.to_path_buf(),
@@ -391,18 +459,18 @@ fn resolve_cwd(cwd: Option<&str>, workdir: Option<&Path>) -> PyResult<Option<Pat
 }
 
 /// Accepts only plain relative components (no root, drive prefix, `.` or
-/// `..`), so `cwd` cannot escape the sandbox workdir.
-fn validate_relative_key(kind: &str, key: &str) -> PyResult<()> {
-    let path = Path::new(key);
-    if key.is_empty()
+/// `..`), so `cwd` and `copy_in` destinations cannot escape the workdir.
+fn validate_relative_path(kind: &str, path: &Path) -> PyResult<()> {
+    if path.as_os_str().is_empty()
         || path.has_root()
-        || key.contains(':')
+        || path.to_string_lossy().contains(':')
         || !path
             .components()
             .all(|component| matches!(component, Component::Normal(_)))
     {
         return Err(PyValueError::new_err(format!(
-            "invalid {kind} {key:?}: must be a relative path inside the sandbox workdir"
+            "invalid {kind} {}: must be a relative path inside the sandbox workdir",
+            path.display()
         )));
     }
     Ok(())
