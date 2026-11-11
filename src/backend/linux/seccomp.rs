@@ -49,7 +49,7 @@ pub(super) fn build_filter() -> Result<BpfProgram, i32> {
         DENIED.iter().map(|&nr| (nr, Vec::new())).collect();
     let filter = SeccompFilter::new(
         rules,
-        SeccompAction::Allow,          // not in the list: allowed
+        SeccompAction::Allow,                     // not in the list: allowed
         SeccompAction::Errno(libc::EPERM as u32), // in the list: EPERM
         std::env::consts::ARCH
             .try_into()

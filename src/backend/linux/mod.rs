@@ -194,8 +194,16 @@ impl Backend for Linux {
                 }
             };
 
-            run(&spec, workdir, runtimes, rootfs.as_ref(), &environment, &cwd, &mut session)
-                .map_err(|error| os_error("sandbox run failed", error))
+            run(
+                &spec,
+                workdir,
+                runtimes,
+                rootfs.as_ref(),
+                &environment,
+                &cwd,
+                &mut session,
+            )
+            .map_err(|error| os_error("sandbox run failed", error))
         })();
 
         // Always put the session back so later runs (and `on_exit`) see it.
@@ -232,7 +240,15 @@ fn run(
     session: &mut Session,
 ) -> io::Result<Status> {
     let run_group = session.run_group(spec.cpu_time_limit_ms, spec.memory_limit_bytes)?;
-    let raw = match supervise(spec, workdir, runtimes, rootfs, environment, cwd, &run_group) {
+    let raw = match supervise(
+        spec,
+        workdir,
+        runtimes,
+        rootfs,
+        environment,
+        cwd,
+        &run_group,
+    ) {
         Ok(raw) => raw,
         Err(error) => {
             // The group may still hold processes; kill and drop it before
@@ -316,12 +332,19 @@ fn supervise(
             .iter()
             .map(|arg| CString::new(arg.as_str()))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte"))?,
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "argument contains a NUL byte")
+            })?,
         envp: environment
             .iter()
             .map(|(key, value)| CString::new(format!("{key}={value}")))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "environment contains a NUL byte"))?,
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "environment contains a NUL byte",
+                )
+            })?,
         cwd: CString::new(cwd)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd contains a NUL byte"))?,
         workdir: cstring(workdir)?,
@@ -453,8 +476,8 @@ fn classify(
 ) -> (&'static str, i32) {
     let abnormal = raw.timed_out || raw.signal != 0 || raw.exit_code != 0;
     let cpu_over = cpu_limit_ms.is_some_and(|limit| cpu_used_ms > limit);
-    let memory_hit = oom_kills > 0
-        || memory_limit_bytes.is_some_and(|limit| peak_memory_bytes >= limit);
+    let memory_hit =
+        oom_kills > 0 || memory_limit_bytes.is_some_and(|limit| peak_memory_bytes >= limit);
 
     if raw.output_limit_hit {
         ("OLE", 9)

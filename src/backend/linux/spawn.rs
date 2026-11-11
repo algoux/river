@@ -109,7 +109,8 @@ pub(crate) fn spawn(spec: ChildSpec) -> io::Result<Child> {
 
     // SAFETY: `clone_args` matches the kernel layout; without CLONE_VM the
     // child is a plain fork-style copy and both sides return through here.
-    let pid_raw = unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
+    let pid_raw =
+        unsafe { libc::syscall(libc::SYS_clone3, &args, std::mem::size_of::<CloneArgs>()) };
 
     if pid_raw == 0 {
         drop(status_r);
@@ -212,9 +213,7 @@ fn exec_payload(spec: &ChildSpec) -> i32 {
     envp.push(std::ptr::null());
 
     unsafe fn execve(path: &CStr, argv: &[*const c_char], envp: &[*const c_char]) -> i32 {
-        let ret = unsafe {
-            libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr())
-        };
+        let ret = unsafe { libc::execve(path.as_ptr(), argv.as_ptr(), envp.as_ptr()) };
         debug_assert!(ret != 0, "a successful execve never returns");
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
     }

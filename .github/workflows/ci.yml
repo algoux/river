@@ -1,8 +1,8 @@
 name: ci
 
 # Every push/PR must pass: formatting, clippy and the Python suite — on both
-# supported backends. The README's "run `cargo fmt` before every commit"
-# rule is enforced here instead of by hand.
+# supported backends. Formatting is checked here, so the source tree is
+# expected to be `cargo fmt`-clean before every commit.
 on:
   push:
     branches: [master, main]
@@ -33,7 +33,12 @@ jobs:
       - name: Set up environment
         run: uv sync --extra test
       - name: Build extension
-        run: uv run --no-project maturin develop --release
+        # maturin is a build requirement, not a project dependency, so
+        # `uv sync` leaves it out of the environment and the runner has no
+        # maturin on PATH: install it into the project environment first.
+        run: |
+          uv pip install maturin
+          uv run --no-project maturin develop --release
       - name: Python suite
         run: uv run --no-project python -m pytest -q
 
@@ -58,6 +63,11 @@ jobs:
       - name: Set up environment
         run: uv sync --extra test
       - name: Build extension
-        run: uv run --no-project maturin develop --release
+        # maturin is a build requirement, not a project dependency, so
+        # `uv sync` leaves it out of the environment and the runner has no
+        # maturin on PATH: install it into the project environment first.
+        run: |
+          uv pip install maturin
+          uv run --no-project maturin develop --release
       - name: "Python suite (root: namespaces + cgroups v2)"
         run: sudo -E "$PWD/.venv/bin/python" -m pytest -q

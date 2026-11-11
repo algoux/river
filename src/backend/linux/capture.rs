@@ -50,12 +50,9 @@ impl Capture {
 
         let mut streams = [None, None];
         let mut writers = [None, None];
-        for (index, (file, limit)) in [
-            (stdout_file, stdout_limit),
-            (stderr_file, stderr_limit),
-        ]
-        .into_iter()
-        .enumerate()
+        for (index, (file, limit)) in [(stdout_file, stdout_limit), (stderr_file, stderr_limit)]
+            .into_iter()
+            .enumerate()
         {
             if let Some(limit) = limit {
                 let (reader, writer) = pipe_nonblocking()?;
@@ -82,14 +79,16 @@ impl Capture {
         }
 
         let capture = Self {
-            streams: streams.map(|stream| stream.unwrap_or(Stream {
-                reader: None,
-                file: None,
-                limit: None,
-                total: 0,
-                exceeded: false,
-                eof: true,
-            })),
+            streams: streams.map(|stream| {
+                stream.unwrap_or(Stream {
+                    reader: None,
+                    file: None,
+                    limit: None,
+                    total: 0,
+                    exceeded: false,
+                    eof: true,
+                })
+            }),
         };
         Ok((capture, [stdin, writers[0].take(), writers[1].take()]))
     }
@@ -205,12 +204,7 @@ fn pipe_nonblocking() -> io::Result<(OwnedFd, OwnedFd)> {
         return Err(error);
     }
     // SAFETY: fresh fds from pipe2, owned from here on.
-    unsafe {
-        Ok((
-            OwnedFd::from_raw_fd(fds[0]),
-            OwnedFd::from_raw_fd(fds[1]),
-        ))
-    }
+    unsafe { Ok((OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))) }
 }
 
 fn into_fd(file: File) -> OwnedFd {

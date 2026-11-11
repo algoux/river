@@ -29,7 +29,10 @@ use super::spawn::RootFs;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 
-use libc::{MNT_DETACH as MS_DETACH, MS_BIND, MS_NODEV, MS_NOSUID, MS_PRIVATE, MS_REC, MS_REMOUNT, MS_RDONLY};
+use libc::{
+    MNT_DETACH as MS_DETACH, MS_BIND, MS_NODEV, MS_NOSUID, MS_PRIVATE, MS_RDONLY, MS_REC,
+    MS_REMOUNT,
+};
 
 /// Host directories merged read-only into the new root, in mount order.
 const SYSTEM_DIRS: &[&str] = &["/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc"];
@@ -100,7 +103,10 @@ pub(super) fn setup_and_pivot(
     }
 
     // Stop mount events propagating to the host namespace before any mount.
-    phased!(10, mount(Some(c"none"), c"/", None, MS_REC | MS_PRIVATE, None));
+    phased!(
+        10,
+        mount(Some(c"none"), c"/", None, MS_REC | MS_PRIVATE, None)
+    );
 
     let root = join_bytes(workdir.to_bytes(), b"/root")?;
     phased!(11, mkdir_ok(&root));

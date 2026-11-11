@@ -55,16 +55,23 @@ pub(crate) fn attach(image: &Path) -> io::Result<(CString, LoopGuard)> {
         let bound =
             unsafe { libc::ioctl(device.as_raw_fd(), LOOP_SET_FD, image.as_fd().as_raw_fd()) };
         if bound == 0 {
-            let path = CString::new(path)
-                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
-            return Ok((path, LoopGuard { device: device.into() }));
+            let path =
+                CString::new(path).map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+            return Ok((
+                path,
+                LoopGuard {
+                    device: device.into(),
+                },
+            ));
         }
         let error = io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EBUSY) {
             return Err(error);
         }
     }
-    Err(io::Error::other("no free loop device for the squashfs image"))
+    Err(io::Error::other(
+        "no free loop device for the squashfs image",
+    ))
 }
 
 impl Drop for LoopGuard {

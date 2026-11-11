@@ -30,10 +30,8 @@ impl Session {
     pub(crate) fn create() -> io::Result<Self> {
         static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = Path::new("/sys/fs/cgroup").join(format!(
-            "river-{}.{sequence}",
-            std::process::id()
-        ));
+        let path =
+            Path::new("/sys/fs/cgroup").join(format!("river-{}.{sequence}", std::process::id()));
         fs::create_dir(&path)?;
         let session = Self {
             path,
@@ -57,7 +55,9 @@ impl Session {
 
     fn controller_available(&self, controller: &str) -> io::Result<bool> {
         let controllers = fs::read_to_string(self.path.join("cgroup.controllers"))?;
-        Ok(controllers.split_whitespace().any(|name| name == controller))
+        Ok(controllers
+            .split_whitespace()
+            .any(|name| name == controller))
     }
 
     /// Creates the per-run child group with the given limits applied.
