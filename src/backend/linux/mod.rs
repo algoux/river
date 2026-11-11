@@ -177,7 +177,7 @@ impl Backend for Linux {
                     .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
             }
 
-            let environment = build_environment(spec.envs.as_ref(), workdir, rootfs.is_some())?;
+            let environment = build_environment(spec.envs.as_ref(), workdir)?;
             let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
 
             let rootfs = match rootfs {
@@ -531,24 +531,21 @@ fn container_cwd(cwd: Option<&str>, workdir: &Path) -> PyResult<String> {
     }
 }
 
-/// The base environment for a rootfs run: the host environment is not
-/// passed (its PATH points at directories the rootfs does not have, and it
-/// can carry secrets). Caller `envs` can extend it.
-const ROOTFS_ENV_BASE: &[(&str, &str)] = &[
+/// The base environment every run starts from: the host environment is not
+/// passed (it can carry secrets, and its PATH may point at directories the
+/// sandbox does not have). Caller `envs` can extend or override it.
+const ENV_BASE: &[(&str, &str)] = &[
     ("PATH", "/usr/bin:/bin:/usr/local/bin"),
     ("HOME", "/workspace/tmp"),
     ("LANG", "C.UTF-8"),
 ];
 
-/// The child environment. Default mode passes the host variables (the
-/// host system dirs are merged read-only, so they resolve); a rootfs run
-/// starts from [`ROOTFS_ENV_BASE`]. Either way `TMPDIR`/`TEMP`/`TMP` point
-/// into the writable scratch, and caller `envs` come last (case sensitive,
-/// as POSIX environments are).
+/// The child environment: [`ENV_BASE`] plus `TMPDIR`/`TEMP`/`TMP` pointing
+/// into the writable scratch, with caller `envs` last (case sensitive, as
+/// POSIX environments are).
 fn build_environment(
     overrides: Option<&HashMap<String, String>>,
     workdir: &Path,
-    rootfs_mode: bool,
 ) -> PyResult<Vec<(String, String)>> {
     let temp = workdir.join("tmp");
     std::fs::create_dir_all(&temp).map_err(|error| {
@@ -559,21 +556,10 @@ fn build_environment(
     })?;
     let temp = format!("{CONTAINER_WORKDIR}/tmp");
 
-    let mut variables: Vec<(String, String)> = if rootfs_mode {
-        ROOTFS_ENV_BASE
-            .iter()
-            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-            .collect()
-    } else {
-        std::env::vars_os()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.to_string_lossy().into_owned(),
-                )
-            })
-            .collect()
-    };
+    let mut variables: Vec<(String, String)> = ENV_BASE
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect();
     for name in ["TMPDIR", "TEMP", "TMP"] {
         set_environment(&mut variables, name, temp.clone());
     }

@@ -538,6 +538,19 @@ def test_tmpdir_points_into_scratch(session, tmp_path):
     assert lines[1] == "writable"
 
 
+def test_env_whitelist_default_mode(session, tmp_path, monkeypatch):
+    # The host environment (secrets included) never reaches the payload;
+    # default and rootfs modes share the same whitelist.
+    monkeypatch.setenv("RIVER_SECRET", "leak")
+    out = out_path(tmp_path)
+    status = session.exec(SH, args=["-c", "echo $PATH; echo [$RIVER_SECRET]"],
+                          stdout_file=out)
+    assert status.status == "AC"
+    lines = Path(out).read_text().splitlines()
+    assert lines[0] == "/usr/bin:/bin:/usr/local/bin"
+    assert lines[1] == "[]"
+
+
 # --- isolation ---------------------------------------------------------------
 
 
