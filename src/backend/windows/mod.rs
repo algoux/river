@@ -52,9 +52,9 @@ use self::profile::AppContainer;
 use self::spawn::{SpawnConfig, WaitResult, env_block, spawn};
 use self::stdio::StdioSet;
 
-/// Environment variables kept for an AppContainer child. Everything else
-/// from the host environment is dropped (the AppContainer's visible surface
-/// is already restricted to the granted paths).
+/// Environment variables kept from the host (machine facts such as
+/// `SystemRoot`; values are not secrets). Everything else from the host
+/// environment is dropped, matching the Linux backend's whitelist approach.
 const SANDBOX_ENV_WHITELIST: &[&str] = &[
     "SystemRoot",
     "SystemDrive",
@@ -217,7 +217,7 @@ impl Backend for Windows {
                 .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
         }
 
-        let environment = build_environment(spec.envs.as_ref(), workdir, sandboxed)?;
+        let environment = build_environment(spec.envs.as_ref(), workdir)?;
         let cwd = resolve_cwd(spec.cwd.as_deref(), workdir)?;
 
         let mut status = run(spec, cwd.as_deref(), &environment, appcontainer_sid)
@@ -389,42 +389,31 @@ fn memory_slack(limit_bytes: u64) -> u64 {
     (limit_bytes / 8).max(1024 * 1024)
 }
 
-/// The child environment: all host variables for a plain run, a whitelist
-/// for an AppContainer run. The session `TEMP`/`TMP` point into the writable
-/// scratch directory; caller `envs` override either base.
+/// The child environment: the [`SANDBOX_ENV_WHITELIST`] variables (aligned
+/// with the Linux backend's `ENV_BASE`: the host environment is not passed
+/// through wholesale) plus a fixed system PATH. The session `TEMP`/`TMP`
+/// point into the writable scratch directory; caller `envs` override either.
 fn build_environment(
     overrides: Option<&HashMap<String, String>>,
     workdir: Option<&Path>,
-    sandboxed: bool,
 ) -> PyResult<Vec<(String, String)>> {
-    let mut variables: Vec<(String, String)> = if sandboxed {
-        SANDBOX_ENV_WHITELIST
-            .iter()
-            .filter_map(|name| {
-                std::env::var(name)
-                    .ok()
-                    .map(|value| ((*name).to_string(), value))
-            })
-            .collect()
-    } else {
-        std::env::vars_os()
-            .map(|(key, value)| {
-                (
-                    key.to_string_lossy().into_owned(),
-                    value.to_string_lossy().into_owned(),
-                )
-            })
-            .collect()
-    };
+    let mut variables: Vec<(String, String)> = SANDBOX_ENV_WHITELIST
+        .iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| ((*name).to_string(), value))
+        })
+        .collect();
 
-    // An AppContainer run gets a fixed system PATH; caller `envs` can
-    // override it. Copying the host PATH would advertise directories the
-    // package cannot actually open.
-    if sandboxed && let Ok(root) = std::env::var("SystemRoot") {
+    // A fixed system PATH, like the Linux `ENV_BASE` PATH: copying the host
+    // PATH would advertise directories the run may not be able to use.
+    // Caller `envs` can override it.
+    if let Ok(root) = std::env::var("SystemRoot") {
         set_environment(&mut variables, "PATH", format!(r"{root}\system32;{root}"));
     }
 
-    if sandboxed && let Some(workdir) = workdir {
+    if let Some(workdir) = workdir {
         let temp = workdir.join("tmp");
         std::fs::create_dir_all(&temp).map_err(|error| {
             PyOSError::new_err(format!(

@@ -758,3 +758,35 @@ def test_without_runtimes_is_a_plain_process(tmp_path: Path):
     )
     assert status.status == "AC"
     assert target.read_text(encoding="utf-8").strip() == "plain"
+
+
+def test_plain_run_env_is_whitelisted(monkeypatch, tmp_path: Path):
+    """A plain run (no runtimes) also drops the host environment, matching
+    the Linux backend's `ENV_BASE` semantics; only whitelisted machine
+    facts pass through and PATH is the fixed system PATH."""
+    monkeypatch.setenv("RIVER_TEST_MARKER", "secret")
+    stdout = tmp_path / "env.txt"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import os, sys; w = sys.stdout.write; "
+               "w(os.environ.get('RIVER_TEST_MARKER', '<absent>') + '\\n'); "
+               "w(os.environ.get('PATH', '') + '\\n'); "
+               "w(os.environ.get('SystemRoot', ''))"],
+        stdout_file=str(stdout),
+    )
+    assert status.status == "AC"
+    marker, path, system_root = stdout.read_text(encoding="utf-8").splitlines()
+    assert marker == "<absent>"
+    assert path == rf"{system_root}\system32;{system_root}"
+
+
+def test_plain_run_envs_override_the_whitelist(tmp_path: Path):
+    stdout = tmp_path / "env.txt"
+    status = river.Sandbox().exec(
+        sys.executable,
+        ["-c", "import os, sys; sys.stdout.write(os.environ['RIVER_TEST_SET'])"],
+        envs={"RIVER_TEST_SET": "passed-through"},
+        stdout_file=str(stdout),
+    )
+    assert status.status == "AC"
+    assert stdout.read_text(encoding="utf-8") == "passed-through"
