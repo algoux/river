@@ -305,6 +305,64 @@ def test_cwd_rejects_escape():
             sandbox.exec(SH, args=["-c", "true"], cwd="/etc")
 
 
+# --- runtimes -----------------------------------------------------------------
+
+
+@pytest.fixture()
+def runtime(tmp_path):
+    directory = tmp_path / "rt-one"
+    directory.mkdir()
+    script = directory / "run.sh"
+    script.write_text('#!/bin/sh\necho from-runtime\n')
+    script.chmod(0o755)
+    (directory / "data.txt").write_text("runtime-data")
+    return directory
+
+
+def test_runtime_executable_and_read(runtime, tmp_path):
+    out = out_path(tmp_path)
+    with river.Sandbox(runtimes=[str(runtime)]) as sandbox:
+        status = sandbox.exec("/runtime/rt-one/run.sh", stdout_file=out)
+        assert status.status == "AC"
+        assert Path(out).read_text() == "from-runtime\n"
+
+        out2 = out_path(tmp_path, "data.txt")
+        status = sandbox.exec(SH, args=["-c", "cat /runtime/rt-one/data.txt"],
+                              stdout_file=out2)
+        assert Path(out2).read_text() == "runtime-data"
+
+
+def test_runtime_read_only(runtime, tmp_path):
+    out = out_path(tmp_path)
+    with river.Sandbox(runtimes=[str(runtime)]) as sandbox:
+        status = sandbox.exec(
+            SH,
+            args=["-c", "echo x > /runtime/rt-one/data.txt 2>/dev/null "
+                         "&& echo writable || echo read-only"],
+            stdout_file=out,
+        )
+        assert status.status == "AC"
+        assert Path(out).read_text().strip() == "read-only"
+    # the host tree was never touched
+    assert (runtime / "data.txt").read_text() == "runtime-data"
+
+
+def test_runtime_bad_path_rejected(tmp_path):
+    with pytest.raises(ValueError, match="not a directory"):
+        with river.Sandbox(runtimes=[str(tmp_path / "missing")]):
+            pass
+
+
+def test_runtime_name_collision_rejected(tmp_path):
+    first = tmp_path / "a" / "rt"
+    second = tmp_path / "b" / "rt"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    with pytest.raises(ValueError, match="cannot collide"):
+        with river.Sandbox(runtimes=[str(first), str(second)]):
+            pass
+
+
 # --- environment -------------------------------------------------------------
 
 

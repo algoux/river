@@ -74,11 +74,32 @@ impl Backend for Linux {
     fn on_enter(
         &self,
         _rootfs: Option<&Path>,
-        _runtimes: &[PathBuf],
+        runtimes: &[PathBuf],
         _workdir: &Path,
     ) -> PyResult<()> {
         // A new session must not inherit the previous session's limits.
         self.close_session();
+        // Fail the `with` statement, not the first exec, on a bad runtime
+        // path (same contract as the Windows backend). Each runtime is
+        // mounted at /runtime/<basename>, so names must not collide.
+        let mut names = std::collections::HashSet::new();
+        for runtime in runtimes {
+            if !runtime.is_dir() {
+                return Err(PyValueError::new_err(format!(
+                    "runtime {} is not a directory",
+                    runtime.display()
+                )));
+            }
+            if let Some(name) = runtime.file_name()
+                && !names.insert(name.to_os_string())
+            {
+                return Err(PyValueError::new_err(format!(
+                    "runtimes share the same name {}: they are mounted at \
+                     /runtime/<name> and cannot collide",
+                    name.to_string_lossy()
+                )));
+            }
+        }
         let session = Session::create().map_err(|error| {
             PyOSError::new_err(format!(
                 "failed to create the cgroup sandbox session: {error} (the Linux \
@@ -103,7 +124,7 @@ impl Backend for Linux {
     fn exec(
         &self,
         _rootfs: Option<&Path>,
-        _runtimes: &[PathBuf],
+        runtimes: &[PathBuf],
         mut spec: RunSpec,
         workdir: Option<&Path>,
     ) -> PyResult<Status> {
@@ -137,7 +158,7 @@ impl Backend for Linux {
             let environment = build_environment(spec.envs.as_ref(), workdir)?;
             let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
 
-            run(&spec, workdir, &environment, &cwd, &mut session)
+            run(&spec, workdir, runtimes, &environment, &cwd, &mut session)
                 .map_err(|error| os_error("sandbox run failed", error))
         })();
 
@@ -168,12 +189,13 @@ impl Backend for Linux {
 fn run(
     spec: &RunSpec,
     workdir: &Path,
+    runtimes: &[PathBuf],
     environment: &[(String, String)],
     cwd: &str,
     session: &mut Session,
 ) -> io::Result<Status> {
     let run_group = session.run_group(spec.cpu_time_limit_ms, spec.memory_limit_bytes)?;
-    let raw = match supervise(spec, workdir, environment, cwd, &run_group) {
+    let raw = match supervise(spec, workdir, runtimes, environment, cwd, &run_group) {
         Ok(raw) => raw,
         Err(error) => {
             // The group may still hold processes; kill and drop it before
@@ -224,6 +246,7 @@ struct RawOutcome {
 fn supervise(
     spec: &RunSpec,
     workdir: &Path,
+    runtimes: &[PathBuf],
     environment: &[(String, String)],
     cwd: &str,
     run_group: &cgroup::RunGroup,
@@ -264,7 +287,10 @@ fn supervise(
         cwd: CString::new(cwd)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "cwd contains a NUL byte"))?,
         workdir: cstring(workdir)?,
-        runtimes: vec![], // runtime grants land with the rootfs milestone
+        runtimes: runtimes
+            .iter()
+            .map(|runtime| cstring(runtime))
+            .collect::<Result<Vec<_>, _>>()?,
         stdio,
         cgroup: Some(cgroup_fd(run_group.path())?),
         seccomp: seccomp_program,
