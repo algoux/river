@@ -120,7 +120,6 @@ impl Sandbox {
         cpu_time_limit_ms=None,
         wall_time_limit_ms=None,
         memory_limit_bytes=None,
-        stdin=None,
         stdin_file=None,
         copy_in=None,
         copy_out=None,

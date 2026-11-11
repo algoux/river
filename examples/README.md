@@ -2,6 +2,12 @@
 
 本目录包含 `river` 项目的示例程序，演示如何在 Linux 和 Windows 平台上进行进程管理、输出捕获与安全沙箱。
 
+> **提示：** 这些示例演示的是沙箱底层的单块机制。Linux 后端本身已完整落地
+> （namespaces + pivot_root + cgroups v2 + seccomp + epoll 监督 + rootfs
+> overlay/squashfs），生产入口是 Python 扩展 `river.Sandbox`，实现见
+> `src/backend/linux/`；Windows 后端（AppContainer + Job Object）见
+> `src/backend/windows/`。示例主要作为各机制的教学参考。
+
 ## 示例列表
 
 | 示例 | 平台 | 说明 |

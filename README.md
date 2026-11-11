@@ -23,8 +23,12 @@ class that executes a child with verdict-grade limits and accounting
 └── usr bin sbin lib lib64 etc   host system dirs (ro)
 ```
 
-`rootfs=` (a caller-supplied container root) is planned; the current backend
-rejects it.
+`rootfs=` accepts a caller-supplied container root: a directory is mounted
+writable-side-up via `overlayfs` (private tmpfs upper layer, host tree stays
+frozen read-only), a squashfs image (detected by the `hsqs` magic) is attached
+through a loop device and used as the read-only lower layer. In `rootfs=` mode
+the host system directories are not mounted in; the root must be self-contained
+(`runtimes=[...]` still composes, mounted at `/runtime/<name>`).
 
 ## Testing
 
