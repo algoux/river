@@ -47,6 +47,16 @@ struct CloneArgs {
     cgroup: u64,
 }
 
+/// The caller-supplied sandbox root.
+#[derive(Clone)]
+pub(crate) enum RootFs {
+    /// A host directory, used directly as the overlayfs lowerdir.
+    Dir(CString),
+    /// A loop device the parent bound a squashfs image to; the child mounts
+    /// it read-only and uses that mount as the lowerdir.
+    Squashfs(CString),
+}
+
 /// Everything the child needs, pre-built: after `clone3` the child must not
 /// allocate through the Python-embedding heap, so every path and string is
 /// a finished `CString` before the fork point.
@@ -60,8 +70,8 @@ pub(crate) struct ChildSpec {
     pub workdir: CString,
     /// Host runtime directories to expose read-only at `/runtime/<name>`.
     pub runtimes: Vec<CString>,
-    /// Host directory used as the sandbox root via overlayfs, if any.
-    pub rootfs: Option<CString>,
+    /// Caller-supplied sandbox root, if any.
+    pub rootfs: Option<RootFs>,
     /// Inheritable fds for stdin/stdout/stderr; `None` keeps the parent's.
     pub stdio: [Option<OwnedFd>; 3],
     /// Directory fd of the cgroup the child is born into (limits must
@@ -174,7 +184,7 @@ pub(crate) fn stage_name(stage: u32) -> &'static str {
 
 fn child_setup(spec: &ChildSpec, stage: &mut u32) -> Result<(), i32> {
     *stage = 1;
-    rootfs::setup_and_pivot(&spec.workdir, &spec.runtimes, spec.rootfs.as_deref(), stage)?;
+    rootfs::setup_and_pivot(&spec.workdir, &spec.runtimes, spec.rootfs.as_ref(), stage)?;
     for (slot, fd) in spec.stdio.iter().enumerate() {
         if let Some(fd) = fd {
             let raw = fd.as_fd().as_raw_fd();

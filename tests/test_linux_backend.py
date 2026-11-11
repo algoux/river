@@ -9,6 +9,7 @@ Run on a root cgroups-v2 host with::
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -362,10 +363,11 @@ def test_runtime_name_collision_rejected(tmp_path):
 # --- rootfs -------------------------------------------------------------------
 
 
-def make_rootfs(base: Path) -> Path:
+def make_rootfs(base: Path, image: bool = False) -> Path:
     """A minimal self-contained root: dash plus its libc, copied from the
     host. `/bin` and `/lib` are relative symlinks like a usr-merged distro,
-    so `SH` resolves inside the rootfs."""
+    so `SH` resolves inside the rootfs. With `image=True` the root is
+    packed into a squashfs file instead."""
     root = base / "rootfs"
     (root / "usr/bin").mkdir(parents=True)
     (root / "usr/lib/x86_64-linux-gnu").mkdir(parents=True)
@@ -378,16 +380,25 @@ def make_rootfs(base: Path) -> Path:
                  root / "usr/lib/x86_64-linux-gnu/libc.so.6")
     shutil.copy2("/lib64/ld-linux-x86-64.so.2",
                  root / "lib64/ld-linux-x86-64.so.2")
-    return root
+    if not image:
+        return root
+    if shutil.which("mksquashfs") is None:
+        pytest.skip("squashfs-tools not installed")
+    image_path = base / "rootfs.sqfs"
+    subprocess.run(["mksquashfs", str(root), str(image_path),
+                    "-noappend", "-quiet", "-no-progress"], check=True)
+    return image_path
 
 
 def test_rootfs_bad_path_rejected(tmp_path):
     (tmp_path / "a,b").mkdir()
     (tmp_path / "a:b").mkdir()
+    (tmp_path / "junk").write_text("not an image")
     for bad, message in [
         ("relative", "absolute path"),
         ("/", "other than /"),
-        (str(tmp_path / "missing"), "not a directory"),
+        (str(tmp_path / "missing"), "neither a directory nor"),
+        (str(tmp_path / "junk"), "neither a directory nor"),
         (str(tmp_path / "a,b"), "overlayfs option separators"),
         (str(tmp_path / "a:b"), "overlayfs option separators"),
     ]:
@@ -396,8 +407,9 @@ def test_rootfs_bad_path_rejected(tmp_path):
                 pass
 
 
-def test_rootfs_exec_and_env(tmp_path, monkeypatch):
-    root = make_rootfs(tmp_path)
+@pytest.mark.parametrize("image", [False, True], ids=["dir", "image"])
+def test_rootfs_exec_and_env(image, tmp_path, monkeypatch):
+    root = make_rootfs(tmp_path, image=image)
     out = out_path(tmp_path)
     monkeypatch.setenv("RIVER_SECRET", "leak")
     with river.Sandbox(rootfs=str(root)) as sandbox:
@@ -413,10 +425,16 @@ def test_rootfs_exec_and_env(tmp_path, monkeypatch):
         assert lines[1] == "/workspace/tmp"
         assert lines[2] == "[]"  # the host environment is not passed
         assert lines[3] == "v"
+        # A second run in the same session re-attaches (and releases) the
+        # loop device when the rootfs is an image.
+        status = sandbox.exec(SH, args=["-c", "echo again"], stdout_file=out)
+        assert status.status == "AC"
+        assert Path(out).read_text().strip() == "again"
 
 
-def test_rootfs_layout_read_only(tmp_path):
-    root = make_rootfs(tmp_path)
+@pytest.mark.parametrize("image", [False, True], ids=["dir", "image"])
+def test_rootfs_layout_read_only(image, tmp_path):
+    root = make_rootfs(tmp_path, image=image)
     out = out_path(tmp_path)
     with river.Sandbox(rootfs=str(root)) as sandbox:
         status = sandbox.exec(
@@ -437,19 +455,41 @@ def test_rootfs_layout_read_only(tmp_path):
         assert lines[2] == "workspace-writable"
 
 
-def test_rootfs_caller_tree_unchanged(tmp_path):
-    root = make_rootfs(tmp_path)
-    before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+@pytest.mark.parametrize("image", [False, True], ids=["dir", "image"])
+def test_rootfs_caller_tree_unchanged(image, tmp_path):
+    root = make_rootfs(tmp_path, image=image)
+    if image:
+        before = root.read_bytes()
+    else:
+        before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
     with river.Sandbox(rootfs=str(root)) as sandbox:
         status = sandbox.exec(SH, args=["-c", "true"])
         assert status.status == "AC"
     # The writable upper layer lives on a private tmpfs, never in the tree.
-    after = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
-    assert after == before
+    if image:
+        assert root.read_bytes() == before
+    else:
+        after = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+        assert after == before
 
 
-def test_rootfs_runtimes_compose(tmp_path, runtime):
+def test_rootfs_image_path_with_comma(tmp_path):
+    # The overlay option separators restrict directory paths only; an image
+    # path never enters the option string.
     root = make_rootfs(tmp_path)
+    image = tmp_path / "a,b.sqfs"
+    subprocess.run(["mksquashfs", str(root), str(image),
+                    "-noappend", "-quiet", "-no-progress"], check=True)
+    out = out_path(tmp_path)
+    with river.Sandbox(rootfs=str(image)) as sandbox:
+        status = sandbox.exec(SH, args=["-c", "echo hi"], stdout_file=out)
+        assert status.status == "AC"
+        assert Path(out).read_text().strip() == "hi"
+
+
+@pytest.mark.parametrize("image", [False, True], ids=["dir", "image"])
+def test_rootfs_runtimes_compose(image, tmp_path, runtime):
+    root = make_rootfs(tmp_path, image=image)
     out = out_path(tmp_path)
     with river.Sandbox(rootfs=str(root), runtimes=[str(runtime)]) as sandbox:
         status = sandbox.exec(

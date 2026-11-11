@@ -7,6 +7,7 @@
 
 mod capture;
 mod cgroup;
+mod loopdev;
 mod rootfs;
 mod seccomp;
 mod spawn;
@@ -30,7 +31,7 @@ use crate::contract::RunSpec;
 use crate::contract::status::Status;
 
 use self::cgroup::Session;
-use self::spawn::ChildSpec;
+use self::spawn::{ChildSpec, RootFs};
 
 /// Where the session workdir lives inside the sandbox.
 const CONTAINER_WORKDIR: &str = "/workspace";
@@ -59,9 +60,10 @@ impl Linux {
 }
 
 impl Backend for Linux {
-    /// `rootfs` is a caller-supplied, self-contained root directory mounted
-    /// via overlayfs (the caller tree stays read-only). Path constraints
-    /// come from the overlay option string (`,` and `:` are separators).
+    /// `rootfs` is a caller-supplied, self-contained root: either a
+    /// directory (overlay lowerdir) or a squashfs image file, told apart by
+    /// the `hsqs` magic. The overlay option string is the reason a
+    /// *directory* path must not contain `,` or `:`.
     fn validate_new(&self, rootfs: Option<&Path>, _runtimes: &[PathBuf]) -> PyResult<()> {
         let Some(rootfs) = rootfs else {
             return Ok(());
@@ -71,17 +73,19 @@ impl Backend for Linux {
                 "rootfs must be an absolute path other than /",
             ));
         }
-        if !rootfs.is_dir() {
+        if !rootfs.is_dir() && !is_squashfs_image(rootfs) {
             return Err(PyValueError::new_err(format!(
-                "rootfs {} is not a directory",
+                "rootfs {} is neither a directory nor a squashfs image",
                 rootfs.display()
             )));
         }
-        let text = rootfs.to_string_lossy();
-        if text.contains(',') || text.contains(':') {
-            return Err(PyValueError::new_err(
-                "rootfs path must not contain ',' or ':' (overlayfs option separators)",
-            ));
+        if rootfs.is_dir() {
+            let text = rootfs.to_string_lossy();
+            if text.contains(',') || text.contains(':') {
+                return Err(PyValueError::new_err(
+                    "rootfs path must not contain ',' or ':' (overlayfs option separators)",
+                ));
+            }
         }
         Ok(())
     }
@@ -164,6 +168,9 @@ impl Backend for Linux {
                 .ok_or_else(|| PyRuntimeError::new_err("the sandbox session is not active"))?
         };
 
+        // Kept alive until copy_out is over: the loop binding must outlive
+        // everything that could still touch the squashfs mount.
+        let mut loop_guard = None;
         let result = (|| {
             if let Some(copy_in) = copy_in {
                 copy::provision(workdir, copy_in)
@@ -173,7 +180,21 @@ impl Backend for Linux {
             let environment = build_environment(spec.envs.as_ref(), workdir, rootfs.is_some())?;
             let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
 
-            run(&spec, workdir, runtimes, rootfs, &environment, &cwd, &mut session)
+            let rootfs = match rootfs {
+                None => None,
+                // A directory is the overlay lowerdir itself; an image is
+                // bound to a loop device here and the child mounts it.
+                Some(path) if path.is_dir() => Some(RootFs::Dir(cstring(path)?)),
+                Some(path) => {
+                    let (device, guard) = loopdev::attach(path).map_err(|error| {
+                        PyOSError::new_err(format!("rootfs image attach failed: {error}"))
+                    })?;
+                    loop_guard = Some(guard);
+                    Some(RootFs::Squashfs(device))
+                }
+            };
+
+            run(&spec, workdir, runtimes, rootfs.as_ref(), &environment, &cwd, &mut session)
                 .map_err(|error| os_error("sandbox run failed", error))
         })();
 
@@ -205,7 +226,7 @@ fn run(
     spec: &RunSpec,
     workdir: &Path,
     runtimes: &[PathBuf],
-    rootfs: Option<&Path>,
+    rootfs: Option<&RootFs>,
     environment: &[(String, String)],
     cwd: &str,
     session: &mut Session,
@@ -263,7 +284,7 @@ fn supervise(
     spec: &RunSpec,
     workdir: &Path,
     runtimes: &[PathBuf],
-    rootfs: Option<&Path>,
+    rootfs: Option<&RootFs>,
     environment: &[(String, String)],
     cwd: &str,
     run_group: &cgroup::RunGroup,
@@ -308,7 +329,7 @@ fn supervise(
             .iter()
             .map(|runtime| cstring(runtime))
             .collect::<Result<Vec<_>, _>>()?,
-        rootfs: rootfs.map(cstring).transpose()?,
+        rootfs: rootfs.cloned(),
         stdio,
         cgroup: Some(cgroup_fd(run_group.path())?),
         seccomp: seccomp_program,
@@ -576,6 +597,16 @@ fn set_environment(variables: &mut Vec<(String, String)>, key: &str, value: Stri
     } else {
         variables.push((key.to_string(), value));
     }
+}
+
+/// A regular file whose first four bytes are the squashfs magic (`hsqs`,
+/// little-endian 0x73717368).
+fn is_squashfs_image(path: &Path) -> bool {
+    let mut magic = [0u8; 4];
+    std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .map(|()| &magic == b"hsqs")
+        .unwrap_or(false)
 }
 
 fn cstring(path: &Path) -> io::Result<CString> {

@@ -24,6 +24,8 @@
 //! the workdir) and no host system dir is merged: the rootfs must be
 //! self-contained.
 
+use super::spawn::RootFs;
+
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
 
@@ -78,15 +80,16 @@ fn mount(
 /// failed (see `stage_name`), so the caller can report it.
 ///
 /// Without `rootfs` the new root is a tmpfs with the host system dirs
-/// merged in read-only. With `rootfs` (a caller-supplied directory) it is
-/// an overlayfs: `lowerdir=<rootfs>` plus a per-run `upperdir`/`workdir`
-/// under the session workdir, so the caller tree is never written — the
-/// mount-point directories land in the upper layer — and nothing from the
-/// host is merged: the rootfs must be self-contained.
+/// merged in read-only. With `rootfs` it is an overlayfs whose lower layer
+/// is either the caller directory directly or a squashfs image the parent
+/// bound to a loop device; the per-run `upperdir`/`workdir` live on a
+/// private tmpfs under the session workdir, so the caller tree is never
+/// written — the mount-point directories land in the upper layer — and
+/// nothing from the host is merged: the rootfs must be self-contained.
 pub(super) fn setup_and_pivot(
     workdir: &CStr,
     runtimes: &[CString],
-    rootfs: Option<&CStr>,
+    rootfs: Option<&RootFs>,
     stage: &mut u32,
 ) -> Result<(), i32> {
     macro_rules! phased {
@@ -138,12 +141,34 @@ pub(super) fn setup_and_pivot(
             let overlay_work = join_bytes(ovl.to_bytes(), b"/work")?;
             phased!(31, mkdir_ok(&upper));
             phased!(31, mkdir_ok(&overlay_work));
-            // shortcut: the option string rejects ',' and ':' in the rootfs
-            // path at construction; anything else the kernel dislikes
+            let lowerdir = match rootfs {
+                RootFs::Dir(path) => path.to_owned(),
+                // The parent bound the image to this loop device; mount it
+                // read-only here and use that mount as the lower layer. The
+                // mount dies with this namespace, the binding with the
+                // parent's LoopGuard.
+                RootFs::Squashfs(device) => {
+                    let sqfs = join_bytes(ovl.to_bytes(), b"/sqfs")?;
+                    phased!(31, mkdir_ok(&sqfs));
+                    phased!(
+                        34,
+                        mount(
+                            Some(device),
+                            &sqfs,
+                            Some(c"squashfs"),
+                            MS_RDONLY | MS_NOSUID | MS_NODEV,
+                            None,
+                        )
+                    );
+                    sqfs
+                }
+            };
+            // shortcut: a directory path rejects ',' and ':' at construction
+            // (overlay option separators); anything else the kernel dislikes
             // surfaces as the mount's own errno
             let options = format!(
                 "lowerdir={},upperdir={},workdir={}",
-                rootfs.to_string_lossy(),
+                lowerdir.to_string_lossy(),
                 upper.to_string_lossy(),
                 overlay_work.to_string_lossy(),
             );
@@ -312,6 +337,7 @@ pub(super) fn stage_name(stage: u32) -> &'static str {
         31 => "mkdir overlay upper/work",
         32 => "mount rootfs overlay",
         33 => "freeze rootfs read-only",
+        34 => "mount squashfs image",
         _ => "sandbox setup",
     }
 }
