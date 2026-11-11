@@ -33,6 +33,22 @@ def acl(path: Path) -> str:
     return result.stdout
 
 
+def acl_entries(text: str) -> list[str]:
+    """The ACEs of an `icacls` listing, normalized for comparison.
+
+    Writing a DACL makes Windows re-materialize an object's inherited ACEs as
+    explicit ones, so the raw listing changes across a grant cycle even though
+    the effective access does not. The inherited marker is dropped here: only
+    the trustees and their rights are compared, so a leftover package SID or
+    a changed right still fails the check.
+    """
+    return sorted(
+        line.replace("(I)", "", 1)
+        for line in text.splitlines()
+        if line.strip() and not line.startswith("Successfully processed")
+    )
+
+
 def runtime_dir(tmp_path: Path) -> tuple[Path, Path]:
     directory = tmp_path / "runtime"
     directory.mkdir()
@@ -68,7 +84,7 @@ def test_profile_lifecycle_is_bound_to_enter_and_exit(tmp_path: Path):
             assert "S-1-15-2-" in during
             assert box.workdir is not None
             assert box.exec(str(COMSPEC), ["/c", "type", str(target)]).status == "AC"
-        assert acl(directory) == before
+        assert acl_entries(acl(directory)) == acl_entries(before)
 
     with pytest.raises(RuntimeError, match="AppContainer sandbox is not active"):
         box.exec(str(COMSPEC), ["/c", "echo", "x"])
@@ -172,7 +188,7 @@ def test_runtime_directory_is_read_only(tmp_path: Path):
         assert create.status == "RE"
         assert not (directory / "new.txt").exists()
 
-    assert acl(directory) == before
+    assert acl_entries(acl(directory)) == acl_entries(before)
 
 
 def test_file_runtime_is_scoped(tmp_path: Path):
@@ -189,8 +205,8 @@ def test_file_runtime_is_scoped(tmp_path: Path):
             box.exec(str(COMSPEC), ["/c", "echo", "x", ">", str(target)]).status == "RE"
         )
 
-    assert acl(target) == before_file
-    assert acl(directory) == before_directory
+    assert acl_entries(acl(target)) == acl_entries(before_file)
+    assert acl_entries(acl(directory)) == acl_entries(before_directory)
 
 
 def test_workdir_relative_cwd_is_writable(tmp_path: Path):
