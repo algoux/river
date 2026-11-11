@@ -30,9 +30,9 @@ mod profile;
 mod spawn;
 mod stdio;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -43,6 +43,7 @@ use windows_sys::Win32::Foundation::ERROR_NOT_ENOUGH_QUOTA;
 use windows_sys::Win32::Security::PSID;
 
 use crate::backend::common::Backend;
+use crate::backend::common::{resolve_cwd, validate_copy_in, validate_copy_out};
 use crate::contract::RunSpec;
 use crate::contract::status::Status;
 
@@ -386,94 +387,6 @@ fn classify(
 /// run that stayed well clear.
 fn memory_slack(limit_bytes: u64) -> u64 {
     (limit_bytes / 8).max(1024 * 1024)
-}
-
-/// Validates the `copy_out` sources: relative to the workdir. Destinations
-/// are host paths and are not restricted.
-fn validate_copy_out(entries: Option<&HashMap<PathBuf, PathBuf>>) -> PyResult<()> {
-    let Some(entries) = entries else {
-        return Ok(());
-    };
-    for source in entries.keys() {
-        validate_relative_path("copy_out", source)?;
-    }
-    Ok(())
-}
-
-/// Validates the `copy_in` destinations: relative to the workdir, unique, and
-/// not nested inside one another.
-fn validate_copy_in(entries: Option<&HashMap<PathBuf, PathBuf>>) -> PyResult<()> {
-    let Some(entries) = entries else {
-        return Ok(());
-    };
-    let mut destinations: HashSet<&Path> = HashSet::with_capacity(entries.len());
-    for destination in entries.values() {
-        validate_relative_path("copy_in", destination)?;
-        if !destinations.insert(destination.as_path()) {
-            return Err(PyValueError::new_err(format!(
-                "copy_in maps more than one source to the same destination: {}",
-                destination.display()
-            )));
-        }
-    }
-    for &destination in &destinations {
-        for ancestor in destination.ancestors().skip(1) {
-            if ancestor.as_os_str().is_empty() {
-                break;
-            }
-            if destinations.contains(ancestor) {
-                return Err(PyValueError::new_err(format!(
-                    "copy_in destinations overlap: {} is inside {}",
-                    destination.display(),
-                    ancestor.display()
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `cwd` is relative to the session scratch directory; inside a session the
-/// default is that directory itself. Outside a `with` block there is no
-/// scratch directory and the child keeps the caller's current directory.
-fn resolve_cwd(cwd: Option<&str>, workdir: Option<&Path>) -> PyResult<Option<PathBuf>> {
-    let Some(cwd) = cwd else {
-        return Ok(workdir.map(Path::to_path_buf));
-    };
-    validate_relative_path("cwd", Path::new(cwd))?;
-
-    let base = match workdir {
-        Some(workdir) => workdir.to_path_buf(),
-        None => std::env::current_dir().map_err(|error| {
-            PyOSError::new_err(format!("failed to resolve the current directory: {error}"))
-        })?,
-    };
-    let path = base.join(cwd);
-    if !path.is_dir() {
-        return Err(PyValueError::new_err(format!(
-            "cwd {cwd:?} is not a directory inside the sandbox: {}",
-            path.display()
-        )));
-    }
-    Ok(Some(path))
-}
-
-/// Accepts only plain relative components (no root, drive prefix, `.` or
-/// `..`), so `cwd` and `copy_in` destinations cannot escape the workdir.
-fn validate_relative_path(kind: &str, path: &Path) -> PyResult<()> {
-    if path.as_os_str().is_empty()
-        || path.has_root()
-        || path.to_string_lossy().contains(':')
-        || !path
-            .components()
-            .all(|component| matches!(component, Component::Normal(_)))
-    {
-        return Err(PyValueError::new_err(format!(
-            "invalid {kind} {}: must be a relative path inside the sandbox workdir",
-            path.display()
-        )));
-    }
-    Ok(())
 }
 
 /// The child environment: all host variables for a plain run, a whitelist

@@ -5,9 +5,12 @@
 //! [`platform_backend`]. Everything identical across Linux, macOS and
 //! Windows lives in this module exactly once.
 
+mod paths;
 mod sandbox;
 
 pub use sandbox::Sandbox;
+
+pub(crate) use paths::{resolve_cwd, validate_copy_in, validate_copy_out};
 
 use std::path::{Path, PathBuf};
 
