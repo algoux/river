@@ -1,24 +1,26 @@
 //! Linux backend: PID/mount/UTS/IPC/network namespaces + `pivot_root` for
-//! identity and filesystem isolation (see `rootfs.rs`), pidfd-based process
-//! control, and — in later milestones — cgroups v2 resource limits, output
-//! capture and seccomp. The building blocks are demonstrated in
+//! identity and filesystem isolation (see `rootfs.rs`), cgroups v2 for
+//! resource limits and accounting (see `cgroup.rs`), pidfd-based process
+//! control and output capture with kill thresholds (see `capture.rs`).
+//! seccomp is a later milestone. The building blocks are demonstrated in
 //! `examples/linux_*`.
 
+mod capture;
+mod cgroup;
 mod rootfs;
 mod spawn;
 
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::fs::File;
 use std::io;
-use std::os::unix::io::IntoRawFd as _;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use pyo3::exceptions::{PyOSError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use rustix::fd::{AsFd, FromRawFd, OwnedFd};
-use rustix::process::{WaitId, WaitidOptions, waitid};
+use rustix::process::{Signal, WaitId, WaitidOptions, pidfd_send_signal, waitid};
 
 use crate::backend::common::Backend;
 use crate::backend::common::copy;
@@ -26,14 +28,38 @@ use crate::backend::common::{resolve_cwd, validate_copy_in, validate_copy_out};
 use crate::contract::RunSpec;
 use crate::contract::status::Status;
 
+use self::cgroup::Session;
 use self::spawn::ChildSpec;
 
 /// Where the session workdir lives inside the sandbox.
 const CONTAINER_WORKDIR: &str = "/workspace";
 
-/// Placeholder Linux backend; the namespace mechanics land here milestone by
-/// milestone (this one: namespaces + pivot_root + basic exec).
-pub(crate) struct Linux;
+/// Supervisor loop tick: how often the output pipes are drained and the
+/// wall clock is checked.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// The Linux backend. The cgroup session directory is owned by the sandbox
+/// session: `__enter__` creates it, every run gets a child group, `__exit__`
+/// kills leftovers and removes the tree.
+pub(crate) struct Linux {
+    session: Mutex<Option<Session>>,
+}
+
+impl Linux {
+    pub(crate) fn new() -> Self {
+        Linux {
+            session: Mutex::new(None),
+        }
+    }
+
+    /// Best-effort teardown of the current session group.
+    fn close_session(&self) {
+        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(session) = guard.take() {
+            session.destroy();
+        }
+    }
+}
 
 impl Backend for Linux {
     /// `rootfs` (a caller-supplied container root) is planned as a later
@@ -45,6 +71,35 @@ impl Backend for Linux {
                  read-only runtime directories instead",
             ));
         }
+        Ok(())
+    }
+
+    fn on_enter(
+        &self,
+        _rootfs: Option<&Path>,
+        _runtimes: &[PathBuf],
+        _workdir: &Path,
+    ) -> PyResult<()> {
+        // A new session must not inherit the previous session's limits.
+        self.close_session();
+        let session = Session::create().map_err(|error| {
+            PyOSError::new_err(format!(
+                "failed to create the cgroup sandbox session: {error} (the Linux \
+                 backend needs root on a cgroups v2 host)"
+            ))
+        })?;
+        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(session);
+        Ok(())
+    }
+
+    fn on_exit(
+        &self,
+        _rootfs: Option<&Path>,
+        _runtimes: &[PathBuf],
+        _workdir: &Path,
+    ) -> PyResult<()> {
+        self.close_session();
         Ok(())
     }
 
@@ -69,20 +124,35 @@ impl Backend for Linux {
                  exec inside `with Sandbox(...)`",
             ));
         };
-        if let Some(copy_in) = copy_in {
-            copy::provision(workdir, copy_in)
-                .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
-        }
+        let mut session = {
+            let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+            guard
+                .take()
+                .ok_or_else(|| PyRuntimeError::new_err("the sandbox session is not active"))?
+        };
 
-        let environment = build_environment(spec.envs.as_ref(), workdir)?;
-        let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
+        let result = (|| {
+            if let Some(copy_in) = copy_in {
+                copy::provision(workdir, copy_in)
+                    .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
+            }
 
-        let status = run(&spec, workdir, &environment, &cwd)
-            .map_err(|error| os_error("sandbox run failed", error))?;
+            let environment = build_environment(spec.envs.as_ref(), workdir)?;
+            let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
+
+            run(&spec, workdir, &environment, &cwd, &mut session)
+                .map_err(|error| os_error("sandbox run failed", error))
+        })();
+
+        // Always put the session back so later runs (and `on_exit`) see it.
+        let mut guard = self.session.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(session);
+        drop(guard);
+
+        let mut status = result?;
 
         // Products are recovered only from a successful run; a collection
         // quota breach outranks the AC verdict.
-        let mut status = status;
         if status.status == "AC"
             && let Some(copy_out) = copy_out
         {
@@ -103,11 +173,69 @@ fn run(
     workdir: &Path,
     environment: &[(String, String)],
     cwd: &str,
+    session: &mut Session,
 ) -> io::Result<Status> {
-    let stdio = open_stdio(
+    let run_group = session.run_group(spec.cpu_time_limit_ms, spec.memory_limit_bytes)?;
+    let raw = match supervise(spec, workdir, environment, cwd, &run_group) {
+        Ok(raw) => raw,
+        Err(error) => {
+            // The group may still hold processes; kill and drop it before
+            // propagating.
+            run_group.remove();
+            return Err(error);
+        }
+    };
+    // The judged process is gone; the PID namespace took its descendants
+    // with it, so the group is empty and the counters are final.
+    let stats = run_group.stats()?;
+    run_group.remove();
+
+    let cpu_time_used_ms = stats.cpu_time_used_us / 1000;
+    let memory_used_bytes = stats.memory_used_bytes;
+    let (verdict, signal) = classify(
+        &raw,
+        spec.cpu_time_limit_ms,
+        cpu_time_used_ms,
+        spec.memory_limit_bytes,
+        memory_used_bytes,
+        stats.oom_kills,
+    );
+
+    Ok(Status {
+        cpu_time_used_ms,
+        wall_time_used_ms: raw.wall_time_used_ms,
+        memory_used_bytes,
+        status: verdict.to_string(),
+        signal,
+        exit_code: raw.exit_code,
+    })
+}
+
+/// The observed end of the run, before resource-based reclassification.
+struct RawOutcome {
+    exit_code: u32,
+    signal: i32,
+    wall_time_used_ms: u64,
+    timed_out: bool,
+    output_limit_hit: bool,
+}
+
+/// Spawns the child into the run group, then supervises: drains the limited
+/// output pipes, enforces the wall clock, and kills over the pidfd when a
+/// threshold is crossed.
+fn supervise(
+    spec: &RunSpec,
+    workdir: &Path,
+    environment: &[(String, String)],
+    cwd: &str,
+    run_group: &cgroup::RunGroup,
+) -> io::Result<RawOutcome> {
+    let (mut capture, stdio) = capture::Capture::new(
         spec.stdin_file.as_deref(),
         spec.stdout_file.as_deref(),
         spec.stderr_file.as_deref(),
+        spec.stdout_limit_bytes,
+        spec.stderr_limit_bytes,
     )?;
 
     let child_spec = ChildSpec {
@@ -128,69 +256,115 @@ fn run(
         workdir: cstring(workdir)?,
         runtimes: vec![], // runtime grants land with the rootfs milestone
         stdio,
+        cgroup: Some(cgroup_fd(run_group.path())?),
     };
 
     let child = spawn::spawn(child_spec)?;
     let started = Instant::now();
 
     if let Err(error) = await_handshake(&child.status) {
+        let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
         reap(&child.pidfd);
         return Err(error);
     }
 
-    let wait = waitid(WaitId::PidFd(child.pidfd.as_fd()), WaitidOptions::EXITED)
-        .map_err(|error| io::Error::other(format!("waitid failed: {error}")))?
-        .ok_or_else(|| io::Error::other("the sandboxed child never exited"))?;
+    let deadline = spec
+        .wall_time_limit_ms
+        .map(|limit| started + Duration::from_millis(limit));
+    let mut killed = false;
+    let mut timed_out = false;
+    let mut output_limit_hit = false;
+
+    let wait = loop {
+        if capture.poll() && !killed {
+            output_limit_hit = true;
+            killed = true;
+            let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
+        }
+        if !killed
+            && let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            timed_out = true;
+            killed = true;
+            let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
+        }
+        if let Ok(Some(wait)) = waitid(
+            WaitId::PidFd(child.pidfd.as_fd()),
+            WaitidOptions::NOHANG | WaitidOptions::EXITED,
+        ) {
+            break wait;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    };
+    // Final drain: the last chunk between the exit and this point still
+    // counts against the limits.
+    if capture.poll() {
+        output_limit_hit = true;
+    }
     let wall_time_used_ms = started.elapsed().as_millis() as u64;
 
-    // Resource accounting (cpu/memory) and the TLE/MLE/OLE verdicts land with
-    // the cgroups milestone; this milestone reports AC/RE plus the exit
-    // status.
-    let (status, exit_code, signal) = if wait.exited() {
-        let code = wait.exit_status().unwrap_or(0) as u32;
-        (if code == 0 { "AC" } else { "RE" }, code, 0)
+    let (exit_code, signal) = if wait.exited() {
+        (wait.exit_status().unwrap_or(0) as u32, 0)
     } else {
-        let signal = wait.terminating_signal().unwrap_or(0) as i32;
-        ("RE", 0, signal)
+        (0, wait.terminating_signal().unwrap_or(0) as i32)
     };
 
-    Ok(Status {
-        cpu_time_used_ms: 0,
-        wall_time_used_ms,
-        memory_used_bytes: 0,
-        status: status.to_string(),
-        signal,
+    Ok(RawOutcome {
         exit_code,
+        signal,
+        wall_time_used_ms,
+        timed_out,
+        output_limit_hit: output_limit_hit || capture.exceeded(),
     })
 }
 
-/// Opens the redirection files as inheritable fds, in the stdin/stdout/stderr
-/// order `ChildSpec::stdio` expects. `None` keeps the parent's stream.
-/// Output limits are enforced from the capture milestone on.
-fn open_stdio(
-    stdin_file: Option<&Path>,
-    stdout_file: Option<&Path>,
-    stderr_file: Option<&Path>,
-) -> io::Result<[Option<OwnedFd>; 3]> {
-    let stdin = match stdin_file {
-        Some(path) => Some(into_fd(File::open(path)?)),
-        None => None,
-    };
-    let stdout = match stdout_file {
-        Some(path) => Some(into_fd(File::create(path)?)),
-        None => None,
-    };
-    let stderr = match stderr_file {
-        Some(path) => Some(into_fd(File::create(path)?)),
-        None => None,
-    };
-    Ok([stdin, stdout, stderr])
+/// Maps one finished run onto the frozen `Status` verdicts. Evidence:
+/// the wall deadline is a direct observation; a cpu.max throttle makes the
+/// run hit the wall clock (or post-run usage pass the limit); a memory.max
+/// breach kills via the memory cgroup (`oom_kill` event, SIGKILL); output
+/// overflow is a direct observation. Same priority order as the Windows
+/// backend: OLE > MLE > TLE > AC/RE.
+fn classify(
+    raw: &RawOutcome,
+    cpu_limit_ms: Option<u64>,
+    cpu_used_ms: u64,
+    memory_limit_bytes: Option<u64>,
+    peak_memory_bytes: u64,
+    oom_kills: u64,
+) -> (&'static str, i32) {
+    let abnormal = raw.timed_out || raw.signal != 0 || raw.exit_code != 0;
+    let cpu_over = cpu_limit_ms.is_some_and(|limit| cpu_used_ms > limit);
+    let memory_hit = oom_kills > 0
+        || memory_limit_bytes.is_some_and(|limit| peak_memory_bytes >= limit);
+
+    if raw.output_limit_hit {
+        ("OLE", 9)
+    } else if abnormal && memory_hit {
+        ("MLE", 9)
+    } else if raw.timed_out || cpu_over {
+        ("TLE", 9)
+    } else if raw.exit_code == 0 && raw.signal == 0 {
+        ("AC", 0)
+    } else {
+        ("RE", raw.signal)
+    }
 }
 
-/// Converts a `File` into the plain fd type `ChildSpec` carries.
-fn into_fd(file: File) -> OwnedFd {
-    // SAFETY: `into_raw_fd` hands over a live fd that `OwnedFd` now owns.
-    unsafe { OwnedFd::from_raw_fd(file.into_raw_fd()) }
+/// Opens the run cgroup directory as the O_PATH fd clone3 wants.
+fn cgroup_fd(path: &Path) -> io::Result<OwnedFd> {
+    let c_path = cstring(path)?;
+    let fd = unsafe {
+        libc::open(
+            c_path.as_ptr(),
+            libc::O_PATH | libc::O_CLOEXEC | libc::O_DIRECTORY,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fresh fd from open, owned from here on.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// Reads the 8-byte handshake (errno + stage): non-zero errno means the run
@@ -224,8 +398,7 @@ fn reap(pidfd: &OwnedFd) {
 }
 
 fn container_cwd(cwd: Option<&str>, workdir: &Path) -> PyResult<String> {
-    let resolved =
-        resolve_cwd(cwd, Some(workdir))?.unwrap_or_else(|| workdir.to_path_buf());
+    let resolved = resolve_cwd(cwd, Some(workdir))?.unwrap_or_else(|| workdir.to_path_buf());
     let relative = resolved
         .strip_prefix(workdir)
         .map_err(|_| PyValueError::new_err("cwd escapes the sandbox workdir"))?;

@@ -24,6 +24,7 @@ const CLONE_NEWIPC: u64 = 0x0800_0000;
 const CLONE_NEWPID: u64 = 0x2000_0000;
 const CLONE_NEWNET: u64 = 0x4000_0000;
 const CLONE_PIDFD: u64 = 0x0000_1000;
+const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 const SANDBOX_NAMESPACES: u64 =
     CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWPID | CLONE_NEWNET;
@@ -60,6 +61,9 @@ pub(crate) struct ChildSpec {
     pub runtimes: Vec<CString>,
     /// Inheritable fds for stdin/stdout/stderr; `None` keeps the parent's.
     pub stdio: [Option<OwnedFd>; 3],
+    /// Directory fd of the cgroup the child is born into (limits must
+    /// already be applied to it), if any.
+    pub cgroup: Option<OwnedFd>,
 }
 
 /// A started sandbox child: the pidfd to wait on and the read end of the
@@ -75,10 +79,15 @@ pub(crate) fn spawn(spec: ChildSpec) -> io::Result<Child> {
     let (status_r, status_w) = pipe_with(PipeFlags::CLOEXEC)?;
 
     let mut pidfd_raw: c_int = -1;
+    let (cgroup_flag, cgroup_fd) = match &spec.cgroup {
+        Some(fd) => (CLONE_INTO_CGROUP, fd.as_fd().as_raw_fd() as u64),
+        None => (0, 0),
+    };
     let args = CloneArgs {
-        flags: SANDBOX_NAMESPACES | CLONE_PIDFD,
+        flags: SANDBOX_NAMESPACES | CLONE_PIDFD | cgroup_flag,
         pidfd: std::ptr::addr_of_mut!(pidfd_raw) as u64,
         exit_signal: libc::SIGCHLD as u64,
+        cgroup: cgroup_fd,
         ..Default::default()
     };
 

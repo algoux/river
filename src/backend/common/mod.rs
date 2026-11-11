@@ -82,7 +82,7 @@ pub(crate) trait Backend: Send + Sync + 'static {
 /// Build the backend matching the platform this extension was compiled for.
 #[cfg(target_os = "linux")]
 pub(crate) fn platform_backend() -> Box<dyn Backend> {
-    Box::new(super::linux::Linux)
+    Box::new(super::linux::Linux::new())
 }
 
 #[cfg(target_os = "macos")]
