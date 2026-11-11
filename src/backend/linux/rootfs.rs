@@ -18,6 +18,11 @@
 //! The read-only system dirs are what makes a host dynamic linker, libc and
 //! shell runnable inside the sandbox; they exist on every mainstream distro
 //! layout and are simply skipped when absent.
+//!
+//! With a caller-supplied `rootfs` the root is an overlayfs instead
+//! (lowerdir = the caller tree, upperdir/workdir on a private tmpfs under
+//! the workdir) and no host system dir is merged: the rootfs must be
+//! self-contained.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_ulong, c_void};
@@ -71,9 +76,17 @@ fn mount(
 /// On return the process is chdir'd to `/` inside the new root and the host
 /// filesystem is unmounted. `stage` receives a code naming the phase that
 /// failed (see `stage_name`), so the caller can report it.
+///
+/// Without `rootfs` the new root is a tmpfs with the host system dirs
+/// merged in read-only. With `rootfs` (a caller-supplied directory) it is
+/// an overlayfs: `lowerdir=<rootfs>` plus a per-run `upperdir`/`workdir`
+/// under the session workdir, so the caller tree is never written — the
+/// mount-point directories land in the upper layer — and nothing from the
+/// host is merged: the rootfs must be self-contained.
 pub(super) fn setup_and_pivot(
     workdir: &CStr,
     runtimes: &[CString],
+    rootfs: Option<&CStr>,
     stage: &mut u32,
 ) -> Result<(), i32> {
     macro_rules! phased {
@@ -88,26 +101,102 @@ pub(super) fn setup_and_pivot(
 
     let root = join_bytes(workdir.to_bytes(), b"/root")?;
     phased!(11, mkdir_ok(&root));
-    // The per-run root: a fresh tmpfs, so nothing of the host tree leaks in
-    // except what is explicitly bound below.
-    phased!(
-        12,
-        mount(Some(c"tmpfs"), &root, Some(c"tmpfs"), MS_NOSUID | MS_NODEV, None)
-    );
+    match rootfs {
+        None => {
+            // The per-run root: a fresh tmpfs, so nothing of the host tree
+            // leaks in except what is explicitly bound below.
+            phased!(
+                12,
+                mount(
+                    Some(c"tmpfs"),
+                    &root,
+                    Some(c"tmpfs"),
+                    MS_NOSUID | MS_NODEV,
+                    None,
+                )
+            );
+        }
+        Some(rootfs) => {
+            // The overlay's writable internals live on a private tmpfs under
+            // the session workdir — the only host tree river may write. The
+            // /workspace bind is non-recursive, so this mount never shows up
+            // inside the sandbox; after the pivot the overlay is the only
+            // thing keeping it alive.
+            let ovl = join_bytes(workdir.to_bytes(), b"/ovl")?;
+            phased!(29, mkdir_ok(&ovl));
+            phased!(
+                30,
+                mount(
+                    Some(c"tmpfs"),
+                    &ovl,
+                    Some(c"tmpfs"),
+                    MS_NOSUID | MS_NODEV,
+                    Some(c"mode=700"),
+                )
+            );
+            let upper = join_bytes(ovl.to_bytes(), b"/upper")?;
+            let overlay_work = join_bytes(ovl.to_bytes(), b"/work")?;
+            phased!(31, mkdir_ok(&upper));
+            phased!(31, mkdir_ok(&overlay_work));
+            // shortcut: the option string rejects ',' and ':' in the rootfs
+            // path at construction; anything else the kernel dislikes
+            // surfaces as the mount's own errno
+            let options = format!(
+                "lowerdir={},upperdir={},workdir={}",
+                rootfs.to_string_lossy(),
+                upper.to_string_lossy(),
+                overlay_work.to_string_lossy(),
+            );
+            let options = CString::new(options).map_err(|_| libc::EINVAL)?;
+            phased!(
+                32,
+                mount(Some(c"none"), &root, Some(c"overlay"), 0, Some(&options))
+            );
+        }
+    }
 
     *stage = 13;
     for name in ["proc", "dev", "runtime", "workspace", ".oldroot"] {
         mkdir_ok(&join(&root, name))?;
     }
+    // The runtime mount points must exist before the overlay is frozen
+    // read-only below; the default-mode root tmpfs is writable either way.
+    for runtime in runtimes {
+        if let Some(name) = runtime_name(runtime) {
+            let mut target = join_bytes(root.to_bytes(), b"/runtime/")?;
+            target = join_bytes(target.to_bytes(), name)?;
+            mkdir_ok(&target)?;
+        }
+    }
+
+    // Rootfs mode: the merged view is frozen read-only before anything is
+    // mounted on top of it. (The mount-point dirs above landed in the
+    // writable upper layer.)
+    if rootfs.is_some() {
+        phased!(
+            33,
+            mount(
+                None,
+                &root,
+                None,
+                MS_REC | MS_REMOUNT | MS_RDONLY | MS_NOSUID | MS_NODEV,
+                None,
+            )
+        );
+    }
 
     // The writable scratch: the session workdir bind-mounted at /workspace.
+    // Non-recursive on purpose: a recursive bind would copy the overlay
+    // backing tmpfs (workdir/ovl) into /workspace and hand the child the
+    // writable upper layer. The workdir is river's own scratch directory
+    // and holds no mounts the sandbox needs.
     phased!(
         14,
         mount(
             Some(workdir),
             &join(&root, "workspace"),
             None,
-            MS_BIND | MS_REC,
+            MS_BIND,
             None,
         )
     );
@@ -136,34 +225,33 @@ pub(super) fn setup_and_pivot(
         mount(Some(&source), &target, None, MS_BIND, None)?;
     }
 
-    // Read-only host system dirs. `/bin`, `/sbin`, `/lib` and `/lib64` are
-    // often symlinks into `/usr` on modern distros; mounting through a
-    // symlink resolves to the same tree, so no special casing is needed.
-    for dir in SYSTEM_DIRS {
-        *stage = 17;
-        let source = CString::new(*dir).map_err(|_| libc::EINVAL)?;
-        if !path_exists(&source) {
-            continue;
+    // Read-only host system dirs, default mode only. `/bin`, `/sbin`,
+    // `/lib` and `/lib64` are often symlinks into `/usr` on modern distros;
+    // mounting through a symlink resolves to the same tree, so no special
+    // casing is needed. A caller rootfs is self-contained instead.
+    if rootfs.is_none() {
+        for dir in SYSTEM_DIRS {
+            *stage = 17;
+            let source = CString::new(*dir).map_err(|_| libc::EINVAL)?;
+            if !path_exists(&source) {
+                continue;
+            }
+            let target = join(&root, dir.trim_start_matches('/'));
+            mkdir_ok(&target)?;
+            bind_read_only(&source, &target)?;
         }
-        let target = join(&root, dir.trim_start_matches('/'));
-        mkdir_ok(&target)?;
-        bind_read_only(&source, &target)?;
     }
 
-    // Caller runtimes, read-only at /runtime/<name>.
+    // Caller runtimes, read-only at /runtime/<name> (mount points created
+    // at stage 13, before the read-only freeze).
     for runtime in runtimes {
         *stage = 18;
-        let name = runtime
-            .to_bytes()
-            .rsplit(|&b| b == b'/')
-            .next()
-            .unwrap_or_default();
+        let name = runtime_name(runtime).unwrap_or_default();
         if name.is_empty() {
             continue;
         }
         let mut target = join_bytes(root.to_bytes(), b"/runtime/")?;
         target = join_bytes(target.to_bytes(), name)?;
-        mkdir_ok(&target)?;
         bind_read_only(runtime, &target)?;
     }
 
@@ -180,7 +268,7 @@ pub(super) fn setup_and_pivot(
         )
     );
 
-    // Pivot: / becomes the per-run tmpfs, the host root lands under
+    // Pivot: / becomes the per-run root, the host root lands under
     // /.oldroot and is detached immediately after.
     let old_root = join(&root, ".oldroot");
     *stage = 20;
@@ -219,8 +307,22 @@ pub(super) fn stage_name(stage: u32) -> &'static str {
         20 | 21 => "pivot_root",
         22 => "chdir /",
         23 => "detach old root",
+        29 => "mkdir overlay scratch",
+        30 => "mount overlay scratch tmpfs",
+        31 => "mkdir overlay upper/work",
+        32 => "mount rootfs overlay",
+        33 => "freeze rootfs read-only",
         _ => "sandbox setup",
     }
+}
+
+/// The basename of a runtime path (its mount name at `/runtime/<name>`).
+fn runtime_name(runtime: &CStr) -> Option<&[u8]> {
+    runtime
+        .to_bytes()
+        .rsplit(|&b| b == b'/')
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// A read-only bind: two mounts, because a bind cannot be created and

@@ -8,6 +8,7 @@ Run on a root cgroups-v2 host with::
 
 from __future__ import annotations
 
+import shutil
 import sys
 from pathlib import Path
 
@@ -57,11 +58,6 @@ def test_exec_requires_session():
     sandbox = river.Sandbox()
     with pytest.raises(RuntimeError, match="inside"):
         sandbox.exec(SH, args=["-c", "true"])
-
-
-def test_rootfs_rejected():
-    with pytest.raises(ValueError, match="rootfs"):
-        river.Sandbox(rootfs="/tmp")
 
 
 def test_cgroup_session_cleanup():
@@ -361,6 +357,108 @@ def test_runtime_name_collision_rejected(tmp_path):
     with pytest.raises(ValueError, match="cannot collide"):
         with river.Sandbox(runtimes=[str(first), str(second)]):
             pass
+
+
+# --- rootfs -------------------------------------------------------------------
+
+
+def make_rootfs(base: Path) -> Path:
+    """A minimal self-contained root: dash plus its libc, copied from the
+    host. `/bin` and `/lib` are relative symlinks like a usr-merged distro,
+    so `SH` resolves inside the rootfs."""
+    root = base / "rootfs"
+    (root / "usr/bin").mkdir(parents=True)
+    (root / "usr/lib/x86_64-linux-gnu").mkdir(parents=True)
+    (root / "lib64").mkdir()
+    (root / "etc").mkdir()
+    (root / "bin").symlink_to("usr/bin")
+    (root / "lib").symlink_to("usr/lib")
+    shutil.copy2("/usr/bin/dash", root / "usr/bin/sh")
+    shutil.copy2("/usr/lib/x86_64-linux-gnu/libc.so.6",
+                 root / "usr/lib/x86_64-linux-gnu/libc.so.6")
+    shutil.copy2("/lib64/ld-linux-x86-64.so.2",
+                 root / "lib64/ld-linux-x86-64.so.2")
+    return root
+
+
+def test_rootfs_bad_path_rejected(tmp_path):
+    (tmp_path / "a,b").mkdir()
+    (tmp_path / "a:b").mkdir()
+    for bad, message in [
+        ("relative", "absolute path"),
+        ("/", "other than /"),
+        (str(tmp_path / "missing"), "not a directory"),
+        (str(tmp_path / "a,b"), "overlayfs option separators"),
+        (str(tmp_path / "a:b"), "overlayfs option separators"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            with river.Sandbox(rootfs=bad):
+                pass
+
+
+def test_rootfs_exec_and_env(tmp_path, monkeypatch):
+    root = make_rootfs(tmp_path)
+    out = out_path(tmp_path)
+    monkeypatch.setenv("RIVER_SECRET", "leak")
+    with river.Sandbox(rootfs=str(root)) as sandbox:
+        status = sandbox.exec(
+            SH,
+            args=["-c", "echo $PATH; echo $HOME; echo [$RIVER_SECRET]; echo $RIVER_TEST"],
+            envs={"RIVER_TEST": "v"},
+            stdout_file=out,
+        )
+        assert status.status == "AC"
+        lines = Path(out).read_text().splitlines()
+        assert lines[0] == "/usr/bin:/bin:/usr/local/bin"
+        assert lines[1] == "/workspace/tmp"
+        assert lines[2] == "[]"  # the host environment is not passed
+        assert lines[3] == "v"
+
+
+def test_rootfs_layout_read_only(tmp_path):
+    root = make_rootfs(tmp_path)
+    out = out_path(tmp_path)
+    with river.Sandbox(rootfs=str(root)) as sandbox:
+        status = sandbox.exec(
+            SH,
+            args=["-c",
+                  # dash builtins only: the minimal rootfs ships no coreutils
+                  "echo /*; "
+                  "echo x > /nope 2>/dev/null && echo root-writable || echo root-ro; "
+                  "echo ok > /workspace/w.txt && echo workspace-writable"],
+            stdout_file=out,
+        )
+        assert status.status == "AC"
+        lines = Path(out).read_text().splitlines()
+        # Only the rootfs content plus mount points: no host dirs merged.
+        assert set(lines[0].split()) == {"/bin", "/dev", "/etc", "/lib", "/lib64",
+                                         "/proc", "/runtime", "/usr", "/workspace"}
+        assert lines[1] == "root-ro"  # the overlay is frozen read-only
+        assert lines[2] == "workspace-writable"
+
+
+def test_rootfs_caller_tree_unchanged(tmp_path):
+    root = make_rootfs(tmp_path)
+    before = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+    with river.Sandbox(rootfs=str(root)) as sandbox:
+        status = sandbox.exec(SH, args=["-c", "true"])
+        assert status.status == "AC"
+    # The writable upper layer lives on a private tmpfs, never in the tree.
+    after = sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+    assert after == before
+
+
+def test_rootfs_runtimes_compose(tmp_path, runtime):
+    root = make_rootfs(tmp_path)
+    out = out_path(tmp_path)
+    with river.Sandbox(rootfs=str(root), runtimes=[str(runtime)]) as sandbox:
+        status = sandbox.exec(
+            SH,
+            args=["-c", "read -r l < /runtime/rt-one/data.txt; echo \"$l\""],
+            stdout_file=out,
+        )
+        assert status.status == "AC"
+        assert Path(out).read_text() == "runtime-data\n"
 
 
 # --- environment -------------------------------------------------------------

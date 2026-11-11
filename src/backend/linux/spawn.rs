@@ -60,6 +60,8 @@ pub(crate) struct ChildSpec {
     pub workdir: CString,
     /// Host runtime directories to expose read-only at `/runtime/<name>`.
     pub runtimes: Vec<CString>,
+    /// Host directory used as the sandbox root via overlayfs, if any.
+    pub rootfs: Option<CString>,
     /// Inheritable fds for stdin/stdout/stderr; `None` keeps the parent's.
     pub stdio: [Option<OwnedFd>; 3],
     /// Directory fd of the cgroup the child is born into (limits must
@@ -172,7 +174,7 @@ pub(crate) fn stage_name(stage: u32) -> &'static str {
 
 fn child_setup(spec: &ChildSpec, stage: &mut u32) -> Result<(), i32> {
     *stage = 1;
-    rootfs::setup_and_pivot(&spec.workdir, &spec.runtimes, stage)?;
+    rootfs::setup_and_pivot(&spec.workdir, &spec.runtimes, spec.rootfs.as_deref(), stage)?;
     for (slot, fd) in spec.stdio.iter().enumerate() {
         if let Some(fd) = fd {
             let raw = fd.as_fd().as_raw_fd();

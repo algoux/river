@@ -59,13 +59,28 @@ impl Linux {
 }
 
 impl Backend for Linux {
-    /// `rootfs` (a caller-supplied container root) is planned as a later
-    /// milestone: it needs an overlay to keep the caller tree read-only.
+    /// `rootfs` is a caller-supplied, self-contained root directory mounted
+    /// via overlayfs (the caller tree stays read-only). Path constraints
+    /// come from the overlay option string (`,` and `:` are separators).
     fn validate_new(&self, rootfs: Option<&Path>, _runtimes: &[PathBuf]) -> PyResult<()> {
-        if rootfs.is_some() {
+        let Some(rootfs) = rootfs else {
+            return Ok(());
+        };
+        if !rootfs.is_absolute() || rootfs == Path::new("/") {
             return Err(PyValueError::new_err(
-                "rootfs is not supported on Linux yet; use runtimes=[...] to expose \
-                 read-only runtime directories instead",
+                "rootfs must be an absolute path other than /",
+            ));
+        }
+        if !rootfs.is_dir() {
+            return Err(PyValueError::new_err(format!(
+                "rootfs {} is not a directory",
+                rootfs.display()
+            )));
+        }
+        let text = rootfs.to_string_lossy();
+        if text.contains(',') || text.contains(':') {
+            return Err(PyValueError::new_err(
+                "rootfs path must not contain ',' or ':' (overlayfs option separators)",
             ));
         }
         Ok(())
@@ -123,7 +138,7 @@ impl Backend for Linux {
 
     fn exec(
         &self,
-        _rootfs: Option<&Path>,
+        rootfs: Option<&Path>,
         runtimes: &[PathBuf],
         mut spec: RunSpec,
         workdir: Option<&Path>,
@@ -155,10 +170,10 @@ impl Backend for Linux {
                     .map_err(|error| PyOSError::new_err(format!("copy_in failed: {error}")))?;
             }
 
-            let environment = build_environment(spec.envs.as_ref(), workdir)?;
+            let environment = build_environment(spec.envs.as_ref(), workdir, rootfs.is_some())?;
             let cwd = container_cwd(spec.cwd.as_deref(), workdir)?;
 
-            run(&spec, workdir, runtimes, &environment, &cwd, &mut session)
+            run(&spec, workdir, runtimes, rootfs, &environment, &cwd, &mut session)
                 .map_err(|error| os_error("sandbox run failed", error))
         })();
 
@@ -190,12 +205,13 @@ fn run(
     spec: &RunSpec,
     workdir: &Path,
     runtimes: &[PathBuf],
+    rootfs: Option<&Path>,
     environment: &[(String, String)],
     cwd: &str,
     session: &mut Session,
 ) -> io::Result<Status> {
     let run_group = session.run_group(spec.cpu_time_limit_ms, spec.memory_limit_bytes)?;
-    let raw = match supervise(spec, workdir, runtimes, environment, cwd, &run_group) {
+    let raw = match supervise(spec, workdir, runtimes, rootfs, environment, cwd, &run_group) {
         Ok(raw) => raw,
         Err(error) => {
             // The group may still hold processes; kill and drop it before
@@ -247,6 +263,7 @@ fn supervise(
     spec: &RunSpec,
     workdir: &Path,
     runtimes: &[PathBuf],
+    rootfs: Option<&Path>,
     environment: &[(String, String)],
     cwd: &str,
     run_group: &cgroup::RunGroup,
@@ -291,6 +308,7 @@ fn supervise(
             .iter()
             .map(|runtime| cstring(runtime))
             .collect::<Result<Vec<_>, _>>()?,
+        rootfs: rootfs.map(cstring).transpose()?,
         stdio,
         cgroup: Some(cgroup_fd(run_group.path())?),
         seccomp: seccomp_program,
@@ -492,12 +510,24 @@ fn container_cwd(cwd: Option<&str>, workdir: &Path) -> PyResult<String> {
     }
 }
 
-/// The child environment: the host variables plus `TMPDIR`/`TEMP`/`TMP`
-/// pointing into the writable scratch, with caller `envs` last (case
-/// sensitive, as POSIX environments are).
+/// The base environment for a rootfs run: the host environment is not
+/// passed (its PATH points at directories the rootfs does not have, and it
+/// can carry secrets). Caller `envs` can extend it.
+const ROOTFS_ENV_BASE: &[(&str, &str)] = &[
+    ("PATH", "/usr/bin:/bin:/usr/local/bin"),
+    ("HOME", "/workspace/tmp"),
+    ("LANG", "C.UTF-8"),
+];
+
+/// The child environment. Default mode passes the host variables (the
+/// host system dirs are merged read-only, so they resolve); a rootfs run
+/// starts from [`ROOTFS_ENV_BASE`]. Either way `TMPDIR`/`TEMP`/`TMP` point
+/// into the writable scratch, and caller `envs` come last (case sensitive,
+/// as POSIX environments are).
 fn build_environment(
     overrides: Option<&HashMap<String, String>>,
     workdir: &Path,
+    rootfs_mode: bool,
 ) -> PyResult<Vec<(String, String)>> {
     let temp = workdir.join("tmp");
     std::fs::create_dir_all(&temp).map_err(|error| {
@@ -508,14 +538,21 @@ fn build_environment(
     })?;
     let temp = format!("{CONTAINER_WORKDIR}/tmp");
 
-    let mut variables: Vec<(String, String)> = std::env::vars_os()
-        .map(|(key, value)| {
-            (
-                key.to_string_lossy().into_owned(),
-                value.to_string_lossy().into_owned(),
-            )
-        })
-        .collect();
+    let mut variables: Vec<(String, String)> = if rootfs_mode {
+        ROOTFS_ENV_BASE
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    } else {
+        std::env::vars_os()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.to_string_lossy().into_owned(),
+                )
+            })
+            .collect()
+    };
     for name in ["TMPDIR", "TEMP", "TMP"] {
         set_environment(&mut variables, name, temp.clone());
     }
