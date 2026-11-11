@@ -253,6 +253,22 @@ def test_copy_out_limit(session, tmp_path):
     assert not destination.exists()
 
 
+def test_copy_out_skips_planted_symlinks(session, tmp_path):
+    # A symlink planted in the workdir names a HOST path once the judger
+    # resolves it; following it would read host files through copy_out.
+    host_leak = tmp_path / "leak"
+    host_dir = tmp_path / "products"
+    status = session.exec(
+        SH,
+        args=["-c", "ln -s /etc/passwd f; mkdir d; ln -s /etc/passwd d/leak; echo real > d/ok"],
+        copy_out={"f": str(host_leak), "d": str(host_dir)},
+    )
+    assert status.status == "AC"
+    assert not host_leak.exists()  # top-level symlink skipped
+    assert not (host_dir / "leak").exists()  # deep symlink skipped
+    assert (host_dir / "ok").read_text() == "real\n"
+
+
 def test_copy_in_rejects_escape(session, tmp_path):
     source = tmp_path / "f.txt"
     source.write_text("x")
@@ -566,6 +582,55 @@ def test_host_root_unreachable(session, tmp_path):
     assert status.status == "AC"
     lines = Path(out).read_text().splitlines()
     assert lines[0] == "isolated"
+
+
+def test_dev_shm_and_minimal_dev(session, tmp_path):
+    # /dev/shm for python multiprocessing / numpy, and a /dev that holds
+    # nothing but the four bound-in character devices plus shm.
+    out = out_path(tmp_path)
+    status = session.exec(
+        SH,
+        args=["-c", "echo /dev/*; "
+                    "echo hi > /dev/shm/f && read -r l < /dev/shm/f && echo $l"],
+        stdout_file=out,
+    )
+    assert status.status == "AC"
+    lines = Path(out).read_text().splitlines()
+    assert set(lines[0].split()) == {"/dev/null", "/dev/random", "/dev/shm",
+                                     "/dev/urandom", "/dev/zero"}
+    assert lines[1] == "hi"
+
+
+@pytest.mark.skipif(not has_python(), reason="needs python3 in the sandbox")
+def test_device_nodes_unusable(session, tmp_path):
+    # The payload runs as root, so mknod itself succeeds — but every
+    # writable mount is nodev, so opening the node is impossible: no raw
+    # host disk through /workspace.
+    status = session.exec(
+        PYTHON,
+        args=["-c", "import os, stat\n"
+                    "os.mknod('/workspace/d', 0o600 | stat.S_IFBLK, os.makedev(8, 0))\n"
+                    "os.open('/workspace/d', os.O_RDONLY)\n"],
+    )
+    assert status.status == "RE"  # the open, not the mknod, is what fails
+
+
+@pytest.mark.skipif(not has_python(), reason="needs python3 in the sandbox")
+def test_zombie_grandchild_reaped(session, tmp_path):
+    # A grandchild that exits unreaped by its parent (the PID-ns init of
+    # the run) must not block the verdict, the reaping or the cgroup
+    # teardown.
+    status = session.exec(
+        PYTHON,
+        args=["-c", "import os, sys, time\n"
+                    "pid = os.fork()\n"
+                    "if pid == 0:\n"
+                    "    sys.exit(0)\n"
+                    "time.sleep(0.3)\n"
+                    "sys.exit(0)\n"],
+    )
+    assert status.status == "AC"
+    assert status.exit_code == 0
 
 
 def test_seccomp_blocks_mount(session, tmp_path):

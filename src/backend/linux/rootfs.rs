@@ -215,13 +215,18 @@ pub(super) fn setup_and_pivot(
     // backing tmpfs (workdir/ovl) into /workspace and hand the child the
     // writable upper layer. The workdir is river's own scratch directory
     // and holds no mounts the sandbox needs.
+    // nodev/nosuid need the second remount step (a bind alone cannot apply
+    // them): without nodev the payload, running as root, could mknod a disk
+    // device node here and open the host's raw disk.
+    let workspace = join(&root, "workspace");
+    phased!(14, mount(Some(workdir), &workspace, None, MS_BIND, None));
     phased!(
         14,
         mount(
-            Some(workdir),
-            &join(&root, "workspace"),
             None,
-            MS_BIND,
+            &workspace,
+            None,
+            MS_BIND | MS_REMOUNT | MS_NODEV | MS_NOSUID,
             None,
         )
     );
@@ -249,6 +254,23 @@ pub(super) fn setup_and_pivot(
         let source = join_bytes(b"/dev/", device.as_bytes())?;
         mount(Some(&source), &target, None, MS_BIND, None)?;
     }
+
+    // Shared memory (python multiprocessing, numpy). mode=1777 like the
+    // host; no size cap on purpose — tmpfs pages land in the cgroup memory
+    // counter, so memory.max stays the single limit and an overshoot keeps
+    // the MLE verdict instead of turning into an ENOSPC runtime error.
+    let shm = join(&root, "dev/shm");
+    phased!(35, mkdir_ok(&shm));
+    phased!(
+        35,
+        mount(
+            Some(c"tmpfs"),
+            &shm,
+            Some(c"tmpfs"),
+            MS_NOSUID | MS_NODEV,
+            Some(c"mode=1777"),
+        )
+    );
 
     // Read-only host system dirs, default mode only. `/bin`, `/sbin`,
     // `/lib` and `/lib64` are often symlinks into `/usr` on modern distros;
@@ -338,6 +360,7 @@ pub(super) fn stage_name(stage: u32) -> &'static str {
         32 => "mount rootfs overlay",
         33 => "freeze rootfs read-only",
         34 => "mount squashfs image",
+        35 => "mount /dev/shm",
         _ => "sandbox setup",
     }
 }
