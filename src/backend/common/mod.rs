@@ -10,6 +10,7 @@ mod sandbox;
 
 pub use sandbox::Sandbox;
 
+pub(crate) mod copy;
 pub(crate) use paths::{resolve_cwd, validate_copy_in, validate_copy_out};
 
 use std::path::{Path, PathBuf};
