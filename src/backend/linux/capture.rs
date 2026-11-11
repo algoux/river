@@ -29,6 +29,8 @@ struct Stream {
     limit: Option<u64>,
     total: u64,
     exceeded: bool,
+    /// Set when the pipe hit EOF (every writer is gone).
+    eof: bool,
 }
 
 impl Capture {
@@ -67,6 +69,7 @@ impl Capture {
                     limit: Some(limit),
                     total: 0,
                     exceeded: false,
+                    eof: false,
                 });
                 writers[index] = Some(writer);
             } else {
@@ -85,13 +88,34 @@ impl Capture {
                 limit: None,
                 total: 0,
                 exceeded: false,
+                eof: true,
             })),
         };
         Ok((capture, [stdin, writers[0].take(), writers[1].take()]))
     }
 
-    /// Drains every limited stream once. Returns `true` when a stream has
-    /// passed its limit (a kill threshold; exactly the limit is legal).
+    /// The pipe read end of stream `index` (0 = stdout, 1 = stderr), for
+    /// epoll registration.
+    pub(super) fn reader(&self, index: usize) -> Option<&OwnedFd> {
+        self.streams[index].reader.as_ref()
+    }
+
+    /// Drains stream `index` once. Returns `true` when it has passed its
+    /// limit (a kill threshold; exactly the limit is legal).
+    pub(super) fn drain_one(&mut self, index: usize) -> bool {
+        match self.streams.get_mut(index) {
+            Some(stream) => drain(stream),
+            None => false,
+        }
+    }
+
+    /// True when the stream's pipe hit EOF; the caller deregisters it from
+    /// epoll so a level-triggered EOF stops waking the loop.
+    pub(super) fn at_eof(&self, index: usize) -> bool {
+        self.streams[index].eof
+    }
+
+    /// Drains every limited stream once (final flush after the child exit).
     pub(super) fn poll(&mut self) -> bool {
         for stream in &mut self.streams {
             if stream.reader.is_none() {
@@ -152,6 +176,7 @@ fn drain(stream: &mut Stream) -> bool {
             return stream.exceeded;
         }
         if moved == 0 {
+            stream.eof = true;
             return stream.exceeded;
         }
         stream.total = stream.total.saturating_add(moved as u64);
@@ -166,6 +191,18 @@ fn pipe_nonblocking() -> io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0 as std::os::raw::c_int; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+    // The child's write end must block when the pipe is full (an EAGAIN
+    // there would abort the payload); only the supervisor's read end stays
+    // non-blocking. O_NONBLOCK lives on each end's open file description,
+    // so clearing it on the writer leaves the reader untouched.
+    if unsafe { libc::fcntl(fds[1], libc::F_SETFL, 0) } != 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(error);
     }
     // SAFETY: fresh fds from pipe2, owned from here on.
     unsafe {

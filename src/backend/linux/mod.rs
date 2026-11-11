@@ -34,10 +34,6 @@ use self::spawn::ChildSpec;
 /// Where the session workdir lives inside the sandbox.
 const CONTAINER_WORKDIR: &str = "/workspace";
 
-/// Supervisor loop tick: how often the output pipes are drained and the
-/// wall clock is checked.
-const POLL_INTERVAL: Duration = Duration::from_millis(5);
-
 /// The Linux backend. The cgroup session directory is owned by the sandbox
 /// session: `__enter__` creates it, every run gets a child group, `__exit__`
 /// kills leftovers and removes the tree.
@@ -220,9 +216,10 @@ struct RawOutcome {
     output_limit_hit: bool,
 }
 
-/// Spawns the child into the run group, then supervises: drains the limited
-/// output pipes, enforces the wall clock, and kills over the pidfd when a
-/// threshold is crossed.
+/// Supervises the run: an epoll set holds the pidfd (readable when the
+/// child dies) and the limited output pipes, so the loop wakes on real
+/// events instead of a timer. The wall clock is the epoll timeout: on
+/// expiry the run is killed over the pidfd.
 fn supervise(
     spec: &RunSpec,
     workdir: &Path,
@@ -230,6 +227,10 @@ fn supervise(
     cwd: &str,
     run_group: &cgroup::RunGroup,
 ) -> io::Result<RawOutcome> {
+    use rustix::event::epoll::{self, CreateFlags, EventData, EventFlags, EventVec};
+
+    const EVENT_PIDFD: u64 = 2;
+
     let (mut capture, stdio) = capture::Capture::new(
         spec.stdin_file.as_deref(),
         spec.stdout_file.as_deref(),
@@ -268,19 +269,68 @@ fn supervise(
         return Err(error);
     }
 
+    let poller = epoll::create(CreateFlags::CLOEXEC)?;
+    for index in 0..2 {
+        if let Some(reader) = capture.reader(index) {
+            epoll::add(
+                &poller,
+                reader,
+                EventData::new_u64(index as u64),
+                EventFlags::IN,
+            )?;
+        }
+    }
+    epoll::add(
+        &poller,
+        child.pidfd.as_fd(),
+        EventData::new_u64(EVENT_PIDFD),
+        EventFlags::IN,
+    )?;
+
     let deadline = spec
         .wall_time_limit_ms
         .map(|limit| started + Duration::from_millis(limit));
     let mut killed = false;
     let mut timed_out = false;
     let mut output_limit_hit = false;
+    let mut events = EventVec::with_capacity(3);
 
-    let wait = loop {
-        if capture.poll() && !killed {
-            output_limit_hit = true;
-            killed = true;
-            let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
+    let wait = 'run: loop {
+        let timeout = match deadline {
+            // Block until the wall deadline; the +1ms rounds the sub-ms
+            // remainder up so we never wake a hair early and miss the kill.
+            Some(deadline) => (deadline.saturating_duration_since(Instant::now())
+                + Duration::from_millis(1))
+            .as_millis()
+            .min(i32::MAX as u128) as i32,
+            None => -1,
+        };
+        epoll::wait(&poller, &mut events, timeout)?;
+
+        for event in &events {
+            if event.data.u64() == EVENT_PIDFD {
+                if let Ok(Some(wait)) = waitid(
+                    WaitId::PidFd(child.pidfd.as_fd()),
+                    WaitidOptions::NOHANG | WaitidOptions::EXITED,
+                ) {
+                    break 'run wait;
+                }
+                continue;
+            }
+            let index = event.data.u64() as usize;
+            if capture.drain_one(index) && !killed {
+                output_limit_hit = true;
+                killed = true;
+                let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
+            }
+            if capture.at_eof(index) {
+                // Level-triggered EOF would wake the loop forever.
+                if let Some(reader) = capture.reader(index) {
+                    let _ = epoll::delete(&poller, reader);
+                }
+            }
         }
+
         if !killed
             && let Some(deadline) = deadline
             && Instant::now() >= deadline
@@ -289,13 +339,6 @@ fn supervise(
             killed = true;
             let _ = pidfd_send_signal(child.pidfd.as_fd(), Signal::Kill);
         }
-        if let Ok(Some(wait)) = waitid(
-            WaitId::PidFd(child.pidfd.as_fd()),
-            WaitidOptions::NOHANG | WaitidOptions::EXITED,
-        ) {
-            break wait;
-        }
-        std::thread::sleep(POLL_INTERVAL);
     };
     // Final drain: the last chunk between the exit and this point still
     // counts against the limits.
