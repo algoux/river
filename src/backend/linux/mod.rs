@@ -8,6 +8,7 @@
 mod capture;
 mod cgroup;
 mod rootfs;
+mod seccomp;
 mod spawn;
 
 use std::collections::HashMap;
@@ -239,6 +240,14 @@ fn supervise(
         spec.stderr_limit_bytes,
     )?;
 
+    // Compiled before the fork point: the child only applies it.
+    let seccomp_program = seccomp::build_filter().map_err(|errno| {
+        io::Error::other(format!(
+            "failed to compile the seccomp filter: {} (os error {errno})",
+            io::Error::from_raw_os_error(errno)
+        ))
+    })?;
+
     let child_spec = ChildSpec {
         executable: cstring(&spec.executable)?,
         args: spec
@@ -258,6 +267,7 @@ fn supervise(
         runtimes: vec![], // runtime grants land with the rootfs milestone
         stdio,
         cgroup: Some(cgroup_fd(run_group.path())?),
+        seccomp: seccomp_program,
     };
 
     let child = spawn::spawn(child_spec)?;

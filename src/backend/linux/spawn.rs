@@ -17,6 +17,7 @@ use rustix::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use rustix::pipe::{PipeFlags, pipe_with};
 
 use super::rootfs;
+use super::seccomp;
 
 const CLONE_NEWNS: u64 = 0x0002_0000;
 const CLONE_NEWUTS: u64 = 0x0400_0000;
@@ -64,6 +65,9 @@ pub(crate) struct ChildSpec {
     /// Directory fd of the cgroup the child is born into (limits must
     /// already be applied to it), if any.
     pub cgroup: Option<OwnedFd>,
+    /// Pre-compiled seccomp program (built before the fork point: the child
+    /// must not allocate through the Python-embedding heap).
+    pub seccomp: seccompiler::BpfProgram,
 }
 
 /// A started sandbox child: the pidfd to wait on and the read end of the
@@ -140,6 +144,14 @@ fn child(spec: ChildSpec, status_w: OwnedFd) -> ! {
         unsafe { libc::_exit(126) };
     }
 
+    // seccomp last: the rootfs setup above needs mount/pivot_root, which
+    // the filter denies.
+    stage = 5;
+    if let Err(errno) = seccomp::apply(&spec.seccomp) {
+        report(&status_w, errno, stage);
+        unsafe { libc::_exit(126) };
+    }
+
     // No "0" report here: a successful execve closes the CLOEXEC pipe and
     // the parent reads EOF; only a failed execve reports (below).
     let err = exec_payload(&spec);
@@ -152,8 +164,8 @@ pub(crate) fn stage_name(stage: u32) -> &'static str {
     match stage {
         0 | 1 => "sandbox setup",
         2 => "chdir into the sandbox cwd",
-        3 => "start",
         4 => "execve",
+        5 => "seccomp",
         other => rootfs::stage_name(other),
     }
 }
