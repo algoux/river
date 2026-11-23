@@ -4,10 +4,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use pyo3::exceptions::{PyNotImplementedError, PyRuntimeError};
+use pyo3::exceptions::{PyKeyboardInterrupt, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyTuple};
+use pyo3::types::{PyBytes, PyDict};
 
+use crate::exec::{self, CopyInValue, ExecFailure, ExecParams};
 use crate::preflight;
 
 pyo3::create_exception!(
@@ -54,8 +55,7 @@ pyo3::create_exception!(
 #[pyclass(frozen, module = "river")]
 pub struct River {
     rootfs: PathBuf,
-    /// `envs` from `<rootfs>/meta.json`, consumed by `exec()`.
-    #[allow(dead_code)]
+    /// `envs` from `<rootfs>/meta.json`, consumed by `exec()` (design.md §4.1).
     envs: Option<HashMap<String, String>>,
 }
 
@@ -90,14 +90,277 @@ impl River {
         false
     }
 
-    /// Not implemented yet; the signature is documented in `river/_river.pyi`
-    /// and `docs/example.py`.
-    #[pyo3(signature = (*args, **kwargs))]
-    #[allow(unused_variables)]
-    fn exec(&self, args: &Bound<'_, PyTuple>, kwargs: Option<&Bound<'_, PyAny>>) -> PyResult<ExecResult> {
-        Err(PyNotImplementedError::new_err(
-            "River.exec() is not implemented yet",
-        ))
+    /// Executes `executable` inside the sandbox (design.md §4). The sandbox
+    /// child is pid 1 of a fresh pid namespace; every end state lands in the
+    /// returned `ExecResult`, only setup failures raise.
+    #[pyo3(signature = (
+        executable,
+        args = None,
+        *,
+        cwd = None,
+        envs = None,
+        cpu_time_limit_ms = None,
+        wall_time_limit_ms = None,
+        memory_limit_bytes = None,
+        stdout_limit_bytes = None,
+        stderr_limit_bytes = None,
+        copy_in = None,
+        copy_out = None,
+        copy_out_limit_bytes = None,
+        stdin_file = None,
+        stdin = None,
+        stdout_file = None,
+        stderr_file = None,
+        proc_limit = None,
+        open_file_limit = None,
+        stack_limit_bytes = None,
+        address_space_limit_bytes = None,
+    ))]
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn exec(
+        &self,
+        py: Python<'_>,
+        executable: Py<PyAny>,
+        args: Option<Vec<String>>,
+        cwd: Option<String>,
+        envs: Option<Py<PyAny>>,
+        cpu_time_limit_ms: Option<u64>,
+        wall_time_limit_ms: Option<u64>,
+        memory_limit_bytes: Option<u64>,
+        stdout_limit_bytes: Option<u64>,
+        stderr_limit_bytes: Option<u64>,
+        copy_in: Option<Py<PyAny>>,
+        copy_out: Option<Py<PyAny>>,
+        copy_out_limit_bytes: Option<u64>,
+        stdin_file: Option<String>,
+        stdin: Option<Py<PyBytes>>,
+        stdout_file: Option<String>,
+        stderr_file: Option<String>,
+        proc_limit: Option<u64>,
+        open_file_limit: Option<u64>,
+        stack_limit_bytes: Option<u64>,
+        address_space_limit_bytes: Option<u64>,
+    ) -> PyResult<ExecResult> {
+        // ------------------------------------------------- extract & validate
+        let executable = str_or_path(py, executable)?;
+        let args = args.unwrap_or_default();
+        let cwd = cwd.unwrap_or_else(|| "/work".to_string());
+        let envs = match envs {
+            Some(value) => extract_envs(py, value)?,
+            None => self.envs.clone().ok_or_else(|| {
+                RootfsError::new_err(format!(
+                    "envs is None but the rootfs {} has no meta.json providing envs",
+                    self.rootfs.display()
+                ))
+            })?,
+        };
+        let stdin_data = stdin.map(|b| b.bind(py).as_bytes().to_vec());
+        if stdin_data.is_some() && stdin_file.is_some() {
+            return Err(PyValueError::new_err(
+                "stdin and stdin_file are mutually exclusive",
+            ));
+        }
+        if !cwd.starts_with('/') {
+            return Err(PyValueError::new_err(format!(
+                "cwd {cwd:?} must be an absolute sandbox path"
+            )));
+        }
+        if executable.is_empty() {
+            return Err(PyValueError::new_err("executable must not be empty"));
+        }
+        if !executable.contains('/') && !envs.contains_key("PATH") {
+            return Err(PyValueError::new_err(
+                "executable without '/' requires envs['PATH'] so the sandbox can find it",
+            ));
+        }
+        let copy_in = match copy_in {
+            None => Vec::new(),
+            Some(value) => extract_copy_in(py, value)?,
+        };
+        let copy_out = match copy_out {
+            None => Vec::new(),
+            Some(value) => extract_copy_out(py, value)?,
+        };
+        // design.md §10: keys normalize strictly below /work.
+        for (key, _) in &copy_in {
+            exec::io::sandbox_path(key, &cwd).map_err(RootfsError::new_err)?;
+        }
+        for (key, _) in &copy_out {
+            exec::io::sandbox_path(key, &cwd).map_err(RootfsError::new_err)?;
+        }
+
+        // cpu_time_limit_ms .. address_space_limit_bytes are accepted and
+        // validated here, and enforced from PR 3 on (development-plan.md §4).
+
+        let params = ExecParams {
+            executable,
+            args,
+            cwd,
+            envs,
+            stdin: stdin_data,
+            stdin_file,
+            stdout_file,
+            stderr_file,
+            stdout_limit_bytes,
+            stderr_limit_bytes,
+            copy_in,
+            copy_out,
+            copy_out_limit_bytes,
+        };
+
+        // ------------------------------------------------------- run, GIL-free
+        let outcome = py
+            .detach(|| exec::run(&self.rootfs, &params))
+            .map(|outcome| build_result(py, outcome))
+            .map_err(|failure| failure_to_err(py, failure))?;
+        Ok(outcome)
+    }
+}
+
+/// `str | os.PathLike` → `String` (design.md §4).
+fn str_or_path(py: Python<'_>, value: Py<PyAny>) -> PyResult<String> {
+    let bound = value.bind(py);
+    if let Ok(text) = bound.extract::<String>() {
+        return Ok(text);
+    }
+    if is_pathlike(py, bound)? {
+        fspath(py, bound)
+    } else {
+        Err(PyTypeError::new_err(format!(
+            "expected str or os.PathLike, got {}",
+            bound.get_type().name()?
+        )))
+    }
+}
+
+fn is_pathlike(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let os = py.import("os")?;
+    let pathlike = os.getattr("PathLike")?;
+    let builtins = py.import("builtins")?;
+    let isinstance = builtins.getattr("isinstance")?;
+    isinstance.call1((value, pathlike))?.extract()
+}
+
+fn fspath(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    let os = py.import("os")?;
+    let resolved = os.getattr("fspath")?.call1((value,))?;
+    resolved.extract::<String>().map_err(|_| {
+        PyTypeError::new_err("paths must be str, not bytes")
+    })
+}
+
+/// `Mapping[str, str]` → `HashMap<String, String>` (passed `envs`).
+fn extract_envs(py: Python<'_>, value: Py<PyAny>) -> PyResult<HashMap<String, String>> {
+    let bound = value.bind(py);
+    let items = bound.call_method0("items")?;
+    let mut out = HashMap::new();
+    for pair in items.try_iter()? {
+        let (key, value): (String, String) = pair?.extract()?;
+        out.insert(key, value);
+    }
+    Ok(out)
+}
+
+/// `Mapping[str, bytes | str | os.PathLike]` → copy_in entries (design.md §10).
+fn extract_copy_in(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, CopyInValue)>> {
+    let bound = value.bind(py);
+    let items = bound.call_method0("items")?;
+    let mut out = Vec::new();
+    for pair in items.try_iter()? {
+        let (key, item): (String, Py<PyAny>) = pair?.extract()?;
+        let item = item.bind(py);
+        let entry = if let Ok(bytes) = item.cast::<PyBytes>() {
+            CopyInValue::Bytes(bytes.as_bytes().to_vec())
+        } else if let Ok(text) = item.extract::<String>() {
+            CopyInValue::Bytes(text.into_bytes())
+        } else if is_pathlike(py, item)? {
+            CopyInValue::HostFile(PathBuf::from(fspath(py, item)?))
+        } else {
+            return Err(PyTypeError::new_err(format!(
+                "copy_in values must be bytes, str or os.PathLike, got {}",
+                item.get_type().name()?
+            )));
+        };
+        out.push((key, entry));
+    }
+    Ok(out)
+}
+
+/// `Mapping[str, None | os.PathLike]` → copy_out entries (design.md §10).
+fn extract_copy_out(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, Option<String>)>> {
+    let bound = value.bind(py);
+    let items = bound.call_method0("items")?;
+    let mut out = Vec::new();
+    for pair in items.try_iter()? {
+        let (key, item): (String, Py<PyAny>) = pair?.extract()?;
+        let item = item.bind(py);
+        let dest = if item.is_none() {
+            None
+        } else if is_pathlike(py, item)? {
+            Some(fspath(py, item)?)
+        } else {
+            return Err(PyTypeError::new_err(format!(
+                "copy_out values must be None or os.PathLike, got {}",
+                item.get_type().name()?
+            )));
+        };
+        out.push((key, dest));
+    }
+    Ok(out)
+}
+
+/// `ExecFailure` → the Python exception it represents (design.md §4).
+fn failure_to_err(py: Python<'_>, failure: ExecFailure) -> PyErr {
+    match failure {
+        ExecFailure::BadParams(msg) => PyValueError::new_err(msg),
+        ExecFailure::Rootfs(msg) => RootfsError::new_err(msg),
+        ExecFailure::Host(msg) => RiverError::new_err(msg),
+        ExecFailure::Setup { step, errno, context } => {
+            // ExecSetupError carries the step name and the errno text
+            // (design.md §4).
+            let errno_text = if errno == 0 {
+                String::new()
+            } else {
+                format!(": {}", std::io::Error::from_raw_os_error(errno))
+            };
+            let msg = if context.is_empty() {
+                format!("{step}{errno_text}")
+            } else {
+                format!("{step}: {context}{errno_text}")
+            };
+            ExecSetupError::new_err(msg)
+        }
+        ExecFailure::CopyOut { key, reason } => {
+            CopyOutError::new_err(format!("copy_out {key:?}: {reason}"))
+        }
+        ExecFailure::Interrupted => {
+            // The child is already killed and reaped; surface the pending
+            // signal now that the GIL is back (design.md §4).
+            match py.check_signals() {
+                Err(err) => err,
+                Ok(()) => PyKeyboardInterrupt::new_err("river.exec() was interrupted"),
+            }
+        }
+    }
+}
+
+/// `Outcome` (plain Rust) → `ExecResult`.
+fn build_result(py: Python<'_>, outcome: exec::Outcome) -> ExecResult {
+    let files = PyDict::new(py);
+    for (key, data) in outcome.files {
+        let _ = files.set_item(key, PyBytes::new(py, &data));
+    }
+    ExecResult {
+        status: outcome.status,
+        exit_code: outcome.exit_code,
+        signal: outcome.signal,
+        cpu_time_used_ms: outcome.cpu_time_used_ms,
+        wall_time_used_ms: outcome.wall_time_used_ms,
+        memory_used_bytes: outcome.memory_used_bytes,
+        stdout: outcome.stdout.map(|data| PyBytes::new(py, &data).unbind()),
+        stderr: outcome.stderr.map(|data| PyBytes::new(py, &data).unbind()),
+        files: files.unbind(),
+        error: outcome.error,
     }
 }
 

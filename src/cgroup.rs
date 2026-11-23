@@ -109,6 +109,30 @@ fn write_file(path: &Path, data: String) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e} (not delegated to this user)", path.display()))
 }
 
+/// Best-effort run metrics: `(cpu_time_used_ms, memory_used_bytes)` from
+/// `cpu.stat` / `memory.peak`. PR 2 reads the process's `river/` cgroup, so
+/// the numbers include the caller itself and every sandbox so far; PR 3
+/// switches to the per-run cgroup. Unreadable values are reported as 0.
+pub fn read_metrics() -> (u64, u64) {
+    let Ok(base) = singleton() else {
+        return (0, 0);
+    };
+    let cpu = read_trim(&base.river.join("cpu.stat"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|usec| usec.parse::<u64>().ok())
+        })
+        .map_or(0, |usec| usec.div_ceil(1000));
+    let memory = read_trim(&base.river.join("memory.peak"))
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    (cpu, memory)
+}
+
 fn current_cgroup() -> Result<PathBuf, String> {
     let text = fs::read_to_string("/proc/self/cgroup")
         .map_err(|e| format!("cannot read /proc/self/cgroup: {e}"))?;

@@ -308,7 +308,7 @@ fn euid() -> u32 {
 fn check_landlock_abi() -> Check {
     // Informational only: a kernel without Landlock just runs without the
     // filesystem hardening layer (design.md §9).
-    let detail = match landlock_abi() {
+    let detail = match crate::exec::landlock::probe_abi() {
         Ok(abi) => format!("Landlock ABI v{abi}"),
         Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
             "Landlock is not available on this kernel (ENOSYS); filesystem hardening will be disabled"
@@ -317,26 +317,6 @@ fn check_landlock_abi() -> Check {
         Err(e) => format!("Landlock ABI probe failed: {e}"),
     };
     ok("landlock_abi", detail)
-}
-
-/// `landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`.
-fn landlock_abi() -> io::Result<u32> {
-    // LANDLOCK_CREATE_RULESET_VERSION from <linux/landlock.h>; libc does not export it.
-    const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
-    // SAFETY: plain syscall; the only pointer argument is NULL.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            std::ptr::null::<libc::c_void>(),
-            0usize,
-            LANDLOCK_CREATE_RULESET_VERSION,
-        )
-    };
-    if r < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(r as u32)
-    }
 }
 
 // ------------------------------------------------------------------ rootfs

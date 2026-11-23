@@ -3,6 +3,7 @@
 
 mod api;
 mod cgroup;
+mod exec;
 mod preflight;
 
 use pyo3::prelude::*;

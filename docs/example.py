@@ -19,7 +19,7 @@ with River("/rootfs/python") as river:
         memory_limit_bytes=256 * 1024,
         stdout_limit_bytes=64 * 1024,
         stderr_limit_bytes=64 * 1024,
-        copy_in={},
+        copy_in={"input.txt": "1 2 3\n"},
         copy_out={},
         copy_out_limit_bytes=64 * 1024,
         stdin_file="input.txt",

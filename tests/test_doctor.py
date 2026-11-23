@@ -239,11 +239,6 @@ class TestRiverInit:
             with pytest.raises(RootfsError, match="meta.json"):
                 River(tmp_path)
 
-    def test_exec_is_not_implemented_yet(self, tmp_path):
-        with River(tmp_path) as r:
-            with pytest.raises(NotImplementedError):
-                r.exec("python")
-
     def test_real_rootfs(self):
         rootfs = os.environ.get("RIVER_TEST_ROOTFS")
         if not rootfs:
