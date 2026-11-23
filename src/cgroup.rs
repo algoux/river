@@ -1,10 +1,13 @@
-//! cgroup v2: delegation detection and the per-process `river/` singleton
-//! (design.md §7, steps 1–5). Per-run cgroups are added in a later PR.
+//! cgroup v2: delegation detection, the per-process `river/` singleton
+//! (design.md §7, steps 1–5) and the per-run cgroups (design.md §3 step 2,
+//! §6, §7).
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
@@ -109,28 +112,158 @@ fn write_file(path: &Path, data: String) -> Result<(), String> {
         .map_err(|e| format!("cannot write {}: {e} (not delegated to this user)", path.display()))
 }
 
-/// Best-effort run metrics: `(cpu_time_used_ms, memory_used_bytes)` from
-/// `cpu.stat` / `memory.peak`. PR 2 reads the process's `river/` cgroup, so
-/// the numbers include the caller itself and every sandbox so far; PR 3
-/// switches to the per-run cgroup. Unreadable values are reported as 0.
-pub fn read_metrics() -> (u64, u64) {
-    let Ok(base) = singleton() else {
-        return (0, 0);
-    };
-    let cpu = read_trim(&base.river.join("cpu.stat"))
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .and_then(|usec| usec.parse::<u64>().ok())
+// ------------------------------------------------------------------ per-run
+
+/// The knobs the exec() limits put on the run cgroup (design.md §6). Every
+/// `None` field means the knob is never written: a limit of `None` must
+/// leave the cgroup file at its default.
+pub struct RunKnobs {
+    pub memory_limit_bytes: Option<u64>,
+    pub proc_limit: Option<u64>,
+}
+
+/// Metrics of one finished run, read from its cgroup before removal.
+pub struct RunMetrics {
+    pub cpu_time_used_ms: u64,
+    pub memory_used_bytes: u64,
+    /// `memory.events` reported an OOM kill in this cgroup (design.md §6).
+    pub oom_kill: bool,
+}
+
+/// One exec's cgroup `<base>/river-<pid>-<seq>` (design.md §7): the limit
+/// knobs live here, the sandbox tree runs here, `cgroup.kill` clears it and
+/// the metrics are read from it before the `rmdir`. Dropping without
+/// `finish()` is the failure-path cleanup.
+pub struct RunCgroup {
+    dir: PathBuf,
+    finished: AtomicBool,
+}
+
+impl RunCgroup {
+    /// design.md §3 step 2 / §7: create the cgroup and write the knobs
+    /// before the child exists, so every limit is in force before "go".
+    pub fn create(knobs: &RunKnobs) -> Result<Self, String> {
+        let base = singleton()?;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = base.base.join(format!(
+            "river-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir)
+            .map_err(|e| format!("cannot create run cgroup {}: {e}", dir.display()))?;
+        if let Some(bytes) = knobs.memory_limit_bytes {
+            write_knob(&dir, "memory.max", &bytes.to_string())?;
+            write_knob(&dir, "memory.swap.max", "0")?;
+            write_knob(&dir, "memory.oom.group", "1")?;
+        }
+        if let Some(pids) = knobs.proc_limit {
+            write_knob(&dir, "pids.max", &pids.to_string())?;
+        }
+        Ok(RunCgroup {
+            dir,
+            finished: AtomicBool::new(false),
         })
-        .map_or(0, |usec| usec.div_ceil(1000));
-    let memory = read_trim(&base.river.join("memory.peak"))
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    (cpu, memory)
+    }
+
+    /// The cgroup's path, for logging and diagnostics.
+    pub fn path(&self) -> &Path {
+        &self.dir
+    }
+
+    /// design.md §3 step 6: move the freshly cloned child in; the caller
+    /// sends "go" right after, so every limit precedes the first sandboxed
+    /// instruction.
+    pub fn attach(&self, pid: i32) -> Result<(), String> {
+        write_knob(&self.dir, "cgroup.procs", &pid.to_string())
+    }
+
+    /// Atomic kill of every process in the cgroup (5.14+, design.md §7).
+    pub fn kill(&self) {
+        let _ = fs::write(self.dir.join("cgroup.kill"), b"1");
+    }
+
+    /// Wait until `cgroup.events` reports `populated 0` (design.md §3
+    /// step 8): after the pid-1 reap the namespace teardown is normally
+    /// instantaneous, and the cap only guards against a stuck straggler.
+    fn wait_empty(&self, cap: Duration) -> bool {
+        let deadline = Instant::now() + cap;
+        loop {
+            match read_trim(&self.dir.join("cgroup.events")) {
+                Ok(text) => {
+                    if text.lines().any(|line| line == "populated 0") {
+                        return true;
+                    }
+                }
+                Err(_) => return true, // already removed
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// design.md §3 step 8: wait for the teardown, read `cpu.stat` /
+    /// `memory.peak` / `memory.events`, then `rmdir`. The run already
+    /// happened, so an unreadable file degrades to zero instead of failing.
+    pub fn finish(&self) -> RunMetrics {
+        if !self.wait_empty(Duration::from_secs(5)) {
+            // A process refuses to die (D state, say): force the kill once
+            // more, wait a little longer, then read what is still there.
+            self.kill();
+            self.wait_empty(Duration::from_secs(2));
+        }
+        let cpu_time_used_ms = read_trim(&self.dir.join("cpu.stat"))
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|usec| usec.parse::<u64>().ok())
+            })
+            .map_or(0, |usec| usec.div_ceil(1000));
+        let memory_used_bytes = read_trim(&self.dir.join("memory.peak"))
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let oom_kill = read_trim(&self.dir.join("memory.events")).map_or(false, |text| {
+            oom_event(&text, "oom_kill") || oom_event(&text, "oom_group_kill")
+        });
+        self.finished.store(true, Ordering::Release);
+        let _ = fs::remove_dir(&self.dir);
+        RunMetrics {
+            cpu_time_used_ms,
+            memory_used_bytes,
+            oom_kill,
+        }
+    }
+}
+
+impl Drop for RunCgroup {
+    /// Failure-path cleanup (design.md §7): no live process and no cgroup
+    /// directory survive an exec that bailed out mid-run.
+    fn drop(&mut self) {
+        if !self.finished.swap(true, Ordering::AcqRel) {
+            self.kill();
+            self.wait_empty(Duration::from_secs(2));
+            let _ = fs::remove_dir(&self.dir);
+        }
+    }
+}
+
+/// `memory.events`: did the counter `name` ever tick (design.md §6 MLE)? A
+/// group OOM kill shows up as `oom_group_kill`; both count as OOM evidence.
+fn oom_event(text: &str, name: &str) -> bool {
+    text.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        fields.next() == Some(name) && fields.next().is_some_and(|count| count != "0")
+    })
+}
+
+fn write_knob(dir: &Path, name: &str, value: &str) -> Result<(), String> {
+    fs::write(dir.join(name), value)
+        .map_err(|e| format!("cannot write {} in {}: {e}", name, dir.display()))
 }
 
 fn current_cgroup() -> Result<PathBuf, String> {

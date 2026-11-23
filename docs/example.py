@@ -16,7 +16,7 @@ with River("/rootfs/python") as river:
         },
         cpu_time_limit_ms=1000,
         wall_time_limit_ms=2000,
-        memory_limit_bytes=256 * 1024,
+        memory_limit_bytes=64 * 1024 * 1024,
         stdout_limit_bytes=64 * 1024,
         stderr_limit_bytes=64 * 1024,
         copy_in={"input.txt": "1 2 3\n"},

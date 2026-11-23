@@ -116,7 +116,7 @@ impl River {
         stack_limit_bytes = None,
         address_space_limit_bytes = None,
     ))]
-    #[allow(clippy::too_many_arguments, unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn exec(
         &self,
         py: Python<'_>,
@@ -189,8 +189,9 @@ impl River {
             exec::io::sandbox_path(key, &cwd).map_err(RootfsError::new_err)?;
         }
 
-        // cpu_time_limit_ms .. address_space_limit_bytes are accepted and
-        // validated here, and enforced from PR 3 on (development-plan.md §4).
+        // design.md §6: from here the limits reach the run cgroup
+        // (`memory.max`, `pids.max`), the rlimits (`RLIMIT_*`) or the
+        // supervisor (wall clock, output caps).
 
         let params = ExecParams {
             executable,
@@ -203,6 +204,13 @@ impl River {
             stderr_file,
             stdout_limit_bytes,
             stderr_limit_bytes,
+            cpu_time_limit_ms,
+            wall_time_limit_ms,
+            memory_limit_bytes,
+            proc_limit,
+            open_file_limit,
+            stack_limit_bytes,
+            address_space_limit_bytes,
             copy_in,
             copy_out,
             copy_out_limit_bytes,

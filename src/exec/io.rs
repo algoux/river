@@ -11,10 +11,10 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::exec::CopyInValue;
 
-/// Lexically normalized sandbox path of a copy_in/copy_out key: absolute
-/// keys are used as-is, relative ones resolve against `cwd`; the result
-/// must stay strictly below `/work` (design.md §10).
-pub fn sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> {
+/// Lexically normalized sandbox path of a key: absolute keys are used
+/// as-is, relative ones resolve against `cwd`. Pure path algebra — no
+/// location enforcement (that is `sandbox_path`'s job).
+pub fn normalized_sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> {
     if key.is_empty() {
         return Err("sandbox path must not be empty".to_string());
     }
@@ -42,6 +42,13 @@ pub fn sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> {
             Component::Prefix(_) => unreachable!("no prefix components on Linux"),
         }
     }
+    Ok(out)
+}
+
+/// copy_in/copy_out key, normalized and enforced strictly below /work
+/// (design.md §10).
+pub fn sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> {
+    let out = normalized_sandbox_path(key, cwd)?;
     if out == Path::new("/work") {
         return Err(format!(
             "sandbox path {key:?} must name something below /work, not /work itself"

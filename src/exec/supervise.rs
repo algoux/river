@@ -1,17 +1,21 @@
 //! Parent-side event loop (design.md §3 step 7): a single-threaded epoll over
 //! the pidfd, the sync socket, the output pipes and the stdin write end.
 //!
-//! PR 2 uses the epoll timeout only to watch for Ctrl-C (the wall-clock
-//! deadline kill lands in PR 3, together with the run cgroup). Output past
-//! the limits keeps being read and discarded; the `OLE` verdict and kill are
-//! PR 3's as well.
+//! The epoll timeout is the shorter of the Ctrl-C checkpoint (100 ms) and
+//! the remaining wall budget; a tripped wall clock or output cap kills the
+//! run through the run cgroup (`cgroup.kill`, design.md §6/§7) and the loop
+//! keeps draining the pipes until the teardown closes them.
 
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
+use std::time::Instant;
 
 use pyo3::Python;
 use rustix::event::epoll;
 use rustix::io::Errno;
+
+use crate::cgroup::RunCgroup;
 
 use super::SyncMsg;
 
@@ -37,6 +41,12 @@ pub struct Input {
     pub stdin_bytes: Vec<u8>,
     pub stdout_limit_bytes: Option<u64>,
     pub stderr_limit_bytes: Option<u64>,
+    /// design.md §6: the absolute wall-clock deadline measured from "go"
+    /// (`None` = no limit). Firing means river killed the run and the
+    /// verdict is `TLE` — see `Supervised::wall_timeout`.
+    pub wall_deadline: Option<Instant>,
+    /// Kills go through the run cgroup (design.md §7 `cgroup.kill`).
+    pub cgroup: Arc<RunCgroup>,
 }
 
 /// Outcome of a supervised run.
@@ -44,6 +54,12 @@ pub struct Supervised {
     /// `(step, errno)` when the child failed before execve; the parent turns
     /// it into `ExecSetupError`.
     pub setup_error: Option<(u32, i32)>,
+    /// The wall deadline fired and river killed the run (→ `TLE`).
+    pub wall_timeout: bool,
+    /// Bytes received strictly past `stdout_limit_bytes` / the stderr
+    /// counterpart (→ `OLE`); a stream sitting exactly at its cap is fine.
+    pub stdout_over: bool,
+    pub stderr_over: bool,
 }
 
 /// Supervise failure: on every variant the child was already killed and
@@ -87,19 +103,42 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
 
     let mut stdout_buf: Vec<u8> = Vec::new();
     let mut stderr_buf: Vec<u8> = Vec::new();
+    // True byte counts (the buffers are capped, design.md §10); the OLE
+    // verdict needs what was actually produced, not what was kept.
+    let mut stdout_total: u64 = 0;
+    let mut stderr_total: u64 = 0;
     let mut setup_error = None;
     let mut pid_exited = false;
     let mut sync_done = false;
     let mut stdout_eof = input.stdout.is_none();
     let mut stderr_eof = input.stderr.is_none();
+    let mut wall_fired = false;
+    let mut output_killed = false;
+    let mut stdout_over = false;
+    let mut stderr_over = false;
     // One borrow over `input.stdin_bytes` for the whole loop; the field is
     // never mutated afterwards.
     let mut stdin_rest: &[u8] = if input.stdin.is_some() { &input.stdin_bytes } else { &[] };
     let mut events = epoll::EventVec::with_capacity(8);
 
     let result = loop {
-        // PR 3 will clamp this to the wall-clock deadline.
-        let timeout: libc::c_int = 100;
+        // The timeout is the shorter of the Ctrl-C checkpoint and the
+        // remaining wall budget (design.md §3 step 7). `pid_exited` guards
+        // the boundary race: a child that died just before the deadline
+        // finished on its own — no kill, no TLE.
+        let timeout: libc::c_int = match input.wall_deadline {
+            Some(deadline) if !wall_fired && !pid_exited => {
+                let now = Instant::now();
+                if now >= deadline {
+                    wall_fired = true;
+                    input.cgroup.kill();
+                    100
+                } else {
+                    ((deadline - now).as_millis() as i64).clamp(0, 100) as libc::c_int
+                }
+            }
+            _ => 100,
+        };
         match epoll::wait(&epfd, &mut events, timeout) {
             Ok(()) => {}
             Err(Errno::INTR) => {}
@@ -136,7 +175,12 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
                 }
                 TOKEN_STDOUT => {
                     let fd = input.stdout.as_ref().unwrap();
-                    match drain(fd.as_raw_fd(), &mut stdout_buf, input.stdout_limit_bytes) {
+                    match drain(
+                        fd.as_raw_fd(),
+                        &mut stdout_buf,
+                        input.stdout_limit_bytes,
+                        &mut stdout_total,
+                    ) {
                         Ok(true) => {
                             stdout_eof = true;
                             let _ = epoll::delete(&epfd, fd.as_fd());
@@ -147,7 +191,12 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
                 }
                 TOKEN_STDERR => {
                     let fd = input.stderr.as_ref().unwrap();
-                    match drain(fd.as_raw_fd(), &mut stderr_buf, input.stderr_limit_bytes) {
+                    match drain(
+                        fd.as_raw_fd(),
+                        &mut stderr_buf,
+                        input.stderr_limit_bytes,
+                        &mut stderr_total,
+                    ) {
                         Ok(true) => {
                             stderr_eof = true;
                             let _ = epoll::delete(&epfd, fd.as_fd());
@@ -188,6 +237,18 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
             break Err(e);
         }
 
+        // OLE (design.md §6): strictly past a cap — a stream sitting exactly
+        // at its limit produced no excess. The first offender kills the run
+        // once; draining continues so the pipes never block the writers.
+        if !output_killed {
+            stdout_over |= input.stdout_limit_bytes.is_some_and(|l| stdout_total > l);
+            stderr_over |= input.stderr_limit_bytes.is_some_and(|l| stderr_total > l);
+            if stdout_over || stderr_over {
+                output_killed = true;
+                input.cgroup.kill();
+            }
+        }
+
         if pid_exited && sync_done && stdout_eof && stderr_eof && input.stdin.is_none() {
             break Ok(());
         }
@@ -200,17 +261,31 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
     };
 
     if result.is_err() {
-        // No orphan sandbox: SIGKILL through the pidfd, then reap. The child
-        // is pid 1 of the pid namespace, so its death tears the rest down.
-        kill_and_reap(input.pid, input.pidfd.as_raw_fd());
+        // No orphan sandbox: `cgroup.kill` takes the whole tree at once
+        // (design.md §7), then reap pid 1 so the caller never blocks on a
+        // zombie.
+        input.cgroup.kill();
+        reap(input.pid);
     }
 
-    result.map(|_| (Supervised { setup_error }, stdout_buf, stderr_buf))
+    result.map(|_| {
+        (
+            Supervised {
+                setup_error,
+                wall_timeout: wall_fired,
+                stdout_over,
+                stderr_over,
+            },
+            stdout_buf,
+            stderr_buf,
+        )
+    })
 }
 
 /// Reads until `EAGAIN` or EOF; `Ok(true)` = EOF reached. Bytes past the cap
-/// are read and discarded (design.md §10); the kill on the limit is PR 3.
-fn drain(fd: RawFd, buf: &mut Vec<u8>, limit: Option<u64>) -> io::Result<bool> {
+/// are kept out of `buf` but still counted in `total` — the OLE verdict
+/// (design.md §6) needs the real byte count, not the capped buffer.
+fn drain(fd: RawFd, buf: &mut Vec<u8>, limit: Option<u64>, total: &mut u64) -> io::Result<bool> {
     let mut chunk = [0u8; 64 * 1024];
     loop {
         // SAFETY: read(2) into a private stack buffer.
@@ -226,6 +301,7 @@ fn drain(fd: RawFd, buf: &mut Vec<u8>, limit: Option<u64>) -> io::Result<bool> {
         if n == 0 {
             return Ok(true);
         }
+        *total += n as u64;
         append_capped(buf, &chunk[..n as usize], limit);
     }
 }
@@ -256,20 +332,6 @@ fn read_sync(fd: RawFd, msg: &mut SyncMsg) -> usize {
     } else {
         n as usize
     }
-}
-
-fn kill_and_reap(pid: i32, pidfd: RawFd) {
-    // SAFETY: pidfd_send_signal(2) with a null siginfo.
-    let _ = unsafe {
-        libc::syscall(
-            libc::SYS_pidfd_send_signal,
-            pidfd,
-            libc::SIGKILL as libc::c_int,
-            std::ptr::null::<libc::c_void>(),
-            0u32,
-        )
-    };
-    reap(pid);
 }
 
 /// waitpid(2) with the EINTR loop; the child is dying, so this is quick.

@@ -19,7 +19,7 @@ use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use seccompiler::sock_filter;
 
@@ -48,13 +48,19 @@ pub enum Step {
     MountSys = 11,
     MountPivot = 12,
     NetLo = 13,
-    Caps = 14,
-    Nnp = 15,
-    Landlock = 16,
-    Seccomp = 17,
-    Chdir = 18,
-    Stdio = 19,
-    Execve = 20,
+    RlimitCpu = 14,
+    RlimitFsize = 15,
+    RlimitNproc = 16,
+    RlimitNofile = 17,
+    RlimitStack = 18,
+    RlimitAs = 19,
+    Caps = 20,
+    Nnp = 21,
+    Landlock = 22,
+    Seccomp = 23,
+    Chdir = 24,
+    Stdio = 25,
+    Execve = 26,
 }
 
 impl Step {
@@ -74,13 +80,19 @@ impl Step {
             11 => Step::MountSys,
             12 => Step::MountPivot,
             13 => Step::NetLo,
-            14 => Step::Caps,
-            15 => Step::Nnp,
-            16 => Step::Landlock,
-            17 => Step::Seccomp,
-            18 => Step::Chdir,
-            19 => Step::Stdio,
-            20 => Step::Execve,
+            14 => Step::RlimitCpu,
+            15 => Step::RlimitFsize,
+            16 => Step::RlimitNproc,
+            17 => Step::RlimitNofile,
+            18 => Step::RlimitStack,
+            19 => Step::RlimitAs,
+            20 => Step::Caps,
+            21 => Step::Nnp,
+            22 => Step::Landlock,
+            23 => Step::Seccomp,
+            24 => Step::Chdir,
+            25 => Step::Stdio,
+            26 => Step::Execve,
             _ => return None,
         })
     }
@@ -101,6 +113,12 @@ impl Step {
             Step::MountSys => "child.mount.sys",
             Step::MountPivot => "child.mount.pivot",
             Step::NetLo => "child.net.lo",
+            Step::RlimitCpu => "child.rlimit.cpu",
+            Step::RlimitFsize => "child.rlimit.fsize",
+            Step::RlimitNproc => "child.rlimit.nproc",
+            Step::RlimitNofile => "child.rlimit.nofile",
+            Step::RlimitStack => "child.rlimit.stack",
+            Step::RlimitAs => "child.rlimit.as",
             Step::Caps => "child.caps",
             Step::Nnp => "child.nnp",
             Step::Landlock => "child.landlock",
@@ -142,9 +160,31 @@ pub struct ExecParams {
     pub stderr_file: Option<String>,
     pub stdout_limit_bytes: Option<u64>,
     pub stderr_limit_bytes: Option<u64>,
+    pub cpu_time_limit_ms: Option<u64>,
+    pub wall_time_limit_ms: Option<u64>,
+    pub memory_limit_bytes: Option<u64>,
+    pub proc_limit: Option<u64>,
+    pub open_file_limit: Option<u64>,
+    pub stack_limit_bytes: Option<u64>,
+    pub address_space_limit_bytes: Option<u64>,
     pub copy_in: Vec<(String, CopyInValue)>,
     pub copy_out: Vec<(String, Option<String>)>,
     pub copy_out_limit_bytes: Option<u64>,
+}
+
+/// Child-side rlimits, precomputed in the parent (design.md §6): CPU is
+/// soft=`ceil(ms/1000)` with hard=soft+1 (SIGXCPU, then SIGKILL), every
+/// other touched limit is soft=hard. `None` = leave the resource alone.
+#[derive(Default)]
+pub struct RlimitSpec {
+    pub cpu: Option<(libc::rlim_t, libc::rlim_t)>,
+    /// `max(stdout_limit, stderr_limit)` over the streams bound to files —
+    /// the kernel backstop for file OLE and the /work fill guard (§10).
+    pub fsize: Option<libc::rlim_t>,
+    pub nproc: Option<libc::rlim_t>,
+    pub nofile: Option<libc::rlim_t>,
+    pub stack: Option<libc::rlim_t>,
+    pub as_bytes: Option<libc::rlim_t>,
 }
 
 /// The whole pre-serialized child state (design.md §3 step 4): strings are
@@ -186,6 +226,8 @@ pub struct ChildSpec {
     pub seccomp_prog: Vec<sock_filter>,
     /// `None` = Landlock unavailable or `RIVER_HARDENING=off`.
     pub landlock_masks: Option<landlock::Masks>,
+    /// The design.md §6 rlimits; only the `Some` entries are applied.
+    pub rlimits: RlimitSpec,
     pub sync_fd: RawFd,
 }
 
@@ -252,7 +294,19 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         &format!("exec starting: executable={:?} cwd={:?}", p.executable, p.cwd),
     );
 
-    // 1. The host work directory and copy_in (design.md §3 step 3, §10).
+    // 2. The run cgroup (design.md §3 step 2, §7): every limit knob, the
+    //    sandbox process tree and the metrics live here — it must exist
+    //    even when not a single limit is passed (design.md §3).
+    let run_knobs = cgroup::RunKnobs {
+        memory_limit_bytes: p.memory_limit_bytes,
+        proc_limit: p.proc_limit,
+    };
+    let run_cg = std::sync::Arc::new(
+        cgroup::RunCgroup::create(&run_knobs).map_err(ExecFailure::Host)?,
+    );
+    log(debug, &format!("run cgroup ready: {}", run_cg.path().display()));
+
+    // 3. The host work directory and copy_in (design.md §3 step 3, §10).
     let base = preflight::workdir_base().map_err(ExecFailure::Host)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let work_dir = base
@@ -272,7 +326,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     io::write_copy_in(&work_dir, &p.cwd, &p.copy_in).map_err(ExecFailure::Rootfs)?;
     log(debug, &format!("work dir ready: {}", work_dir.display()));
 
-    // 2. Hardening artifacts (design.md §9). `RIVER_HARDENING=off` disables
+    // 4. Hardening artifacts (design.md §9). `RIVER_HARDENING=off` disables
     //    only these two; namespaces, the read-only rootfs and the cap drop
     //    stay (design.md §4).
     let seccomp_prog = if hardening_off {
@@ -293,7 +347,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         masks
     };
 
-    // 3. File descriptors: the sync socket and the stdio pipes (design.md §3
+    // 5. File descriptors: the sync socket and the stdio pipes (design.md §3
     //    step 4). Parent ends and child ends live in separate `OwnedFd`s so
     //    closing happens exactly once.
     let (sync_parent, sync_child) = {
@@ -346,7 +400,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         (None, None)
     };
 
-    // 4. Pre-serialize the child state (design.md §3 step 4).
+    // 6. Pre-serialize the child state (design.md §3 step 4).
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     let cstring = |s: &str| -> Result<CString, ExecFailure> {
@@ -387,6 +441,26 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
             .collect::<Result<Vec<_>, _>>()?
     };
     let work_src = cstring(&work_dir.display().to_string())?;
+    // The design.md §6 rlimits, precomputed so the child only calls
+    // setrlimit: CPU soft=ceil(ms/1000)/hard=soft+1, the file cap is the
+    // max of the *file-bound* stream limits, everything else is flat.
+    let rlimits = RlimitSpec {
+        cpu: p.cpu_time_limit_ms.map(|ms| {
+            let soft = ms.div_ceil(1000) as libc::rlim_t;
+            (soft, soft + 1)
+        }),
+        fsize: [
+            p.stdout_limit_bytes.filter(|_| p.stdout_file.is_some()),
+            p.stderr_limit_bytes.filter(|_| p.stderr_file.is_some()),
+        ]
+        .into_iter()
+        .flatten()
+        .max(),
+        nproc: p.proc_limit,
+        nofile: p.open_file_limit,
+        stack: p.stack_limit_bytes,
+        as_bytes: p.address_space_limit_bytes,
+    };
     let spec = ChildSpec {
         expected_ppid: std::process::id() as i32,
         debug,
@@ -410,10 +484,11 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         stderr_pipe_w: stderr_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
         seccomp_prog,
         landlock_masks,
+        rlimits,
         sync_fd: sync_child.as_raw_fd(),
     };
 
-    // 5. clone3: one call creates every namespace (design.md §3 step 5).
+    // 7. clone3: one call creates every namespace (design.md §3 step 5).
     let flags: u64 = (libc::CLONE_NEWUSER
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
@@ -464,15 +539,31 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     drop(stderr_child);
     drop(stdin_child);
 
-    // 6. design.md §3 step 6 — PR 3 writes the child pid into the run
-    //    cgroup's `cgroup.procs` here (creating <base>/river-<pid>-<seq>),
-    //    so every limit is in force before the first sandbox instruction.
-    //    PR 2 reads the metrics from the process's `river/` cgroup instead.
+    // 8. design.md §3 step 6: park the child in the run cgroup *before*
+    //    "go", so every limit is in force before the first sandboxed
+    //    instruction. A failure here means the child is still unattached —
+    //    kill it through the pidfd (`cgroup.kill` cannot reach it yet).
+    if let Err(msg) = run_cg.attach(pid) {
+        kill_child(pid, pidfd.as_raw_fd());
+        return Err(ExecFailure::Host(msg));
+    }
+    log(
+        debug,
+        &format!("child {pid} attached to {}", run_cg.path().display()),
+    );
 
-    // 7. "go" + supervise (design.md §3 step 7).
+    // 9. "go" + supervise (design.md §3 step 6–7). The wall clock runs from
+    //    "go" to the reap (design.md §4, §6).
     let t0 = Instant::now();
-    io::write_all_fd(sync_parent.as_raw_fd(), b"g")
-        .map_err(|e| parent_setup("parent.go", e, "sync socket".to_string()))?;
+    if let Err(e) = io::write_all_fd(sync_parent.as_raw_fd(), b"g") {
+        kill_child(pid, pidfd.as_raw_fd());
+        return Err(parent_setup("parent.go", e, "sync socket".to_string()));
+    }
+    let wall_deadline = p.wall_time_limit_ms.map(|ms| {
+        // Clamp: an absurd limit must not overflow the Instant arithmetic,
+        // and a year of wall time is beyond any sane budget anyway.
+        t0 + Duration::from_millis(ms.min(365 * 24 * 3600 * 1000))
+    });
     let supervise_input = supervise::Input {
         pid,
         pidfd,
@@ -483,6 +574,8 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         stdin_bytes: p.stdin.clone().unwrap_or_default(),
         stdout_limit_bytes: p.stdout_limit_bytes,
         stderr_limit_bytes: p.stderr_limit_bytes,
+        wall_deadline,
+        cgroup: run_cg.clone(),
     };
     let (supervised, stdout_buf, stderr_buf) = match supervise::run(supervise_input) {
         Ok(value) => value,
@@ -496,10 +589,10 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         }
     };
 
-    // 8. Reap (design.md §3 step 8) and interpret the sync report
-    //    (ExecSetupError, design.md §5).
-    let status = waitpid_blocking(pid);
-    let (exit_code, signal) = decode_status(status);
+    // 10. Reap (design.md §3 step 8) and interpret the sync report
+    //     (ExecSetupError, design.md §5).
+    let wait_status = waitpid_blocking(pid);
+    let (exit_code, signal) = decode_status(wait_status);
     let wall_time_used_ms = t0.elapsed().as_millis() as u64;
     log(
         debug,
@@ -519,40 +612,43 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         return Err(ExecFailure::Setup { step, errno, context });
     }
 
-    // 9. Metrics (design.md §3 step 8). PR 2 reads the process's `river/`
-    //    cgroup: the numbers include the caller itself and every sandbox
-    //    so far — inaccurate but wired end to end; PR 3 switches to the
-    //    per-run cgroup.
-    let (cpu_time_used_ms, memory_used_bytes) = cgroup::read_metrics();
+    // With the pid-1 reap the namespace teardown kills the rest of the
+    // tree; wait for the cgroup to drain, read the final numbers, remove
+    // the directory (design.md §3 step 8).
+    let metrics = run_cg.finish();
+    log(
+        debug,
+        &format!(
+            "metrics: cpu={} ms memory={} bytes oom_kill={}",
+            metrics.cpu_time_used_ms, metrics.memory_used_bytes, metrics.oom_kill
+        ),
+    );
 
-    // 10. copy_out (design.md §3 step 9).
+    // 11. copy_out (design.md §3 step 9).
     let files = io::read_copy_out(&work_dir, &p.cwd, &p.copy_out, p.copy_out_limit_bytes)
         .map_err(|(key, reason)| ExecFailure::CopyOut { key, reason })?;
 
-    // 11. Verdict (design.md §4; TLE/MLE/OLE arrive with PR 3).
-    let (status, error) = match (exit_code, signal) {
-        (Some(0), _) => ("AC".to_string(), None),
-        (Some(code), _) => ("RE".to_string(), Some(format!("exited with code {code}"))),
-        (None, Some(sig)) => (
-            "RE".to_string(),
-            Some(format!(
-                "killed by signal {sig} ({})",
-                signal_name(sig)
-            )),
-        ),
-        (None, None) => (
-            "RE".to_string(),
-            Some("the child did not report an exit status".to_string()),
-        ),
-    };
+    // 12. Verdict (design.md §4 status semantics, §6 ladder:
+    //     OLE > MLE > TLE > AC/RE).
+    let file_over = output_file_over(&work_dir, p, exit_code);
+    let (status, error) = classify(
+        exit_code,
+        signal,
+        wall_time_used_ms,
+        &supervised,
+        &metrics,
+        &file_over,
+        p,
+    );
+    log(debug, &format!("verdict: {status} ({error:?})"));
 
     Ok(Outcome {
         status,
         exit_code,
         signal,
-        cpu_time_used_ms,
+        cpu_time_used_ms: metrics.cpu_time_used_ms,
         wall_time_used_ms,
-        memory_used_bytes,
+        memory_used_bytes: metrics.memory_used_bytes,
         stdout: if p.stdout_file.is_some() {
             None
         } else {
@@ -566,6 +662,159 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         files,
         error,
     })
+}
+
+/// Kills the child through its pidfd and reaps it — for failure paths
+/// between clone3 and supervise, where the child may not be in the run
+/// cgroup yet, so `cgroup.kill` cannot reach it (design.md §3 step 6
+/// attaches only just before "go").
+fn kill_child(pid: i32, pidfd: RawFd) {
+    // SAFETY: pidfd_send_signal(2) with a null siginfo.
+    let _ = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGKILL as libc::c_int,
+            std::ptr::null::<libc::c_void>(),
+            0u32,
+        )
+    };
+    supervise::reap(pid);
+}
+
+/// The file half of the output limits (design.md §6): `*_file` paths that
+/// resolve below /work are host-observable through the bind, so their sizes
+/// are checked against their own caps after the run. RLIMIT_FSIZE (= max of
+/// the file-bound caps) clamps a write exactly at the cap with EFBIG — and
+/// pid 1 drops the kernel's SIGXFSZ (`SIGNAL_UNKILLABLE`), so the writer
+/// dies of the error instead of the signal — hence a file sitting exactly
+/// at its cap on a run that did not exit cleanly also counts as over.
+fn output_file_over(work_dir: &Path, p: &ExecParams, exit_code: Option<i32>) -> Vec<&'static str> {
+    let mut over = Vec::new();
+    for (name, file, limit) in [
+        ("stdout", p.stdout_file.as_deref(), p.stdout_limit_bytes),
+        ("stderr", p.stderr_file.as_deref(), p.stderr_limit_bytes),
+    ] {
+        let (Some(file), Some(limit)) = (file, limit) else {
+            continue;
+        };
+        let Ok(path) = io::normalized_sandbox_path(file, &p.cwd) else {
+            continue; // a malformed key was the caller's problem already
+        };
+        if !path.starts_with("/work") {
+            continue; // outside the bind, not host-observable
+        }
+        let host = work_dir.join(path.strip_prefix("/work").unwrap());
+        if fs::metadata(&host).is_ok_and(|meta| {
+            meta.is_file() && (meta.len() > limit || (meta.len() == limit && exit_code != Some(0)))
+        }) {
+            over.push(name);
+        }
+    }
+    over
+}
+
+/// design.md §4 status semantics behind the §6 verdict ladder
+/// (`OLE > MLE > TLE > AC/RE`), each verdict with a human-readable `error`.
+fn classify(
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    wall_time_used_ms: u64,
+    supervised: &supervise::Supervised,
+    metrics: &cgroup::RunMetrics,
+    file_over: &[&'static str],
+    p: &ExecParams,
+) -> (String, Option<String>) {
+    // OLE: a pipe stream ran past its cap (river killed the run), a *_file
+    // grew past (or was clamped exactly at, on an unclean exit) its own cap,
+    // or a writer died from SIGXFSZ — rare, since pid 1 drops kernel
+    // signals it has no handler for (`SIGNAL_UNKILLABLE`).
+    let mut culprits: Vec<&str> = Vec::new();
+    if supervised.stdout_over {
+        culprits.push("stdout");
+    }
+    if supervised.stderr_over {
+        culprits.push("stderr");
+    }
+    culprits.extend(file_over.iter().copied());
+    if culprits.is_empty() && signal == Some(libc::SIGXFSZ) {
+        culprits.push("a *_file write hit RLIMIT_FSIZE");
+    }
+    if !culprits.is_empty() {
+        return (
+            "OLE".to_string(),
+            Some(format!("output limit exceeded ({})", culprits.join(", "))),
+        );
+    }
+
+    // MLE: the cgroup OOM-killed the tree, or the peak crossed the limit on
+    // a run that did not finish cleanly (page cache exempts normal exits,
+    // design.md §6).
+    if metrics.oom_kill {
+        return (
+            "MLE".to_string(),
+            Some(match p.memory_limit_bytes {
+                Some(limit) => {
+                    format!("the sandbox was OOM-killed (memory_limit_bytes={limit})")
+                }
+                None => "the sandbox was OOM-killed".to_string(),
+            }),
+        );
+    }
+    if let Some(limit) = p.memory_limit_bytes {
+        if metrics.memory_used_bytes >= limit && exit_code != Some(0) {
+            return (
+                "MLE".to_string(),
+                Some(format!(
+                    "memory used {} bytes, at or above memory_limit_bytes={limit}",
+                    metrics.memory_used_bytes
+                )),
+            );
+        }
+    }
+
+    // TLE: our wall kill, SIGXCPU from RLIMIT_CPU, or the post-run cpu.stat
+    // check (design.md §6 — no tree-wide polling, judge after the fact).
+    if supervised.wall_timeout {
+        return (
+            "TLE".to_string(),
+            Some(format!(
+                "wall time used {wall_time_used_ms} ms, at the wall_time_limit_ms={} deadline (killed)",
+                p.wall_time_limit_ms.unwrap_or_default()
+            )),
+        );
+    }
+    if signal == Some(libc::SIGXCPU) {
+        return (
+            "TLE".to_string(),
+            Some("cpu time limit reached (SIGXCPU)".to_string()),
+        );
+    }
+    if let Some(limit) = p.cpu_time_limit_ms {
+        if metrics.cpu_time_used_ms > limit {
+            return (
+                "TLE".to_string(),
+                Some(format!(
+                    "cpu time used {} ms exceeds cpu_time_limit_ms={limit}",
+                    metrics.cpu_time_used_ms
+                )),
+            );
+        }
+    }
+
+    // AC/RE (design.md §4).
+    match (exit_code, signal) {
+        (Some(0), _) => ("AC".to_string(), None),
+        (Some(code), _) => ("RE".to_string(), Some(format!("exited with code {code}"))),
+        (None, Some(sig)) => (
+            "RE".to_string(),
+            Some(format!("killed by signal {sig} ({})", signal_name(sig))),
+        ),
+        (None, None) => (
+            "RE".to_string(),
+            Some("the child did not report an exit status".to_string()),
+        ),
+    }
 }
 
 fn parent_setup(step: &'static str, e: std::io::Error, context: String) -> ExecFailure {

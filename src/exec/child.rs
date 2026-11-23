@@ -55,8 +55,8 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { fail(spec, Step::Idmap, e) };
     }
 
-    // c: wait for "go" — the parent parks us in the run cgroup (PR 3)
-    //    before handing control over.
+    // c: wait for "go" — the parent parks us in the run cgroup (design.md
+    //    §3 step 6) before handing control over.
     let mut go = [0u8; 1];
     // SAFETY: plain read(2) on the inherited sync socket.
     let n = unsafe {
@@ -262,7 +262,54 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         }
     }
 
-    // f: caps -> no_new_privs -> Landlock -> seccomp (design.md §5).
+    // f: rlimits (design.md §5 `child.rlimit.*`, §6) — only the limits the
+    //    caller passed; RLIMIT_CPU carries the (soft, hard) pair, every
+    //    other touched limit is soft=hard.
+    // SAFETY: bare setrlimit(2) on precomputed `ChildSpec` values.
+    unsafe {
+        if let Some((soft, hard)) = spec.rlimits.cpu {
+            let rl = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &rl) != 0 {
+                fail(spec, Step::RlimitCpu, errno());
+            }
+        }
+        if let Some(v) = spec.rlimits.fsize {
+            let rl = libc::rlimit { rlim_cur: v, rlim_max: v };
+            if libc::setrlimit(libc::RLIMIT_FSIZE, &rl) != 0 {
+                fail(spec, Step::RlimitFsize, errno());
+            }
+        }
+        if let Some(v) = spec.rlimits.nproc {
+            let rl = libc::rlimit { rlim_cur: v, rlim_max: v };
+            if libc::setrlimit(libc::RLIMIT_NPROC, &rl) != 0 {
+                fail(spec, Step::RlimitNproc, errno());
+            }
+        }
+        if let Some(v) = spec.rlimits.nofile {
+            let rl = libc::rlimit { rlim_cur: v, rlim_max: v };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) != 0 {
+                fail(spec, Step::RlimitNofile, errno());
+            }
+        }
+        if let Some(v) = spec.rlimits.stack {
+            let rl = libc::rlimit { rlim_cur: v, rlim_max: v };
+            if libc::setrlimit(libc::RLIMIT_STACK, &rl) != 0 {
+                fail(spec, Step::RlimitStack, errno());
+            }
+        }
+        if let Some(v) = spec.rlimits.as_bytes {
+            let rl = libc::rlimit { rlim_cur: v, rlim_max: v };
+            if libc::setrlimit(libc::RLIMIT_AS, &rl) != 0 {
+                fail(spec, Step::RlimitAs, errno());
+            }
+        }
+        debug(spec, c"[river child] rlimits done\n");
+    }
+
+    // g: caps -> no_new_privs -> Landlock -> seccomp (design.md §5).
     // SAFETY: bare prctl/capset and the allocation-free landlock/seccomp steps.
     unsafe {
         let e = caps::drop_all();
@@ -290,7 +337,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         debug(spec, c"[river child] landlock + seccomp done\n");
     }
 
-    // g: chdir(cwd) — the only directory that can be missing at this point.
+    // h: chdir(cwd) — the only directory that can be missing at this point.
     // SAFETY: chdir(2) on `ChildSpec` memory.
     let e = unsafe { libc::chdir(spec.cwd.as_ptr()) };
     if e < 0 {
@@ -298,7 +345,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { fail(spec, Step::Chdir, errno()) };
     }
 
-    // h: stdio (design.md §5 `child.stdio`).
+    // i: stdio (design.md §5 `child.stdio`).
     // SAFETY: open/dup2 on `ChildSpec` paths and fds.
     let e = unsafe { set_up_stdio(spec) };
     if e != 0 {
@@ -306,7 +353,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { fail(spec, Step::Stdio, e) };
     }
 
-    // i: execve. A successful execve never returns; the CLOEXEC sync socket
+    // j: execve. A successful execve never returns; the CLOEXEC sync socket
     // closes and the parent reads EOF as "exec'd". Any return is a failure.
     // SAFETY: execve(2) with the pre-serialized argv/envp arrays.
     unsafe {
