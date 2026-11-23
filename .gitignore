@@ -29,3 +29,6 @@ __pycache__/
 .dsh
 .agent
 .claude
+
+# Local-only notes (machine addresses, accounts, paths); never commit
+*.local.md
