@@ -1,48 +1,36 @@
 # river
 
-A cross-platform sandbox for running untrusted programs: a `Sandbox` Python
-class that executes a child with verdict-grade limits and accounting
-(`AC` / `RE` / `TLE` / `MLE` / `OLE`), output capture, and file copy in/out.
+river is a Python library that runs arbitrary programs inside a rootless Linux
+sandbox built around a caller-supplied rootfs, and reports judge-grade resource
+usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 
-## Backends
+**Status: in development.** This tree is the skeleton of the rootless rewrite.
+The design in [docs/design.md](docs/design.md) is the single source of truth;
+[docs/development-plan.md](docs/development-plan.md) holds the implementation
+plan and PR breakdown, and [docs/example.py](docs/example.py) is the target API.
 
-| Platform | Mechanism |
-|----------|-----------|
-| Linux | PID/mount/UTS/IPC/network namespaces + `pivot_root`, cgroups v2 (cpu/memory/pids), seccomp denylist, pidfd control. Needs root on a cgroups v2 host; every `exec` requires an active session. |
-| Windows | AppContainer + Job Object; `runtimes=[...]` grants read-only directories. |
-| macOS | Not implemented yet. |
+- **rootless**: no root, no setuid helper, no external binary — only the current
+  user and the kernel.
+- **low overhead**: single-digit milliseconds per `exec`; no daemon, no polling.
+- **limits and accounting**: CPU time, wall clock, memory, output, process
+  count; `None` means unlimited.
+- **latest kernels only** (≥ 6.8), no compatibility fallbacks.
 
-## Linux sandbox layout (per run)
+## Development
 
-```
-/                       tmpfs (per-run)
-├── workspace/          the session workdir (rw): cwd, copy_in/out, TMPDIR
-├── proc/               new procfs for the private PID namespace
-├── dev/                tmpfs with null/zero/random/urandom
-├── runtime/<name>/     caller runtime dirs (ro)
-└── usr bin sbin lib lib64 etc   host system dirs (ro)
-```
+Linux only. Build and test as the unprivileged user that will run river, with
+the process inside a delegated cgroup:
 
-`rootfs=` accepts a caller-supplied container root: a directory is mounted
-writable-side-up via `overlayfs` (private tmpfs upper layer, host tree stays
-frozen read-only), a squashfs image (detected by the `hsqs` magic) is attached
-through a loop device and used as the read-only lower layer. In `rootfs=` mode
-the host system directories are not mounted in; the root must be self-contained
-(`runtimes=[...]` still composes, mounted at `/runtime/<name>`).
-
-## Testing
-
-```shell
-uv sync --extra test
-uv run maturin develop
-uv run pytest
+```sh
+uv sync --extra test && uv run maturin develop
+systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -c "import river; print(river.doctor())"
+systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs> -- .venv/bin/python -m pytest -x
 ```
 
-Linux tests run as root on the target host; Windows tests skip elsewhere and
-vice versa.
+Put the interpreter itself inside the scope: a wrapper that stays alive (`uv run`,
+`make`, …) leaves a second process in the cgroup and river cannot enable the
+controllers there (`river.doctor()` reports exactly that).
 
-## Examples
-
-See `examples/` for standalone demos of the underlying mechanisms
-(clone3/pidfd, namespaces, pivot_root, cgroups v2, seccomp, output capture)
-on each platform.
+`river.doctor()` reports every kernel, user-namespace and cgroup prerequisite
+and the fix for anything that fails. The rootfs is a directory exported from a
+container image and unpacked as the running user; see design.md §11.

@@ -35,8 +35,9 @@
 - 通用命令（在仓库根目录，以将要运行 river 的普通用户执行）：
   ```sh
   uv sync --extra test && uv run maturin develop
-  systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs 路径> -- uv run pytest -x
+  systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs 路径> -- .venv/bin/python -m pytest -x
   ```
+- `systemd-run` 里面必须是解释器本身（`.venv/bin/python`），不要套 `uv run`/`make`：它们会留一个父进程在 scope 里，river 无法在那里启用控制器（`EBUSY`）。`uv sync`/`uv run maturin develop` 放在 `systemd-run` 外面即可。
 - rootless 路径必须用**非特权账号**验证；用 root 测试会绕过 unprivileged userns，不能作为依据。
 - rootfs 用 `docker create python:3.12-slim` → `docker export` → 以运行 river 的用户 `tar -xp --no-same-owner` 解压，再写 `meta.json`（命令见 `docs/environment.local.md`，README 在 PR 5 写通用版本）。
 - 提交信息沿用仓库风格：`feat(linux): ...`、`docs: ...`、`test: ...`。
@@ -82,8 +83,8 @@
 验证：
 
 ```sh
-uv run maturin develop && uv run python -c "import river; print(river.doctor())"
-systemd-run --user --scope -p Delegate=yes -- uv run pytest -m doctor
+uv run maturin develop && systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -c "import river; print(river.doctor())"
+systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doctor
 ```
 
 完成标准：两套环境（远端用非特权账号）上 `doctor()` 报告与 `docs/environment.local.md` 的环境表一致；在非委托环境下 `doctor(raise_on_fail=True)` 抛 `CgroupNotDelegatedError` 且消息含修复命令；`git status` 干净且没有 `*.local.md` 被跟踪；`dev` 分支已推送（推送前确认）。

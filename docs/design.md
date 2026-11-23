@@ -195,8 +195,8 @@ cgroup2 文件系统不能在 user namespace 内挂载，必须使用宿主上**
 2. 从 `/proc/self/cgroup` 得到 `<base>`。
 3. `<base>/cgroup.controllers` 必须含 `cpu`、`memory`、`pids`，否则未委托。
 4. `mkdir <base>/river`，把自身 pid 写入 `<base>/river/cgroup.procs`（满足"启用 domain controller 的 cgroup 不能含进程"的约束）。
-5. 向 `<base>/cgroup.subtree_control` 写 `+cpu +memory +pids`；`EACCES`/`EPERM`/`EBUSY` → 未委托。
-6. 以上任一步失败 → `CgroupNotDelegatedError`，消息附修复命令：`systemd-run --user --scope -p Delegate=yes python app.py`，或把 river 放进 `Delegate=yes` 的 user service；普通 ssh 登录的 session scope 在 Ubuntu 24.04 上通常也是委托的。
+5. 向 `<base>/cgroup.subtree_control` 写 `+cpu +memory +pids`；`EACCES`/`EPERM` → 未委托；`EBUSY` → `<base>` 里还有别的进程（典型：外层 `uv run`/`make` 留下的父进程），报错里列出这些 pid。systemd 处理 `Delegate=yes` 时会把控制器启用到父级 slice 并一直保留，所以同一 slice 下之后新建的 scope 即使没写 `Delegate=yes` 也会通过 1–3 步，不能用"兄弟 scope"来模拟非委托环境。
+6. 以上任一步失败 → `CgroupNotDelegatedError`，消息附修复命令：`systemd-run --user --scope -p Delegate=yes -- python app.py`（解释器必须是 scope 内唯一的进程，不要套 `uv run`），或把 river 放进 `Delegate=yes` 的 user service；普通 ssh 登录的 session scope 在 Ubuntu 24.04 上通常也是委托的。
 
 **每次 exec**：`mkdir <base>/river-<pid>-<seq>`；按 §6 写 knob；clone 后把子进程 pid 写入 `cgroup.procs`；结束后 `rmdir`。清场一律 `cgroup.kill`（5.14+）。
 

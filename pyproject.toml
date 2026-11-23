@@ -4,17 +4,27 @@ build-backend = "maturin"
 
 [project]
 name = "river"
-description = "Sandbox for running untrusted executables with resource limits (Rust extension, Windows and Linux backends)"
+description = "Rootless Linux sandbox for untrusted programs, with judge-grade resource limits and accounting"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
-keywords = ["sandbox", "judge", "untrusted", "appcontainer", "seccomp", "cgroups"]
+keywords = [
+    "sandbox",
+    "judge",
+    "untrusted",
+    "rootless",
+    "namespaces",
+    "seccomp",
+    "landlock",
+    "cgroups",
+]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Operating System :: POSIX :: Linux",
 ]
 dynamic = ["version"]
 
@@ -22,24 +32,25 @@ dynamic = ["version"]
 Repository = "https://github.com/algoux/river"
 
 [project.optional-dependencies]
-# S13 test suite (pytest three-pack: functional / attack / limits).
-test = ["pytest>=7.0"]
+test = ["pytest>=8"]
 
 [tool.maturin]
+module-name = "river._river"
+python-source = "python"
 features = ["pyo3/extension-module"]
 
 [tool.uv]
-# The extension is built and installed by `maturin develop`; uv should only
-# manage the environment's dependencies.
+# The extension module is built and installed by `maturin develop`; uv only
+# manages the environment's dependencies.
 package = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# The sandbox tests spawn real processes; they must not run in parallel
-# with each other on purpose (they are independent, but each run costs
-# ~100ms of process creation).
 addopts = "-ra"
 markers = [
-    "attack: attack-surface tests (must be denied inside the sandbox)",
-    "slow: takes more than a second",
+    "functional: end-to-end sandbox behaviour (hello world, stdio, cwd, envs)",
+    "limits: resource limits and verdicts (TLE / MLE / OLE, proc_limit, rlimits)",
+    "attack: attack-surface tests that must be denied inside the sandbox",
+    "concurrency: concurrent exec from multiple threads",
+    "doctor: river.doctor() and the preflight checks",
 ]
