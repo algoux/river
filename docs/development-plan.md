@@ -15,18 +15,16 @@
 - CI 不在当前阶段范围内。除非要求，不做冒烟测试。
 - 设计已经定稿（`docs/design.md`），实现中遇到设计没覆盖的情况：小的自行决定并回写到 design.md；涉及语义/接口的先问。
 
-## 1. 仓库现状（2026-11-23）
+## 1. 仓库现状（2026-11-24，PR 1 之后）
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（2026-11-11）；`origin = git@github.com:algoux/river.git` |
-| 工作分支 | 从 `master` 切 `dev`，所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
-| 旧实现（待删） | Rust + PyO3 0.30 / rustix 0.38 / seccompiler 0.5，以 root 运行，带 Windows AppContainer 后端、loopdev/squashfs、tmpfs 根 + 宿主 `/usr` 绑定、AC/TLE 短码状态。**整体废弃，新实现仅 Linux** |
-| 已跟踪、PR 1 要删的 | `src/`（全部）、`examples/`（全部）、`tests/`（全部）、`river.pyi`、`Cargo.lock`、`uv.lock`（重新生成）、`.github/`（旧 workflow，P4 重建）、`Cargo.toml`、`pyproject.toml`、`README.md`（后三者重写） |
-| 已跟踪、保留 | `LICENSE`（Apache-2.0）、`.gitignore` |
-| 未跟踪、PR 1 提交 | `docs/example.py`、`docs/design.md`、`docs/development-plan.md` |
-| 未跟踪、不提交 | `docs/environment.local.md`（gitignore 规则 `*.local.md`）、`.venv/`、`.dsh/`（已忽略） |
-| `.gitignore` 待补 | `*.local.md`（已加）、`.mypy_cache/`、`.ruff_cache/`（PR 1 补） |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `a302ebb`（PR 1），`origin = git@github.com:algoux/river.git` |
+| 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
+| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`tests/test_doctor.py`、`docs/`（`design.md`、本计划、`example.py`） |
+| 已删除（PR 1） | 旧 `src/`、`examples/`、`tests/`、`river.pyi`、`.github/`（CI 到 PR 6 再建） |
+| 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
+| 依赖 | `pyo3 0.30`（`abi3-py312`）、`libc`、`rustix 0.38`、`seccompiler 0.5`、`landlock 0.4`（crates.io 上的 crate 名；项目名叫 rust-landlock）、`caps 0.5`；Python ≥ 3.12，pytest ≥ 8 |
 
 ## 2. 开发工作流（通用）
 
@@ -58,7 +56,7 @@
 
 每个 PR 独立可验证，做完再开下一个。验证命令在 WSL 和远端两套环境各跑一遍（至少功能组）。
 
-### PR 1 清场 + 骨架 + `river.doctor()`
+### PR 1 清场 + 骨架 + `river.doctor()` ✅ 已完成（2026-11-24，`dev` @ `a302ebb`）
 
 目标：删掉旧实现，建立新骨架，`doctor()` 能给出与 `docs/environment.local.md` 一致的环境报告。
 
@@ -68,17 +66,17 @@
 
 | 文件 | 内容 |
 |---|---|
-| `Cargo.toml` | `[package] name="river"`，edition 2024，`[lib] crate-type=["cdylib","rlib"]`；依赖 `pyo3`（`abi3-py312` + `extension-module` feature 交给 maturin）、`libc`、`rustix`（features：`mount thread process fs event system time`）、`seccompiler`、`rust-landlock`、`caps`；只支持 Linux，不需要 `cfg(target_os)` 分支 |
+| `Cargo.toml` | `[package] name="river"`，edition 2024，`[lib] crate-type=["cdylib","rlib"]`；依赖 `pyo3`（`abi3-py312` + `extension-module` feature 交给 maturin）、`libc`、`rustix`（features：`mount thread process fs event system time`）、`seccompiler`、`landlock`（crate 名；项目名 rust-landlock）、`caps`；只支持 Linux，不需要 `cfg(target_os)` 分支 |
 | `pyproject.toml` | maturin backend；`requires-python >= 3.12`；`[tool.maturin] module-name = "river._river", python-source = "python", features = ["pyo3/extension-module"]`；`[project.optional-dependencies] test = ["pytest>=8"]`；`[tool.pytest.ini_options] testpaths=["tests"]`、markers：`functional limits attack concurrency doctor`；`[tool.uv] package = false` |
-| `python/river/__init__.py` | `from river._river import River, ExecResult, RiverError, KernelTooOldError, ...`；`doctor()` 的 Python 侧（调用 `_river.run_doctor_checks()`，组装 `DoctorReport`）；`__all__` |
+| `python/river/__init__.py` | `from river._river import River, ExecResult, RiverError, KernelTooOldError, ...`；`doctor()` 的 Python 侧（调用 `_river.run_doctor_checks(raise_on_fail)`，组装 `DoctorReport`）；`__all__` |
 | `python/river/_river.pyi`、`py.typed` | 原生模块的类型存根 |
-| `src/lib.rs` | `#[pymodule] fn _river(...)`：注册异常类、`River`、`ExecResult`、`run_doctor_checks()` |
-| `src/api.rs` | `River` / `ExecResult` 的 PyO3 类骨架：`River.__init__` 调 `preflight::check_all()`；`exec()` 暂抛 `NotImplementedError("PR 2")`；异常类层级（design.md §4） |
-| `src/preflight.rs` | design.md §8 全部检查，返回 `Vec<(name, ok, detail, remediation)>`；内核版本解析用 `uname()`；AppArmor knob 读 `/proc/sys/kernel/apparmor_restrict_unprivileged_userns`，不存在视为通过；userns 探测 = `fork` 一个子进程 `unshare(CLONE_NEWUSER)` 后 `_exit(0/errno)`；Landlock ABI 作为信息项 |
-| `src/cgroup.rs` | design.md §7 的检测部分（1–5 步）+ 进程级单例 `OnceLock`；run cgroup 的创建留到 PR 3 |
-| `tests/test_doctor.py` | 在委托环境下 `doctor()` 全绿；`doctor(raise_on_fail=False)` 返回结构正确；在非委托环境下 `raise_on_fail=True` 抛 `CgroupNotDelegatedError`（pytest 内用 `subprocess` 起一个不带 `systemd-run` 的子进程验证，或标 `skipif` 当前已在委托环境） |
+| `src/lib.rs` | `#[pymodule] mod _river`（声明式 `#[pymodule_export]`）：导出异常类、`River`、`ExecResult`、`run_doctor_checks()` |
+| `src/api.rs` | `River` / `ExecResult` 的 PyO3 类骨架：`River.__init__` 调 `preflight::check_all()` + rootfs 检查；`exec()` 暂抛 `NotImplementedError`；异常类层级用 `create_exception!`（design.md §4） |
+| `src/preflight.rs` | design.md §8 全部检查，按序为 `platform kernel userns.max userns.apparmor userns.probe cgroup workdir landlock_abi`，返回 `Vec<(name, ok, detail, remediation)>`；**检查名 → 异常的映射只在这里**，`run_doctor_checks(raise_on_fail)` 同时服务 `doctor()` 和 `River()`；内核版本解析用 `uname()`；AppArmor knob 不存在视为通过；userns 探测 = `fork` 一个子进程 `unshare(CLONE_NEWUSER)` 后 `_exit(0/errno)`；Landlock ABI 作为信息项（裸 syscall，libc 没有 `LANDLOCK_CREATE_RULESET_VERSION`）；rootfs 挂载点补建与 `meta.json` 校验也在这里 |
+| `src/cgroup.rs` | design.md §7 第 1–5 步 + 进程级单例 `OnceLock`；`doctor()` 与 `River()` 共用这个单例——只读 `cgroup.controllers` 检测不出未委托（WSL 的 `/non-systemd` 也显示有控制器），必须真的走到第 5 步；`EBUSY` 时列出 `<base>` 内残留进程；run cgroup 的创建留到 PR 3 |
+| `tests/test_doctor.py` | 委托 / 非委托两组用 `skipif` 互斥：委托环境下 `doctor()` 全绿、`raise_on_fail=False` 结构正确、单例已建立；非委托环境下 `raise_on_fail=True` 抛 `CgroupNotDelegatedError` 且含修复命令。另有一个**确定性**负向用例：子进程把自己挪进 `river/` 下一个无控制器的子 cgroup 再跑 `doctor()`（"兄弟 scope"在当前 systemd 上不可靠，见 design.md §7）。`River()` 的挂载点补建 / `meta.json` 用 `tmp_path`，真实 rootfs 用例靠 `RIVER_TEST_ROOTFS` |
 | `README.md` | 重写：一句话定位、状态（开发中）、指向 `docs/design.md` 与本计划、通用开发命令（§2）。不写任何机器信息 |
-| `.gitignore` | 追加 `.mypy_cache/`、`.ruff_cache/`（`*.local.md` 已加） |
+| `.gitignore` | 追加 `.mypy_cache/`、`.ruff_cache/`、`*.so`（`*.local.md` 已加） |
 
 验证：
 
@@ -88,6 +86,8 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 ```
 
 完成标准：两套环境（远端用非特权账号）上 `doctor()` 报告与 `docs/environment.local.md` 的环境表一致；在非委托环境下 `doctor(raise_on_fail=True)` 抛 `CgroupNotDelegatedError` 且消息含修复命令；`git status` 干净且没有 `*.local.md` 被跟踪；`dev` 分支已推送（推送前确认）。
+
+**结果：全部满足。** WSL：委托 12 过 3 跳，非委托 6 过 9 跳；远端 tester：委托 13 过 2 跳（带真实 rootfs），非委托 6 过 9 跳；两套 `doctor()` 各项与环境表一致，Landlock ABI 见 §5 V6。执行中修正了计划的两个假设：启动命令里不能套 `uv run`（§2），crate 名是 `landlock`。
 
 ### PR 2 P0 沙箱
 
@@ -145,24 +145,26 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 PR 2 开始前（或进行中）用最小代价确认，结果回写到 design.md；具体命令见 `docs/environment.local.md`。
 
-| # | 假设 | 验证方法 | 不成立时 |
-|---|---|---|---|
-| V1 | WSL 内核允许非特权 userns + mount ns + pivot_root | `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true` | WSL 只做编辑，构建测试全部去远端 |
-| V2 | WSL 上从 `wsl.exe -e` 环境能用 `systemd-run --user --scope -p Delegate=yes` | 在该环境里 `systemd-run --user --scope -p Delegate=yes -- cat <自身 cgroup>/cgroup.controllers`，期望含 `cpu memory pids` | 改用登录 shell 或只在远端跑 |
-| V3 | 远端非特权账号的 session scope 已委托 | 以该账号 `cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cgroup.controllers`，且目录属主为该账号 | 一律用 `systemd-run --user --scope` |
-| V4 | `libc` 暴露 `clone3` + `clone_args` | `grep clone3 ~/.cargo/registry/src/*/libc-*/src/unix/linux_like/linux/gnu/mod.rs` | 用 `nix::sched::clone` 或手写 `syscall(SYS_clone3)` |
-| V5 | rustix 0.38 有 `mount_setattr` | docs.rs `rustix::mount` | `libc::syscall(SYS_mount_setattr, …)` |
-| V6 | Landlock 在两套环境的 ABI 版本 | PR 1 的 `doctor()` 输出 `landlock_abi` | ABI 0 → Landlock 自动关闭并警告（design.md §9） |
-| V7 | `/dev/ptmx` 从 `/dev/pts/ptmx` bind 后 `openpty` 可用 | PR 2 功能测试：沙箱内 `python -c "import pty; pty.openpty()"` | 改为 bind 宿主 `/dev/ptmx` |
-| V8 | docker 导出的 rootfs 以运行用户解压后 Python 能在沙箱内启动 | PR 2 的 hello world | 检查 `ld.so.cache`、`/usr/local/bin/python` 符号链接是否保留（`tar -p`） |
-| V9 | user namespace 内能只读挂载 sysfs；Landlock 开启后 `/dev/null`、`/dev/urandom` 读写正常 | PR 2：沙箱内 `python -c "import os; os.write(os.open('/dev/null', os.O_WRONLY), b'x'); print(os.listdir('/sys')[:3])"` | sysfs 挂载失败 → 改为只读 bind 宿主 `/sys`；设备写入失败 → 补 Landlock `WRITE_FILE` 规则（design.md §9） |
+| # | 假设 | 验证方法 | 不成立时 | 结果 |
+|---|---|---|---|---|
+| V1 | WSL 内核允许非特权 userns + mount ns + pivot_root | `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true` | WSL 只做编辑，构建测试全部去远端 | ✅ 通过（2026-11-23） |
+| V2 | WSL 上从 `wsl.exe -e` 环境能用 `systemd-run --user --scope -p Delegate=yes` | 在该环境里 `systemd-run --user --scope -p Delegate=yes -- cat <自身 cgroup>/cgroup.controllers`，期望含 `cpu memory pids` | 改用登录 shell 或只在远端跑 | ✅ 通过；但 scope 内必须直接启动 `.venv/bin/python`（§2） |
+| V3 | 远端非特权账号的 session scope 已委托 | 以该账号 `cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cgroup.controllers`，且目录属主为该账号 | 一律用 `systemd-run --user --scope` | ⚠️ 部分：经 `sudo -u` 启动落在调用者（root）的 session scope，**非委托**；`systemd-run --user --scope -p Delegate=yes`（需 `XDG_RUNTIME_DIR`）已验证全绿。真正的登录 session 未测，一律按"不成立"处理 |
+| V4 | `libc` 暴露 `clone3` + `clone_args` | `grep clone3 ~/.cargo/registry/src/*/libc-*/src/unix/linux_like/linux/gnu/mod.rs` | 用 `nix::sched::clone` 或手写 `syscall(SYS_clone3)` | 待 PR 2 |
+| V5 | rustix 0.38 有 `mount_setattr` | docs.rs `rustix::mount` | `libc::syscall(SYS_mount_setattr, …)` | 待 PR 2 |
+| V6 | Landlock 在两套环境的 ABI 版本 | PR 1 的 `doctor()` 输出 `landlock_abi` | ABI 0 → Landlock 自动关闭并警告（design.md §9） | ✅ WSL（6.18）ABI v7，远端（7.0）ABI v8；§9 列出的全部权限都可用 |
+| V7 | `/dev/ptmx` 从 `/dev/pts/ptmx` bind 后 `openpty` 可用 | PR 2 功能测试：沙箱内 `python -c "import pty; pty.openpty()"` | 改为 bind 宿主 `/dev/ptmx` | 待 PR 2 |
+| V8 | docker 导出的 rootfs 以运行用户解压后 Python 能在沙箱内启动 | PR 2 的 hello world | 检查 `ld.so.cache`、`/usr/local/bin/python` 符号链接是否保留（`tar -p`） | 待 PR 2（两套环境的 rootfs 已就绪，解压后 `/dev` 里没有设备节点，由 `River()` 补建普通文件挂载点） |
+| V9 | user namespace 内能只读挂载 sysfs；Landlock 开启后 `/dev/null`、`/dev/urandom` 读写正常 | PR 2：沙箱内 `python -c "import os; os.write(os.open('/dev/null', os.O_WRONLY), b'x'); print(os.listdir('/sys')[:3])"` | sysfs 挂载失败 → 改为只读 bind 宿主 `/sys`；设备写入失败 → 补 Landlock `WRITE_FILE` 规则（design.md §9） | 待 PR 2 |
 
 ## 6. 风险
 
 | 风险 | 应对 |
 |---|---|
-| WSL 内核缺 Landlock / 其他特性 | doctor 把 Landlock 作为信息项而非失败项；真实验证以远端 Linux 为准 |
+| WSL 内核缺 Landlock / 其他特性 | 已实测 WSL Landlock ABI v7、远端 v8，未发生；doctor 仍把 Landlock 作为信息项而非失败项 |
 | 远端机器内存较小（< 2 GB） | 测试用的内存限制 ≤ 256 MB；不要并行跑大内存用例 |
 | `clone3` 后子进程里 Rust 运行时行为 | 子进程路径只放裸 syscall；PR 2 用 `RIVER_LOG=debug` 逐步打点确认每个 step |
 | `/work` 在 `$XDG_RUNTIME_DIR` 下占满 tmpfs | `memory.max` 计入 tmpfs 页；exec 结束即删；PR 5 评估是否需要 `nr_inodes` |
 | 调用方 Python 进程本身不在委托 cgroup 里 | 这是 fail-fast 的预期行为；doctor 消息给出 `systemd-run --user --scope -p Delegate=yes` 命令 |
+| 委托 cgroup 里还有别的进程（外层 `uv run`/`make`、`sudo -u` 落进调用者的 session scope） | 第 5 步 `EBUSY` 时 doctor 列出残留进程；验证命令一律 `systemd-run ... -- .venv/bin/python`（§2），远端加 `XDG_RUNTIME_DIR` |
+| 用户 scope 的委托表现随 systemd 版本变化（`Delegate=yes` 启用的控制器会留在父 slice，兄弟 scope 看起来也"已委托"） | 不用兄弟 scope 模拟非委托环境；负向用例用 `river/` 下无控制器的子 cgroup（design.md §7 第 5 步） |

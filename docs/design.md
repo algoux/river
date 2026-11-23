@@ -136,7 +136,7 @@ river.RiverError(RuntimeError)
 { "envs": { "PATH": "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin", "HOME": "/work" } }
 ```
 
-- `River.__init__` 时若文件存在则解析并校验（`envs` 必须是 `str → str`），非法 → `RootfsError`。
+- `River.__init__` 时若文件存在则解析并校验：顶层必须是 JSON 对象，`envs` 键缺失视为空映射，存在则必须是 `str → str`；非法 → `RootfsError`。校验通过后 `exec(envs=None)` 使用它。
 - `exec(envs=None)` 使用它；文件不存在且没有 `envs` → `RootfsError`。
 - 其余键预留，未知键忽略。
 
@@ -212,10 +212,10 @@ cgroup2 文件系统不能在 user namespace 内挂载，必须使用宿主上**
 | cgroup 委托（§7） | `CgroupNotDelegatedError` |
 | rootfs 是目录；总是补建缺失的挂载点：目录 `proc`、`sys`、`dev/pts`、`dev/shm`、`dev/mqueue`、`tmp`、`work`，普通文件 `dev/null`、`dev/zero`、`dev/full`、`dev/random`、`dev/urandom`、`dev/ptmx`（已存在则跳过，只增不改，不碰其他任何文件）。补建失败（rootfs 只读等）且确实缺失 → `RootfsError`，消息指出缺的是哪个路径 | `RootfsError` |
 | `meta.json` 可解析（存在时） | `RootfsError` |
-| `/work` 宿主目录位置可用：`$XDG_RUNTIME_DIR/river` 否则 `/dev/shm/river-<uid>` | `RiverError` |
+| `/work` 宿主目录位置可用：`$XDG_RUNTIME_DIR/river` 否则 `/dev/shm/river-<uid>`（以 0700 创建，校验属主为当前用户） | `RiverError` |
 | Landlock ABI 版本（信息项，`landlock_create_ruleset(NULL, 0, LANDLOCK_CREATE_RULESET_VERSION)`） | 不失败，仅报告 |
 
-`doctor()` 返回 `DoctorReport(checks=[Check(name, ok, detail, remediation)])`，`__str__` 打印表格；`raise_on_fail=True` 时抛第一个失败的检查对应的异常。
+`doctor()` 返回 `DoctorReport(checks=[Check(name, ok, detail, remediation)])`，`__str__` 打印表格；`raise_on_fail=True`（默认）时抛第一个失败的检查对应的异常，`remediation` 只在失败时有值。检查按固定顺序、固定名字排列（测试依赖这些名字）：`platform`、`kernel`、`userns.max`、`userns.apparmor`、`userns.probe`、`cgroup`、`workdir`、`landlock_abi`（信息项，永不失败）；rootfs 相关检查只在 `River.__init__` 做，不在报告里。`doctor()` 与 `River()` 共用同一份实现和同一个 cgroup 单例（§7），所以 `doctor()` 也会把调用进程停进 `<base>/river`——这正是 `River()` 会做的事，不是额外副作用。检查名到异常的映射只在实现里维护一处。
 
 ## 9. 沙箱内安全
 
@@ -266,7 +266,7 @@ tests/                         # pytest：functional / limits / attack / concurr
 docs/design.md  docs/example.py
 ```
 
-依赖：`pyo3`、`libc`、`rustix`（mount/thread/process/fs/event/system/time）、`seccompiler`、`rust-landlock`、`caps`。不依赖 `zbus`、`cgroups-rs`、`tempfile`。Python ≥ 3.12，`abi3-py312`。
+依赖：`pyo3`、`libc`、`rustix`（mount/thread/process/fs/event/system/time）、`seccompiler`、`landlock`（crates.io 上的 crate 名；项目名 rust-landlock）、`caps`。不依赖 `zbus`、`cgroups-rs`、`tempfile`、`serde_json`（`meta.json` 经 Python 的 `json` 模块解析）。Python ≥ 3.12，`abi3-py312`。
 
 测试环境：两套 Linux ≥ 6.8 环境——本地 WSL2（开发构建、快速 pytest）和一台远端 Linux（真实环境验证，内存较小）。rootless 路径必须用非特权账号验证；进程若不在委托 cgroup 里，用 `systemd-run --user --scope -p Delegate=yes ...` 启动。具体机器、账号、准备命令见 `docs/environment.local.md`（不入库）。
 
@@ -283,7 +283,7 @@ printf '{"envs":{"PATH":"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 
 | PR | 内容 | 验收 |
 |---|---|---|
-| 1 清场 + 骨架 | 删除旧实现全部代码与示例（Windows/macOS 后端、loopdev、examples、旧测试）；新 Cargo/pyproject/`python/river`；`river.doctor()` + 全部预检 | 两套环境上 `doctor()` 报告与本地环境记录一致 |
+| 1 清场 + 骨架 ✅ 2026-11-24 | 删除旧实现全部代码与示例（Windows/macOS 后端、loopdev、examples、旧测试）；新 Cargo/pyproject/`python/river`；`river.doctor()` + 全部预检 | 两套环境上 `doctor()` 报告与本地环境记录一致（已达成） |
 | 2 P0 沙箱 | clone3 → idmap → mount → pivot → caps → nnp → execve；父进程 epoll + 管道；计量；`AC/RE` | `python -c` 跑通；`docs/example.py` 全字段有值 |
 | 3 P1 cgroup | §7 单例、run cgroup、限制 knob、`cgroup.kill`、`TLE/MLE/OLE` 判定 | 死循环 / 大内存 / 写爆 stdout / fork bomb 用例状态正确 |
 | 4 P2 加固 | seccomp denylist、Landlock、`attack` 测试组 | 嵌套 userns、netlink、写 rootfs、symlink copy_out 全部被拒 |
@@ -301,7 +301,7 @@ CI 不在本阶段范围内。
 | procfs `subset=pid` | 5.8 | 隐藏 `/proc/sys` 等（默认不用） | — |
 | unprivileged overlayfs（需 `userxattr`） | 5.11 | 不用（P3 可选项） | — |
 | `mount_setattr`、idmapped mounts | 5.12 | 递归 rdonly/nosuid；idmapped 不用 | `mount(MS_REMOUNT)` 老坑 |
-| Landlock | 5.13（ABI 逐版本增强，v6=6.12） | 文件系统写限制 | 自动关闭 |
+| Landlock | 5.13（ABI 逐版本增强，v6=6.12） | 文件系统写限制 | 自动关闭（实测：6.18 内核 ABI 7，7.0 内核 ABI 8，§9 列出的全部权限在两套环境都可用） |
 | `cgroup.kill` | 5.14 | 原子清场 | kill pid 1 |
 | `memory.peak` | 5.19 | 峰值内存 | `ru_maxrss` |
 | `memory.oom.group` | 4.19 | OOM 整组杀 | — |
