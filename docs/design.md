@@ -127,6 +127,7 @@ river.RiverError(RuntimeError)
 - `River` 没有配置参数：缺失的挂载点总是补建（§8），`/sys` 只读挂载（§5），`/tmp` 用内核默认 tmpfs，seccomp denylist 与 Landlock 总是开启（内核不支持 Landlock 时自动关闭并警告）。
 - Ctrl-C：epoll 超时上限 100ms，每次醒来调用 `PyErr::check_signals`；收到中断 → `cgroup.kill` → 回收 → 抛 `KeyboardInterrupt`，不留孤儿沙箱。
 - 环境变量：`RIVER_LOG=debug` 让父/子进程把每个 step 打到 stderr；`RIVER_HARDENING=off` 关闭 seccomp 与 Landlock（命名空间、只读 rootfs、丢 caps 不受影响），只用于定位"程序被加固层误伤"，不是配置项。
+- 参数误用与缺失文件：`stdin` 与 `stdin_file` 同时给出 → `ValueError`；`stdin_file` 指向的文件不存在 → `ExecSetupError`（与 `cwd` 不存在一致，fail-fast，不静默回退空输入）；`executable` 不含 `/` 而 `envs` 缺 `PATH` → `ValueError`。
 
 ### 4.1 `meta.json`
 
@@ -144,22 +145,21 @@ river.RiverError(RuntimeError)
 
 | step | 操作 | 说明 |
 |---|---|---|
-| `child.pdeathsig` | `prctl(PR_SET_PDEATHSIG, SIGKILL)`；若 `getppid()` ≠ 期望的父 pid 则直接退出 | 调用方线程意外死亡时整个沙箱随之消亡 |
+| `child.pdeathsig` | `prctl(PR_SET_PDEATHSIG, SIGKILL)`；父进程存活校验：`CLONE_NEWPID` 下 `getppid()` 恒为 0（父进程在 pid ns 之外），改为读 `/proc/self/status` 的 `PPid:` 行与期望的父 pid 比对，不符则直接退出 | 调用方线程意外死亡时整个沙箱随之消亡 |
 | `child.idmap.*` | 写 `/proc/self/setgroups`=`deny`、`uid_map`=`0 <uid> 1`、`gid_map`=`0 <gid> 1` | 子进程是 userns 创建者，拥有 `CAP_SETUID/SETGID`，不需要父进程参与；此时看到的还是宿主 `/proc` |
 | `child.wait_go` | 阻塞读 sync socket 1 字节 | 父进程此时把 pid 写进 `cgroup.procs`，保证 exec 前 limits 已生效 |
 | `child.mount.private` | `mount("none", "/", NULL, MS_REC\|MS_PRIVATE)` | 阻止后续 umount/pivot 传播回宿主 |
-| `child.mount.bind_root` | `fchdir(rootfs_fd)`；`mount(".", ".", MS_BIND)`；`chdir(".")` | 让 new root 成为挂载点（`pivot_root` 的硬性要求）；bind 后必须重新 `chdir(".")` 才能拿到新挂载点 |
-| `child.mount.root_attr` | `mount_setattr(O_PATH fd, "", AT_EMPTY_PATH\|AT_RECURSIVE, RDONLY\|NOSUID\|NODEV)` | 递归只读；rootfs 里的 setuid 位全部失效 |
+| `child.mount.bind_root` | 按宿主**路径** `chdir` 进 rootfs（`CLONE_NEWNS` 之后预打开的 fd 仍指向父 ns 的 mount 对象，路径解析必须走本 ns）；`open_tree(OPEN_TREE_CLONE\|AT_RECURSIVE)` 克隆为**分离**挂载 → `mount_setattr(RDONLY\|NOSUID\|NODEV, RECURSIVE)` → `move_mount` 到原路径；再按宿主路径重新 `chdir`（从父目录**走进**该目录才会穿过新挂载点，`chdir(".")` 不会） | 让 new root 成为只读挂载点（`pivot_root` 的硬性要求）。实现注记：对**已挂接**的 bind 调 `mount_setattr` 恒 `EINVAL`（内核 `MNT_LOCK_*` 语义），旧式 bind+remount 在新内核上会静默忽略 flag，分离挂载是唯一可靠配方 |
 | `child.mount.proc` | `mount("proc", "./proc", "proc", NOSUID\|NODEV\|NOEXEC)` | 新 pid ns 的 procfs；子进程是 pid 1 所以允许挂载 |
-| `child.mount.devpts` | `devpts` `newinstance,ptmxmode=0666,mode=0620` 于 `./dev/pts`；再 bind 宿主 `/dev/pts/ptmx` → `./dev/ptmx` | bind 的目的是让 `/dev/ptmx` 指向这个新 devpts 实例 |
+| `child.mount.devpts` | `devpts` `newinstance,ptmxmode=0666,mode=0620` 于 `./dev/pts`；再 bind **新实例自己的** `./dev/pts/ptmx` → `./dev/ptmx` | bind 宿主的 ptmx 会把 `/dev/ptmx` 链到宿主 devpts 实例，`openpty` 拿不到 slave；bind 新实例的节点才符合本 step 的目的 |
 | `child.mount.shm` / `mqueue` / `tmp` | tmpfs（`mode=1777`）于 `./dev/shm`；`mqueue` 于 `./dev/mqueue`；tmpfs（`mode=1777`，内核默认大小）于 `./tmp` | |
-| `child.mount.dev_*` | 宿主 `/dev/null` `/dev/zero` `/dev/full` `/dev/random` `/dev/urandom` 逐个 bind 到 `./dev/*`，再 `mount_setattr(NOSUID)` | **不能加 `NODEV`**，否则设备不可用；userns 内自己 `mknod` 的节点不可用，所以必须 bind |
-| `child.mount.work` | `mount(<宿主 work 目录>, "./work", MS_BIND)`，再 `mount_setattr(NOSUID\|NODEV)` | 保留 exec（判题编译产物在 /work 运行） |
-| `child.mount.sys` | `sysfs`（`nosuid\|nodev\|noexec\|ro`）于 `./sys`；失败视为建立失败 | user namespace 拥有新 netns，所以允许挂载；挂载点由 §8 预检补建 |
+| `child.mount.dev_*` | 宿主 `/dev/null` `/dev/zero` `/dev/full` `/dev/random` `/dev/urandom` 逐个 `open_tree(CLONE)` → `mount_setattr(NOSUID)` → `move_mount ./dev/*` | **不能加 `NODEV`**，否则设备不可用；userns 内自己 `mknod` 的节点不可用，所以必须 bind |
+| `child.mount.work` | 宿主 work 目录 `open_tree(CLONE)` → `mount_setattr(NOSUID\|NODEV)` → `move_mount ./work` | 保留 exec（判题编译产物在 /work 运行） |
+| `child.mount.sys` | `sysfs`（`nosuid\|nodev\|noexec\|ro`）于 `./sys`，再以 ro tmpfs 覆盖 `./sys/fs`；失败视为建立失败 | user namespace 拥有新 netns，所以允许挂载；挂载点由 §8 预检补建。6.6+ 内核在 userns 内挂 sysfs 时会**自动挂 cgroup2** 到 `/sys/fs/cgroup`，视图暴露调用方的 cgroup 子树，必须盖住 |
 | `child.mount.pivot` | `pivot_root(".", ".")`；`chdir("/")`；`umount2(".", MNT_DETACH)` | 不需要 `.oldroot` 目录 |
 | `child.net.lo` | `ioctl(SIOCSIFFLAGS)` 把 `lo` 置 `IFF_UP` | 在丢 caps 之前做 |
 | `child.rlimit.*` | `setrlimit`，见 §6 | 只对传了参数的限制调用 |
-| `child.caps.*` | `PR_CAPBSET_DROP` 全部 cap；`capset()` 清空 P/E/I/A；`securebits = NOROOT\|NOROOT_LOCKED` | NOROOT 防止 uid 0 在 execve 时重新获得 bounding set |
+| `child.caps.*` | `PR_CAPBSET_DROP` 全部 cap（userns 内允许）；`capset()` 清空 P/E/I | `PR_SET_SECUREBITS` 需要 **init user namespace** 的 CAP_SETPCAP，rootless 下 `EPERM`，不做；NOROOT 防的 uid-0-execve 重取权限路径由下一步 `no_new_privs` 关闭 |
 | `child.nnp` | `PR_SET_NO_NEW_PRIVS` | seccomp / Landlock 的前提 |
 | `child.landlock.*` | 见 §9 | 处理写类权限；读/执行不处理 |
 | `child.seccomp` | `seccomp(SECCOMP_SET_MODE_FILTER)` | 见 §9 |
@@ -168,6 +168,8 @@ river.RiverError(RuntimeError)
 | `child.execve` | `execve`；无 `/` 时按 `envs["PATH"]`（沙箱内）逐段尝试 | 失败写 `{step, errno}` 到 sync，`_exit(42)` |
 
 成功路径不写 sync socket；`execve` 时因 `CLOEXEC` 自动关闭，父进程读到 EOF 即"已 exec"。
+
+信号注记：沙箱程序是新 pid ns 的 **pid 1**，内核只向 init 投递**带处理函数**的信号——`kill(getpid(), SIGSEGV)` 这类自杀式信号被直接丢弃（程序继续运行）。`RE`+`signal` 判定用真实硬件 fault 验证（如解引用空指针）；父进程侧的 `cgroup.kill`/`SIGKILL` 投递不受影响。
 
 ## 6. 资源限制与计量
 
@@ -225,7 +227,7 @@ cgroup2 文件系统不能在 user namespace 内挂载，必须使用宿主上**
 
 **网络**：新 netns，只有 `lo`（up）。没有 veth、没有 DNS。
 
-**Landlock**（总是开启）：处理的权限 = `WRITE_FILE`、`TRUNCATE`（ABI≥3）、`REMOVE_DIR`、`REMOVE_FILE`、`MAKE_CHAR`、`MAKE_DIR`、`MAKE_REG`、`MAKE_SOCK`、`MAKE_SYM`、`MAKE_FIFO`（ABI≥2）、`IOCTL_DEV`（ABI≥4），按内核 ABI 取交集；允许的位置：`/work`、`/tmp`、`/dev/shm` 全部处理权限，`/dev/pts` 仅 `WRITE_FILE`，`/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/ptmx` 仅 `WRITE_FILE`（设备节点的写入受 Landlock 管，不加规则会连 `echo > /dev/null` 都失败；PR 4 用 V9 验证）。读与执行不处理（rootfs 已只读）。在 `no_new_privs` 之后、`seccomp` 之前 `landlock_restrict_self`。内核不支持 Landlock（`landlock_create_ruleset` 返回 `ENOSYS`，ABI 0）时自动关闭并在 `RIVER_LOG=debug` 下警告，不算错误。
+**Landlock**（总是开启）：处理的权限 = `WRITE_FILE`、`TRUNCATE`（ABI≥3）、`REMOVE_DIR`、`REMOVE_FILE`、`MAKE_CHAR`、`MAKE_DIR`、`MAKE_REG`、`MAKE_SOCK`、`MAKE_SYM`、`MAKE_FIFO`（ABI≥2）、`IOCTL_DEV`（ABI≥4），按内核 ABI 取交集；允许的位置：`/work`、`/tmp`、`/dev/shm` 全部处理权限，`/dev/pts` 与设备节点 `/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/ptmx` 授 `WRITE_FILE` + `IOCTL_DEV`（设备写入与设备 ioctl 都受 Landlock 管：不加 `WRITE_FILE` 连 `echo > /dev/null` 都失败，不加 `IOCTL_DEV` 则 `openpty` 的 `TIOCGPTN` 等设备 ioctl 被拒；PR 4 用 V9 验证）。读与执行不处理（rootfs 已只读）。在 `no_new_privs` 之后、`seccomp` 之前 `landlock_restrict_self`。内核不支持 Landlock（`landlock_create_ruleset` 返回 `ENOSYS`，ABI 0）时自动关闭并在 `RIVER_LOG=debug` 下警告，不算错误。
 
 **seccomp**（denylist，总是开启；`RIVER_HARDENING=off` 时关闭）：
 

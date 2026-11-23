@@ -150,12 +150,12 @@ PR 2 开始前（或进行中）用最小代价确认，结果回写到 design.m
 | V1 | WSL 内核允许非特权 userns + mount ns + pivot_root | `bwrap --unshare-all --ro-bind / / --proc /proc --dev /dev -- /bin/true` | WSL 只做编辑，构建测试全部去远端 | ✅ 通过（2026-11-23） |
 | V2 | WSL 上从 `wsl.exe -e` 环境能用 `systemd-run --user --scope -p Delegate=yes` | 在该环境里 `systemd-run --user --scope -p Delegate=yes -- cat <自身 cgroup>/cgroup.controllers`，期望含 `cpu memory pids` | 改用登录 shell 或只在远端跑 | ✅ 通过；但 scope 内必须直接启动 `.venv/bin/python`（§2） |
 | V3 | 远端非特权账号的 session scope 已委托 | 以该账号 `cat /sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cgroup.controllers`，且目录属主为该账号 | 一律用 `systemd-run --user --scope` | ⚠️ 部分：经 `sudo -u` 启动落在调用者（root）的 session scope，**非委托**；`systemd-run --user --scope -p Delegate=yes`（需 `XDG_RUNTIME_DIR`）已验证全绿。真正的登录 session 未测，一律按"不成立"处理 |
-| V4 | `libc` 暴露 `clone3` + `clone_args` | `grep clone3 ~/.cargo/registry/src/*/libc-*/src/unix/linux_like/linux/gnu/mod.rs` | 用 `nix::sched::clone` 或手写 `syscall(SYS_clone3)` | 待 PR 2 |
-| V5 | rustix 0.38 有 `mount_setattr` | docs.rs `rustix::mount` | `libc::syscall(SYS_mount_setattr, …)` | 待 PR 2 |
+| V4 | `libc` 暴露 `clone3` + `clone_args` | `grep clone3 ~/.cargo/registry/src/*/libc-*/src/unix/linux_like/linux/gnu/mod.rs` | 用 `nix::sched::clone` 或手写 `syscall(SYS_clone3)` | ❌ 不成立（2026-11-24）：libc 0.2.191 的 gnu 目标没有 `clone3`/`clone_args` 绑定（仅 musl 有）→ 手写 `struct clone_args` + `libc::syscall(SYS_clone3, …)` 直调，不引入 nix |
+| V5 | rustix 0.38 有 `mount_setattr` | docs.rs `rustix::mount` | `libc::syscall(SYS_mount_setattr, …)` | ❌ 不成立（2026-11-24）：rustix 0.38 未暴露 → `libc::syscall` 直调；且实测**对已挂接的 bind 修改属性恒 `EINVAL`**（内核 `MNT_LOCK_*` 语义），旧式 bind+remount 也会静默忽略 flag——最终采用 `open_tree(OPEN_TREE_CLONE)` 分离挂载 + `mount_setattr` + `move_mount` 配方（见 design.md §5 回写） |
 | V6 | Landlock 在两套环境的 ABI 版本 | PR 1 的 `doctor()` 输出 `landlock_abi` | ABI 0 → Landlock 自动关闭并警告（design.md §9） | ✅ WSL（6.18）ABI v7，远端（7.0）ABI v8；§9 列出的全部权限都可用 |
-| V7 | `/dev/ptmx` 从 `/dev/pts/ptmx` bind 后 `openpty` 可用 | PR 2 功能测试：沙箱内 `python -c "import pty; pty.openpty()"` | 改为 bind 宿主 `/dev/ptmx` | 待 PR 2 |
-| V8 | docker 导出的 rootfs 以运行用户解压后 Python 能在沙箱内启动 | PR 2 的 hello world | 检查 `ld.so.cache`、`/usr/local/bin/python` 符号链接是否保留（`tar -p`） | 待 PR 2（两套环境的 rootfs 已就绪，解压后 `/dev` 里没有设备节点，由 `River()` 补建普通文件挂载点） |
-| V9 | user namespace 内能只读挂载 sysfs；Landlock 开启后 `/dev/null`、`/dev/urandom` 读写正常 | PR 2：沙箱内 `python -c "import os; os.write(os.open('/dev/null', os.O_WRONLY), b'x'); print(os.listdir('/sys')[:3])"` | sysfs 挂载失败 → 改为只读 bind 宿主 `/sys`；设备写入失败 → 补 Landlock `WRITE_FILE` 规则（design.md §9） | 待 PR 2 |
+| V7 | `/dev/ptmx` 从 `/dev/pts/ptmx` bind 后 `openpty` 可用 | PR 2 功能测试：沙箱内 `python -c "import pty; pty.openpty()"` | 改为 bind 宿主 `/dev/ptmx` | ✅ 通过（2026-11-24，WSL）：但 bind 的必须是**新实例自己的** `./dev/pts/ptmx`（bind 宿主 ptmx 会链到宿主 devpts 实例，`openpty` 拿不到 slave）；另外 Landlock 必须给设备授 `IOCTL_DEV`（`openpty` 的 `TIOCGPTN` ioctl），否则 `ENXIO` |
+| V8 | docker 导出的 rootfs 以运行用户解压后 Python 能在沙箱内启动 | PR 2 的 hello world | 检查 `ld.so.cache`、`/usr/local/bin/python` 符号链接是否保留（`tar -p`） | ✅ 通过（2026-11-24，WSL）：hello world 在 `python:3.12-slim` rootfs 内 `AC` |
+| V9 | user namespace 内能只读挂载 sysfs；Landlock 开启后 `/dev/null`、`/dev/urandom` 读写正常 | PR 2：沙箱内 `python -c "import os; os.write(os.open('/dev/null', os.O_WRONLY), b'x'); print(os.listdir('/sys')[:3])"` | sysfs 挂载失败 → 改为只读 bind 宿主 `/sys`；设备写入失败 → 补 Landlock `WRITE_FILE` 规则（design.md §9） | ✅ 通过（2026-11-24，WSL）：sysfs 只读挂载、`/dev/null` 可写、`/dev/urandom` 可读；6.6+ 内核在 userns 内挂 sysfs 会**自动挂 cgroup2** 到 `/sys/fs/cgroup`（视图暴露调用方 cgroup 子树），用 ro tmpfs 覆盖 `./sys/fs` 解决 |
 
 ## 6. 风险
 
