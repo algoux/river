@@ -169,7 +169,7 @@ river.RiverError(RuntimeError)
 
 成功路径不写 sync socket；`execve` 时因 `CLOEXEC` 自动关闭，父进程读到 EOF 即"已 exec"。
 
-信号注记：沙箱程序是新 pid ns 的 **pid 1**，内核只向 init 投递**带处理函数**的信号——`kill(getpid(), SIGSEGV)` 这类自杀式信号被直接丢弃（程序继续运行）。`RE`+`signal` 判定用真实硬件 fault 验证（如解引用空指针）；父进程侧的 `cgroup.kill`/`SIGKILL` 投递不受影响。
+信号注记：沙箱程序是新 pid ns 的 **pid 1**（`SIGNAL_UNKILLABLE`），内核只向 init 投递**带处理函数**的信号——用户态 `kill(getpid(), SIGSEGV)` 这类自杀式信号，以及内核 `send_sig`（非 priv）发的 `SIGXCPU`（RLIMIT_CPU soft 到期）与 `SIGXFSZ`（RLIMIT_FSIZE 超限）同样被直接丢弃（6.18 与 7.0 内核实测：CPU 死循环在 soft 秒后不死于 24，由 hard=soft+1 的 `SIGKILL` 在 +1s 兜底）。`RE`+`signal` 判定用真实硬件 fault 验证（如解引用空指针）；CPU 总量与文件输出上限因此依赖 hard 兜底 + 事后判定（§6）。父进程侧的 `cgroup.kill`/`SIGKILL` 投递不受影响。
 
 ## 6. 资源限制与计量
 
@@ -177,8 +177,8 @@ river.RiverError(RuntimeError)
 |---|---|---|---|
 | `cpu_time_limit_ms` | `RLIMIT_CPU` soft=`ceil(ms/1000)`（到期 `SIGXCPU`，默认终止）、hard=soft+1（`SIGKILL`） | `cpu.stat usage_usec` | `WTERMSIG==SIGXCPU`，或结束后 `cpu_used > limit` → `TLE` |
 | `wall_time_limit_ms` | epoll 超时 = deadline | `CLOCK_MONOTONIC`：发 "go" → `waitid` 返回 | 到期 → `cgroup.kill` → `TLE` |
-| `memory_limit_bytes` | `memory.max`、`memory.swap.max=0`、`memory.oom.group=1` | `memory.peak`（等 `cgroup.events populated=0` 后读） | `memory.events oom_kill > 0`，或结束后 `peak ≥ limit` 且非正常退出 → `MLE` |
-| `stdout_limit_bytes` / `stderr_limit_bytes` | 管道：读到上限后置 `output_limit_hit` 并 `cgroup.kill`；文件：`RLIMIT_FSIZE = max(两者)` | 实际收到的字节数 | `output_limit_hit` 或文件超过各自上限 → `OLE` |
+| `memory_limit_bytes` | `memory.max`、`memory.swap.max=0`、`memory.oom.group=1` | `memory.peak`（等 `cgroup.events populated=0` 后读） | `memory.events` 的 `oom_kill` 或 `oom_group_kill` 计数 > 0，或结束后 `peak ≥ limit` 且非正常退出 → `MLE` |
+| `stdout_limit_bytes` / `stderr_limit_bytes` | 管道：读到**超过**上限（恰等于不算）后置 `output_limit_hit` 并 `cgroup.kill`，继续读并丢弃；文件：`RLIMIT_FSIZE = max(两者)`（写入被钳在上限并返回 `EFBIG`；pid 1 丢弃内核发的 `SIGXFSZ`，见 §5 信号注记） | 实际收到的字节数 | `output_limit_hit`，或文件 **>** 各自上限，或文件恰好停在各自上限且运行非正常退出 → `OLE`。文件判定由宿主经 /work bind `stat`（`*_file` 解析后不在 /work 下且写入者是 fork 子进程的极端情况无法观测，判 `RE`） |
 | `copy_out_limit_bytes` | 拷贝时截断检查 | — | 超过 → `CopyOutError` |
 | `proc_limit` | `pids.max`、`RLIMIT_NPROC` | — | — |
 | `open_file_limit` / `stack_limit_bytes` / `address_space_limit_bytes` | `RLIMIT_NOFILE` / `RLIMIT_STACK` / `RLIMIT_AS` | — | — |

@@ -19,9 +19,9 @@
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `fe92fca`（PR 2），`origin = git@github.com:algoux/river.git` |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `9955a84`（PR 3），`origin = git@github.com:algoux/river.git` |
 | 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
-| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
+| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
 | 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
 | 依赖 | `pyo3 0.30`（`abi3-py312`）、`libc`、`rustix 0.38`、`seccompiler 0.5`、`landlock 0.4`（crates.io 上的 crate 名；项目名叫 rust-landlock）、`caps 0.5`；Python ≥ 3.12，pytest ≥ 8 |
 
@@ -110,7 +110,7 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 **结果：全部满足。** WSL（委托 scope）与远端 tester 各 32 过 2 跳（跳过的是非委托环境用例；functional 组 20/20）。`docs/example.py` 的调用形态由 `test_example_py_call_shape` 逐参数复刻验证（其 `stdin_file="input.txt"` 原先与 `copy_in={}` 自相矛盾，已按拍板结论改为 `copy_in={"input.txt": "1 2 3\n"}`；`stdin_file` 不存在 → `ExecSetupError`）。执行中修正了设计的多处内核级假设并已回写 design.md §4/§5/§9：pdeathsig 校验改读 `/proc/self/status` 的 PPid（NEWPID 下 getppid 恒为 0）；rootfs 进入与 ro-bind 改用 open_tree 分离挂载配方（对已挂 bind 的 mount_setattr 恒 EINVAL，旧式 bind+remount 被忽略）；ptmx bind 新实例的 `./dev/pts/ptmx`；`PR_SET_SECUREBITS` rootless 不可达（删）；Landlock 设备授权补 `IOCTL_DEV`（openpty）；≥6.6 内核 sysfs 自动挂 cgroup2，用 ro tmpfs 盖 `./sys/fs`；pid-1 丢弃无 handler 的自杀信号（`RE`+signal 用真实 fault 验证）。V4/V5 不成立、V7/V8/V9 通过（§5）。远端 `systemd-run` 需显式 `--setenv=HOME`（pytest 9 探测 `$HOME/pytest.toml`，scope 继承的 HOME 不可靠；记录在 environment.local.md）。
 
-### PR 3 P1 cgroup
+### PR 3 P1 cgroup ✅ 已完成（2026-11-24，`dev` @ `9955a84`）
 
 目标：所有限制参数生效，`TLE`/`MLE`/`OLE` 判定正确。
 
@@ -119,6 +119,8 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 测试（`tests/test_limits.py`，marker `limits`；内存数值按远端机器调小）：CPU 死循环 `cpu=1000, wall=5000` → `TLE` 且 `signal=24`（SIGXCPU）或 9；`sleep 10` + `wall=300` → `TLE`；分配 256 MB + `memory=64M` → `MLE`；打印 1 MB + `stdout_limit=64K` → `OLE`；fork 炸弹 + `proc_limit=16` → 子进程 `EAGAIN`，主程序正常结束；`copy_out_limit_bytes` 超限 → `CopyOutError`（若 PR 5 未做 copy_out，此用例挪到 PR 5）。
 
 完成标准：两套环境全绿；每个限制参数为 `None` 时对应 knob 确认未被写入（读 cgroup 文件断言 `max`）。
+
+**结果：全部满足。** WSL 与远端 tester 各 41 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 20/20、limits 9/9）。判定链按设计工作：256 MB vs `memory.max=64M`（`memory.oom.group=1` 整组 SIGKILL，`memory.events` 计数 → `MLE`）；1 MB stdout vs 64K 管道超限即 `cgroup.kill` → `OLE`（恰等于上限不算）；文件分支 RLIMIT_FSIZE 钳位 + 事后 `stat`；墙钟 300 ms → `cgroup.kill` → `TLE`；fork 炸弹 `proc_limit=16`（`pids.max`+`RLIMIT_NPROC` 双保险）→ 子进程 `EAGAIN`、主程序 `AC`；`copy_out_limit_bytes` 超限 → `CopyOutError`（`.result` 留 PR 5）。执行中修正了两个假设：① pid 1（`SIGNAL_UNKILLABLE`）同样丢弃内核 `send_sig`（非 priv）发的 `SIGXCPU`/`SIGXFSZ`——CPU 死循环不死于 24，由 hard=soft+1 的 `SIGKILL` 在 +1 s 兜底 + `cpu.stat` 事后判定（两套内核实测均 signal=9）；文件写超限拿 `EFBIG` 走 OSError traceback，文件恰好停在 cap 上，判定补"cap 上限 + 非正常退出 → OLE"（已回写 design.md §5/§6）。② `docs/example.py` 的 `memory_limit_bytes=256*1024` 是 PR 2 限制未生效时写的玩具值，生效后 CPython 无法在 256 KB 内启动（瞬时 OOM → `MLE`），改为 `64*1024*1024`（与 PR 2 修 `stdin_file`/`copy_in` 矛盾同类，镜像测试同步）。knob 观测用例从宿主读活 cgroup 断言：`None` 时 `memory.max`/`memory.swap.max`/`pids.max` 为 `max`、`memory.oom.group=0`；设限时对应值写入。远端 ssh+sudo 的 pytest `PermissionError`（碰 `/root/pytest.toml`）已修正归因为 **cwd**（ssh 远端命令落在 /root，`sudo` 不改 cwd），`bash -lc` 内先 `cd ~/river`，记录在 environment.local.md。
 
 ### PR 4 P2 加固
 
