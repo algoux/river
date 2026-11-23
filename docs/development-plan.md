@@ -15,14 +15,13 @@
 - CI 不在当前阶段范围内。除非要求，不做冒烟测试。
 - 设计已经定稿（`docs/design.md`），实现中遇到设计没覆盖的情况：小的自行决定并回写到 design.md；涉及语义/接口的先问。
 
-## 1. 仓库现状（2026-11-24，PR 1 之后）
+## 1. 仓库现状（2026-11-24，PR 2 之后）
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `a302ebb`（PR 1），`origin = git@github.com:algoux/river.git` |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `fe92fca`（PR 2），`origin = git@github.com:algoux/river.git` |
 | 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
-| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`tests/test_doctor.py`、`docs/`（`design.md`、本计划、`example.py`） |
-| 已删除（PR 1） | 旧 `src/`、`examples/`、`tests/`、`river.pyi`、`.github/`（CI 到 PR 6 再建） |
+| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
 | 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
 | 依赖 | `pyo3 0.30`（`abi3-py312`）、`libc`、`rustix 0.38`、`seccompiler 0.5`、`landlock 0.4`（crates.io 上的 crate 名；项目名叫 rust-landlock）、`caps 0.5`；Python ≥ 3.12，pytest ≥ 8 |
 
@@ -89,7 +88,7 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 **结果：全部满足。** WSL：委托 12 过 3 跳，非委托 6 过 9 跳；远端 tester：委托 13 过 2 跳（带真实 rootfs），非委托 6 过 9 跳；两套 `doctor()` 各项与环境表一致，Landlock ABI 见 §5 V6。执行中修正了计划的两个假设：启动命令里不能套 `uv run`（§2），crate 名是 `landlock`。
 
-### PR 2 P0 沙箱
+### PR 2 P0 沙箱 ✅ 已完成（2026-11-24，`dev` @ `fe92fca`）
 
 目标：`docs/example.py` 原样跑通，`AC`/`RE` 正确，计量有值。
 
@@ -108,6 +107,8 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 测试（`tests/test_functional.py`，marker `functional`）：hello world；stdout/stderr 捕获；非 0 退出 → `RE` + `exit_code`；`kill -SEGV $$` → `RE` + `signal=11`；`cwd`；`envs` 来自 meta.json 与显式覆盖；`stdin` bytes；`/sys` 已挂载且 `/dev/null` 可写（V9）；`executable` 不存在 → `ExecSetupError`；`cwd` 不存在 → `ExecSetupError`；8 线程并发 exec。
 
 完成标准：以上测试两套环境全绿；`RIVER_TEST_ROOTFS` 指向 docker 导出的 `python:3.12-slim`。
+
+**结果：全部满足。** WSL（委托 scope）与远端 tester 各 32 过 2 跳（跳过的是非委托环境用例；functional 组 20/20）。`docs/example.py` 的调用形态由 `test_example_py_call_shape` 逐参数复刻验证（其 `stdin_file="input.txt"` 原先与 `copy_in={}` 自相矛盾，已按拍板结论改为 `copy_in={"input.txt": "1 2 3\n"}`；`stdin_file` 不存在 → `ExecSetupError`）。执行中修正了设计的多处内核级假设并已回写 design.md §4/§5/§9：pdeathsig 校验改读 `/proc/self/status` 的 PPid（NEWPID 下 getppid 恒为 0）；rootfs 进入与 ro-bind 改用 open_tree 分离挂载配方（对已挂 bind 的 mount_setattr 恒 EINVAL，旧式 bind+remount 被忽略）；ptmx bind 新实例的 `./dev/pts/ptmx`；`PR_SET_SECUREBITS` rootless 不可达（删）；Landlock 设备授权补 `IOCTL_DEV`（openpty）；≥6.6 内核 sysfs 自动挂 cgroup2，用 ro tmpfs 盖 `./sys/fs`；pid-1 丢弃无 handler 的自杀信号（`RE`+signal 用真实 fault 验证）。V4/V5 不成立、V7/V8/V9 通过（§5）。远端 `systemd-run` 需显式 `--setenv=HOME`（pytest 9 探测 `$HOME/pytest.toml`，scope 继承的 HOME 不可靠；记录在 environment.local.md）。
 
 ### PR 3 P1 cgroup
 
