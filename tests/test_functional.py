@@ -11,9 +11,8 @@ import concurrent.futures
 
 import pytest
 
-from river import CopyOutError, ExecResult, ExecSetupError, River, RootfsError
-
 from conftest import delegated
+from river import CopyOutError, ExecResult, ExecSetupError, River, RootfsError
 
 pytestmark = [
     pytest.mark.functional,
@@ -229,7 +228,11 @@ def test_copy_out_nested_and_relative_keys(river_):
     # /work/out before it can write there).
     result = river_.exec(
         "python",
-        ["-c", "import os; os.mkdir('sub'); open('result.txt', 'w').write('42'); open('sub/other.txt', 'w').write('7')"],
+        [
+            "-c",
+            "import os; os.mkdir('sub'); open('result.txt', 'w').write('42');"
+            " open('sub/other.txt', 'w').write('7')",
+        ],
         cwd="/work/out",
         copy_in={"seed.txt": ""},
         copy_out={"result.txt": None, "/work/out/sub/other.txt": None},
@@ -245,7 +248,11 @@ def test_copy_out_to_host_file_as_path_and_str(tmp_path, river_):
     dest.write_text("old content that must be overwritten")
     result = river_.exec(
         "python",
-        ["-c", "open('a.txt', 'w').write('A'); open('b.txt', 'w').write('B'); open('c.txt', 'w').write('C')"],
+        [
+            "-c",
+            "open('a.txt', 'w').write('A'); open('b.txt', 'w').write('B');"
+            " open('c.txt', 'w').write('C')",
+        ],
         copy_out={"a.txt": dest, "b.txt": str(dest2), "c.txt": None},
     )
     assert result.status == "AC", (result.stderr, result.error)
@@ -439,7 +446,7 @@ def test_cwd_does_not_exist(tmp_path):
 
 def test_stdin_file_missing(tmp_path):
     """The agreed semantics: a missing stdin_file fails fast (V4 of the
-    example.py discussion)."""
+    README example discussion)."""
     with River(tmp_path) as sandbox:
         with pytest.raises(ExecSetupError, match="child.stdio"):
             sandbox.exec("python", envs={"PATH": META_PATH}, stdin_file="missing.txt")
@@ -455,16 +462,16 @@ def test_eight_threads_concurrent_exec(river_):
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(one, range(8)))
     assert len(results) == 8
-    for i, result in zip(range(8), results):
+    for i, result in zip(range(8), results, strict=True):
         assert result.status == "AC", (i, result.stderr, result.error)
         assert result.stdout == f"{i}\n".encode()
 
 
-# ------------------------------------------------- docs/example.py, as written
+# -------------------------------------------------- README example, as written
 
 
-def test_example_py_call_shape(river_):
-    """The exact call of docs/example.py: stdin_file is supplied via copy_in
+def test_readme_example_call_shape(river_):
+    """The exact call of the README example: stdin_file is supplied via copy_in
     (the agreed fix), stdout/stderr go to files inside /work, metrics have
     values."""
     result = river_.exec(

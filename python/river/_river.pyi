@@ -21,19 +21,12 @@ __all__ = [
 
 _StrOrPath = str | PathLike[str]
 
-
 class RiverError(RuntimeError): ...
-
 class KernelTooOldError(RiverError): ...
-
 class UserNamespaceDeniedError(RiverError): ...
-
 class CgroupNotDelegatedError(RiverError): ...
-
 class RootfsError(RiverError): ...
-
 class ExecSetupError(RiverError): ...
-
 
 class CopyOutError(RiverError):
     """Raised when a copy_out entry cannot be retrieved.
@@ -43,7 +36,6 @@ class CopyOutError(RiverError):
     """
 
     result: ExecResult
-
 
 class ExecResult:
     status: str
@@ -72,7 +64,6 @@ class ExecResult:
         error: str | None = ...,
     ) -> None: ...
     def __repr__(self) -> str: ...
-
 
 class River:
     rootfs: str
@@ -110,6 +101,5 @@ class River:
         address_space_limit_bytes: int | None = ...,
     ) -> ExecResult: ...
     def __repr__(self) -> str: ...
-
 
 def run_doctor_checks(raise_on_fail: bool) -> list[tuple[str, bool, str, str | None]]: ...

@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    import river
 
 
 def cgroup_base() -> Path:
@@ -23,9 +27,7 @@ def delegated() -> bool:
     try:
         base = cgroup_base()
         controllers = (base / "cgroup.controllers").read_text().split()
-        return {"cpu", "memory", "pids"} <= set(controllers) and os.access(
-            base, os.W_OK | os.X_OK
-        )
+        return {"cpu", "memory", "pids"} <= set(controllers) and os.access(base, os.W_OK | os.X_OK)
     except (OSError, RuntimeError):
         return False
 
@@ -39,7 +41,7 @@ def rootfs() -> str:
 
 
 @pytest.fixture(scope="session")
-def river_(rootfs) -> "river.River":
+def river_(rootfs) -> river.River:
     import river
 
     return river.River(rootfs)

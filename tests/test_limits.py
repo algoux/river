@@ -16,9 +16,8 @@ from pathlib import Path
 
 import pytest
 
-from river import CopyOutError
-
 from conftest import cgroup_base, delegated
+from river import CopyOutError
 
 pytestmark = [
     pytest.mark.limits,

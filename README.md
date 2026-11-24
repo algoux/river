@@ -1,19 +1,21 @@
 # river
 
+English | [简体中文](README.zh.md)
+
 river is a Python library that runs arbitrary programs inside a rootless Linux
 sandbox built around a caller-supplied rootfs, and reports judge-grade resource
 usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 
-- **rootless** — like podman: no root, no setuid helper, no external binary
-  (bwrap/nsjail/crun); only the current user and the kernel.
-- **low overhead** — like nsjail: single-digit milliseconds per `exec`; no
-  daemon, no polling.
-- **limits and accounting** — like go-judge: CPU time, wall clock, memory,
-  output, process count, all enforced and measured; `None` means unlimited.
+- **rootless** — no root, no setuid helper, no external sandbox binary; only
+  the current user and the kernel are involved.
+- **low overhead** — single-digit milliseconds per `exec`; no daemon, no
+  polling.
+- **limits and accounting** — CPU time, wall clock, memory, output and process
+  count are all enforced and measured; `None` means unlimited.
 - **latest kernels only** (≥ 6.8): user namespaces, delegated cgroup v2,
   Landlock and seccomp are always on; no compatibility fallbacks.
 
-[docs/example.py](docs/example.py) is the complete API in one file.
+The API section below is the complete surface, in one page.
 
 **Status: v0.1.0 released.** Wheels live on the
 [releases page](https://github.com/algoux/river/releases), not on PyPI — the
@@ -108,7 +110,7 @@ happens.
 
 ## API
 
-[docs/example.py](docs/example.py), complete:
+The complete API:
 
 ```python
 from river import River
@@ -180,6 +182,9 @@ uv sync --extra test && uv run maturin develop
 systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -c "import river; print(river.doctor())"
 systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs> -- .venv/bin/python -m pytest -x
 ```
+
+Formatting and import order are ruff's job (its isort rules replace a standalone
+isort): `uv run ruff check . && uv run ruff format .`.
 
 The rootfs for the functional tests is a docker-exported `python:3.12-slim`
 tree (recipe above). The design document and the PR plan that drove the

@@ -1,6 +1,6 @@
 """river: rootless Linux sandbox for untrusted programs.
 
-See docs/example.py for a complete API example.
+See the README for a complete API example.
 """
 
 from __future__ import annotations

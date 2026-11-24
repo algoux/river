@@ -44,6 +44,23 @@ features = ["pyo3/extension-module"]
 # manages the environment's dependencies.
 package = false
 
+[dependency-groups]
+dev = ["ruff>=0.17"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Markdown is left out: the README's Python snippets are hand-aligned
+# documentation, not source files.
+extend-exclude = ["target", "*.md"]
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort, UP: pyupgrade, B: flake8-bugbear.
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["conftest", "river"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"

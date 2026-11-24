@@ -15,9 +15,8 @@ import os
 
 import pytest
 
-from river import CopyOutError
-
 from conftest import delegated
+from river import CopyOutError
 
 pytestmark = [
     pytest.mark.attack,
@@ -294,32 +293,38 @@ def test_filesystem_write_matrix(river_):
     # /work, /tmp and /dev/shm get every handled right; the
     # device nodes and /dev/pts get WRITE_FILE (+ IOCTL_DEV); everything
     # else — the read-only rootfs, /sys, /proc — refuses writes.
-    table = {path: f"attempt(open, {path!r}, 'w')" for path in [
-        "/usr/x",
-        "/etc/x",
-        "/meta.json",
-        "/sys/x",
-        "/proc/self/comm",
-        "/work/x",
-        "/tmp/x",
-        "/dev/shm/x",
-        "/dev/null",
-    ]}
+    table = {
+        path: f"attempt(open, {path!r}, 'w')"
+        for path in [
+            "/usr/x",
+            "/etc/x",
+            "/meta.json",
+            "/sys/x",
+            "/proc/self/comm",
+            "/work/x",
+            "/tmp/x",
+            "/dev/shm/x",
+            "/dev/null",
+        ]
+    }
     got = run_table(river_, list(table.items()))
-    assert wrong(
-        got,
-        {
-            "/usr/x": EROFS,
-            "/etc/x": EROFS,
-            "/meta.json": EROFS,
-            "/sys/x": EROFS,
-            "/proc/self/comm": EACCES,
-            "/work/x": "ok",
-            "/tmp/x": "ok",
-            "/dev/shm/x": "ok",
-            "/dev/null": "ok",
-        },
-    ) == {}
+    assert (
+        wrong(
+            got,
+            {
+                "/usr/x": EROFS,
+                "/etc/x": EROFS,
+                "/meta.json": EROFS,
+                "/sys/x": EROFS,
+                "/proc/self/comm": EACCES,
+                "/work/x": "ok",
+                "/tmp/x": "ok",
+                "/dev/shm/x": "ok",
+                "/dev/null": "ok",
+            },
+        )
+        == {}
+    )
 
 
 def test_device_nodes_cannot_be_made_in_work(river_):
@@ -346,7 +351,8 @@ def test_proc_shows_only_the_sandbox(river_):
     code = (
         "import os, json\n"
         "pids = sorted(int(p) for p in os.listdir('/proc') if p.isdigit())\n"
-        f"print(json.dumps([os.getpid(), os.getppid(), pids, os.path.exists('/proc/{host_pid}')]))\n"
+        f"print(json.dumps([os.getpid(), os.getppid(), pids,"
+        f" os.path.exists('/proc/{host_pid}')]))\n"
     )
     result = py(river_, code)
     assert result.status == "AC", (result.stderr, result.error)
@@ -381,7 +387,10 @@ def test_root_is_exactly_the_rootfs(river_, rootfs):
     assert result.status == "AC", (result.stderr, result.error)
     assert set(json.loads(result.stdout)) <= set(os.listdir(rootfs)) | {"work"}
     # The rootfs's empty /home and /mnt stay empty: no host tree behind them.
-    result = py(river_, "import os, json; print(json.dumps([os.listdir('/home'), os.listdir('/mnt')]))\n")
+    result = py(
+        river_,
+        "import os, json; print(json.dumps([os.listdir('/home'), os.listdir('/mnt')]))\n",
+    )
     assert result.status == "AC", (result.stderr, result.error)
     assert json.loads(result.stdout) == [[], []]
 

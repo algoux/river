@@ -143,7 +143,10 @@ def test_doctor_report_structure():
             assert f"fix: {check.remediation}" in text
 
 
-@pytest.mark.skipif(not _delegated(), reason="not in a delegated cgroup; run under systemd-run --user --scope -p Delegate=yes")
+@pytest.mark.skipif(
+    not _delegated(),
+    reason="not in a delegated cgroup; run under systemd-run --user --scope -p Delegate=yes",
+)
 class TestDoctorInDelegatedEnvironment:
     def test_all_green_by_default(self):
         report = river.doctor()
@@ -200,7 +203,10 @@ class TestDoctorInNonDelegatedEnvironment:
 # ------------------------------------------------------------------- River
 
 
-@pytest.mark.skipif(not _delegated(), reason="not in a delegated cgroup; run under systemd-run --user --scope -p Delegate=yes")
+@pytest.mark.skipif(
+    not _delegated(),
+    reason="not in a delegated cgroup; run under systemd-run --user --scope -p Delegate=yes",
+)
 class TestRiverInit:
     def test_creates_missing_mount_points_only(self, tmp_path):
         (tmp_path / "proc").mkdir()
