@@ -15,11 +15,11 @@
 - CI 不在当前阶段范围内。除非要求，不做冒烟测试。
 - 设计已经定稿（`docs/design.md`），实现中遇到设计没覆盖的情况：小的自行决定并回写到 design.md；涉及语义/接口的先问。
 
-## 1. 仓库现状（2026-11-24，PR 4 之后）
+## 1. 仓库现状（2026-11-24，PR 5 之后）
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `1ff318b`（PR 4），`origin = git@github.com:algoux/river.git` |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `11643a9`（PR 5），`origin = git@github.com:algoux/river.git` |
 | 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
 | 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/test_attack.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
 | 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
@@ -132,13 +132,15 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 **结果：全部满足。** WSL 与远端 tester 各 56 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 20/20、limits 11/11、attack 15/15），非委托环境各 6 过 52 跳。seccomp 按 design.md §9 全表落地（56 个无条件拒绝的 syscall + `clone`/`socket` 的参数规则），attack 组用原始 syscall 逐条验证 `EPERM`——探针刻意选了没有过滤器时会成功的调用（`open_tree`、`ptrace(TRACEME)`、自身 `process_vm_*v`、`add_key`、`settimeofday(NULL, NULL)` 等），保证拒绝来自 seccomp 而不是能力丢弃；`clone3` → `ENOSYS`、带 ns flag 的 `clone` → `EPERM`、x32 编号 → `SIGSYS`；`Seccomp: 2` / `NoNewPrivs: 1`；`RIVER_HARDENING=off` 作为对照组放行 `AF_NETLINK` 与 `/proc/self/comm` 写入。Landlock 规则在 PR 2 已为 V7/V9 补齐，本 PR 无改动：写矩阵 `/usr`、`/etc`、`/meta.json`、`/sys` → `EROFS`，`/proc/self/comm` → `EACCES`（Landlock 已生效的直接证据），`/work`、`/tmp`、`/dev/shm`、`/dev/null` 可写，`/work` 下 `mknod` 设备节点被拒。执行中的发现：① seccompiler 0.5 的三个限制（§5 V10）→ 两个叠加程序（`RIVER_LOG=debug` 打印大小：14 + 377 条指令）+ `clone` 9 条按位规则 + `socket` 两段区间 + 手写 x32 guard，已回写 design.md §9；② 测试初稿把 `nfsservctl` 写成 184（实为 `tuxcall`），libc 的 `SYS_nfsservctl = 180`，已按 libc 修正；③ `AF_UNSPEC` 虽在白名单，内核本身拒绝创建（`EAFNOSUPPORT`），正向用例不含它。copy_out symlink 用例按计划留在本组：PR 2 的 `symlink_metadata` 已拒绝非普通文件，PR 5 换成 `openat2 RESOLVE_NO_SYMLINKS` 消除 TOCTOU。
 
-### PR 5 P3 I/O 与文档
+### PR 5 P3 I/O 与文档 ✅ 已完成（2026-11-24，`dev` @ `11643a9`）
 
 目标：`copy_in/copy_out`、`stdin_file/stdout_file/stderr_file`、`meta.json` 全部按 design.md §4.1/§10 工作；README 可照做。
 
 范围：`src/exec/io.rs`（`openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`，`copy_out_limit_bytes`，`CopyOutError.result`）；`child.stdio` 的文件分支与 `RLIMIT_FSIZE`；README（安装、rootfs 制作、`systemd-run` 用法、API 示例即 `docs/example.py`；不含任何机器信息）。
 
 测试：补 `functional` 组的 copy_in/out、`*_file`、symlink 拒绝、`copy_out_limit_bytes`、目录/设备文件拒绝；`CopyOutError.result` 可访问。
+
+**结果：全部满足。** WSL 与远端 tester 各 81 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 44/44、limits 9/9、attack 16/16），非委托环境各 6 过 77 跳。copy_out 与 `*_file` 大小判定统一走 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`（libc 有 `SYS_openat2`/`RESOLVE_*` 常量，`struct open_how` 因 `#[non_exhaustive]` 手写，与 `mount_setattr` 同类处理）：最终组件与**中间目录组件**的 symlink 一律 `ELOOP`——attack 组新增的中间组件用例证明宿主侧 stat+read 两步查找会被 `<work>/etc → /etc` 带到宿主的 `/etc/passwd`，openat2 单步解析+打开并把普通文件/大小检查落在 fd 上，TOCTOU 一并消除；FIFO 以 `O_NONBLOCK` 打开后按非普通文件拒绝（宿主侧永不阻塞）；宿主目标**两阶段**写入，任一条失败时不留半写的宿主文件。`CopyOutError.result` 挂完整 `ExecResult`（判定先于收集完成，`files` 为空，`api.rs` 在异常实例上 `setattr`）。执行中补齐一个实现缺口：`extract_copy_out` 此前漏收 `str` 值（design.md §4 一直写明 `None | str | os.PathLike`）。`/work` inode 洪泛评估结论（不加 `nr_inodes`：独立受限 tmpfs 需要 host 侧 mount 权限，rootless 不可达，残余风险被墙钟+结束即删封顶）与两阶段写入语义已回写 design.md §10。
 
 ### PR 6 P4 发布
 
@@ -170,7 +172,7 @@ PR 2 开始前（或进行中）用最小代价确认，结果回写到 design.m
 | WSL 内核缺 Landlock / 其他特性 | 已实测 WSL Landlock ABI v7、远端 v8，未发生；doctor 仍把 Landlock 作为信息项而非失败项 |
 | 远端机器内存较小（< 2 GB） | 测试用的内存限制 ≤ 256 MB；不要并行跑大内存用例 |
 | `clone3` 后子进程里 Rust 运行时行为 | 子进程路径只放裸 syscall；PR 2 用 `RIVER_LOG=debug` 逐步打点确认每个 step |
-| `/work` 在 `$XDG_RUNTIME_DIR` 下占满 tmpfs | `memory.max` 计入 tmpfs 页；exec 结束即删；PR 5 评估是否需要 `nr_inodes` |
+| `/work` 在 `$XDG_RUNTIME_DIR` 下占满 tmpfs | `memory.max` 计入 tmpfs 页；exec 结束即删；PR 5 已评估：不加 `nr_inodes`，独立受限 tmpfs 需要 host mount 权限（rootless 不可达），残余风险见 design.md §10 |
 | 调用方 Python 进程本身不在委托 cgroup 里 | 这是 fail-fast 的预期行为；doctor 消息给出 `systemd-run --user --scope -p Delegate=yes` 命令 |
 | 委托 cgroup 里还有别的进程（外层 `uv run`/`make`、`sudo -u` 落进调用者的 session scope） | 第 5 步 `EBUSY` 时 doctor 列出残留进程；验证命令一律 `systemd-run ... -- .venv/bin/python`（§2），远端加 `XDG_RUNTIME_DIR` |
 | 用户 scope 的委托表现随 systemd 版本变化（`Delegate=yes` 启用的控制器会留在父 slice，兄弟 scope 看起来也"已委托"） | 不用兄弟 scope 模拟非委托环境；负向用例用 `river/` 下无控制器的子 cgroup（design.md §7 第 5 步） |
