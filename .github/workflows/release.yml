@@ -1,7 +1,6 @@
-# Push a tag (v*) to publish: builds the manylinux wheel and attaches it to a
-# GitHub Release. The wheel is named after the PyPI distribution
-# (`river_sandbox-<version>-...whl`); PyPI publishing is not wired up yet, so
-# users install the wheel straight from the release URL.
+# Push a tag (v*) to publish: builds the manylinux wheel and the sdist,
+# attaches them to a GitHub Release and uploads them to PyPI as the
+# `river-sandbox` distribution (`river_sandbox-<version>-...whl`).
 name: release
 
 on:
@@ -12,17 +11,59 @@ permissions:
   contents: write
 
 jobs:
-  github-release:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # Same command as the README install section: the pyo3/maturin image is
+      # manylinux2014 (glibc 2.17), and -i python3.12 makes the abi3 wheel
+      # carry the cp312 tag that matches requires-python >= 3.12.
       - name: Build the wheel
         run: >
           docker run --rm -v "$PWD:/io" ghcr.io/pyo3/maturin:latest
           build --release --locked -i python3.12 -o /io/dist
 
-      - name: Create the release with the wheel attached
+      - name: Build the sdist
+        run: >
+          docker run --rm -v "$PWD:/io" ghcr.io/pyo3/maturin:latest
+          sdist -o /io/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: river-sandbox-dist
+          path: dist/*
+          if-no-files-found: error
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: river-sandbox-dist
+          path: dist
+
+      - name: Create the release with the artifacts attached
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.whl --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+
+  publish-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: river-sandbox-dist
+          path: dist
+
+      # The token is the account-wide API token from the PyPI account settings;
+      # keep it a repository secret (Settings -> Secrets and variables ->
+      # Actions -> PYPI_API_TOKEN).
+      - name: Publish to PyPI
+        uses: pypi/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          # A re-run of the same tag must not fail on the files already there.
+          skip-existing: true
