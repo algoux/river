@@ -227,17 +227,17 @@ cgroup2 文件系统不能在 user namespace 内挂载，必须使用宿主上**
 
 **网络**：新 netns，只有 `lo`（up）。没有 veth、没有 DNS。
 
-**Landlock**（总是开启）：处理的权限 = `WRITE_FILE`、`TRUNCATE`（ABI≥3）、`REMOVE_DIR`、`REMOVE_FILE`、`MAKE_CHAR`、`MAKE_DIR`、`MAKE_REG`、`MAKE_SOCK`、`MAKE_SYM`、`MAKE_FIFO`（ABI≥2）、`IOCTL_DEV`（ABI≥4），按内核 ABI 取交集；允许的位置：`/work`、`/tmp`、`/dev/shm` 全部处理权限，`/dev/pts` 与设备节点 `/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/ptmx` 授 `WRITE_FILE` + `IOCTL_DEV`（设备写入与设备 ioctl 都受 Landlock 管：不加 `WRITE_FILE` 连 `echo > /dev/null` 都失败，不加 `IOCTL_DEV` 则 `openpty` 的 `TIOCGPTN` 等设备 ioctl 被拒；PR 4 用 V9 验证）。读与执行不处理（rootfs 已只读）。在 `no_new_privs` 之后、`seccomp` 之前 `landlock_restrict_self`。内核不支持 Landlock（`landlock_create_ruleset` 返回 `ENOSYS`，ABI 0）时自动关闭并在 `RIVER_LOG=debug` 下警告，不算错误。
+**Landlock**（总是开启）：处理的权限 = `WRITE_FILE`、`TRUNCATE`（ABI≥3）、`REMOVE_DIR`、`REMOVE_FILE`、`MAKE_CHAR`、`MAKE_DIR`、`MAKE_REG`、`MAKE_SOCK`、`MAKE_SYM`、`MAKE_FIFO`（ABI≥2）、`IOCTL_DEV`（ABI≥4），按内核 ABI 取交集；允许的位置：`/work`、`/tmp`、`/dev/shm` 全部处理权限，`/dev/pts` 与设备节点 `/dev/null`、`/dev/zero`、`/dev/full`、`/dev/random`、`/dev/urandom`、`/dev/ptmx` 授 `WRITE_FILE` + `IOCTL_DEV`（设备写入与设备 ioctl 都受 Landlock 管：不加 `WRITE_FILE` 连 `echo > /dev/null` 都失败，不加 `IOCTL_DEV` 则 `openpty` 的 `TIOCGPTN` 等设备 ioctl 被拒）。读与执行不处理（rootfs 已只读）。在 `no_new_privs` 之后、`seccomp` 之前 `landlock_restrict_self`。内核不支持 Landlock（`landlock_create_ruleset` 返回 `ENOSYS`，ABI 0）时自动关闭并在 `RIVER_LOG=debug` 下警告，不算错误。`/proc` 没有任何规则，所以沙箱内对 procfs 的写（如 `/proc/self/comm`，DAC 本来允许）得到 `EACCES`——这也是 Landlock 已生效的直接证据（attack 组）。
 
 **seccomp**（denylist，总是开启；`RIVER_HARDENING=off` 时关闭）：
 
-- `clone3` → 返回 `ENOSYS`（glibc 收到后回退到 `clone`）；`clone` 的 flags 参数 `SCMP_CMP_MASKED_EQ` 要求 namespace 相关位（`CLONE_NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS|NEWCGROUP|NEWTIME|INTO_CGROUP`）为 0；`unshare`、`setns` → `EPERM`。沙箱内不能再创建任何 namespace。
+- `clone3` → 返回 `ENOSYS`（glibc 收到后回退到 `clone`）；`clone` 的 flags 参数里任一 namespace 位（`CLONE_NEWUSER|NEWNS|NEWPID|NEWNET|NEWIPC|NEWUTS|NEWCGROUP|NEWTIME|INTO_CGROUP`）置位 → `EPERM`；`unshare`、`setns` → `EPERM`。沙箱内不能再创建任何 namespace。
 - `socket` 只允许 `AF_UNSPEC/AF_UNIX/AF_INET/AF_INET6`；`AF_NETLINK`（nf_tables 攻击面）、`AF_PACKET`、`AF_ALG` 等 → `EPERM`。
 - 挂载族：`mount umount2 pivot_root chroot fsopen fsconfig fsmount move_mount open_tree mount_setattr` → `EPERM`。
 - 内核攻击面：`ptrace process_vm_readv process_vm_writev bpf perf_event_open keyctl add_key request_key userfaultfd io_uring_setup io_uring_enter io_uring_register kcmp pidfd_getfd name_to_handle_at open_by_handle_at memfd_secret` → `EPERM`。
 - 系统级：`reboot kexec_load kexec_file_load init_module finit_module delete_module swapon swapoff settimeofday clock_settime clock_adjtime adjtimex adjtime sethostname setdomainname acct quotactl nfsservctl ioperm iopl syslog sysfs _sysctl uselib vhangup` → `EPERM`。`pidfd_open`、`pidfd_send_signal` 保留（沙箱内只能作用于自己 ns 里的进程）。
 - fanotify 族（`fanotify_init fanotify_mark`）→ `EPERM`。
-- 完整列表维护在 `src/sandbox/seccomp.rs` 的常量表里，以 syscall 名（`seccompiler` 按架构解析）而不是编号定义。
+- 实现注记（`src/exec/seccomp.rs`，`seccompiler` 0.5）：① 规则按 syscall **编号**匹配且每个过滤器只有一个 on-match 动作，所以是**两个叠加的 BPF 程序**（14 + 377 条指令）：程序 1 `clone3` → `ENOSYS`，程序 2 denylist → `EPERM`，未命中一律允许；子进程在 `no_new_privs` 之后依次 `prctl(PR_SET_SECCOMP)`。② 列表以 `libc::SYS_*` 常量定义（libc 按架构解析），不用裸编号；`adjtime`/`umount` 在 64 位上没有独立入口（glibc 走 `adjtimex`/`umount2`），由对应项覆盖；`nfsservctl sysfs _sysctl uselib ioperm iopl syslog` 是 x86_64 才有的编号，aarch64 移植时需按架构裁剪。③ `seccompiler` 只有"掩码相等"一种位测试，`clone` 的"任一位置位"拆成 9 条按位规则（同一 syscall 的规则彼此 OR）。④ `socket` 的白名单写成两段 denylist 区间：`[AF_INET+1, AF_INET6-1]` 与 `≥ AF_INET6+1`（无符号比较，负值落入后者）。⑤ **x32 绕过**：x32 syscall 的 arch 仍是 `AUDIT_ARCH_X86_64`，只有 `nr` 带 `__X32_SYSCALL_BIT`（0x40000000），seccompiler 的架构检查放行、编号又不会命中任何规则——所以程序 1 前置 4 条手写 cBPF 指令，把 `nr & 0x40000000 ≠ 0` 的调用直接 `SECCOMP_RET_KILL_PROCESS`（与 libseccomp 对未处理 ABI 的默认做法一致）。
 
 **不该暴露的东西**：宿主 `/sys/fs/cgroup`、`/proc/sys`（procfs 不加 `subset=pid`，兼容性优先）、宿主 `PATH`/`LD_*`（`envs` 从零构造）。
 
@@ -288,7 +288,7 @@ printf '{"envs":{"PATH":"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 | 1 清场 + 骨架 ✅ 2026-11-24 | 删除旧实现全部代码与示例（Windows/macOS 后端、loopdev、examples、旧测试）；新 Cargo/pyproject/`python/river`；`river.doctor()` + 全部预检 | 两套环境上 `doctor()` 报告与本地环境记录一致（已达成） |
 | 2 P0 沙箱 | clone3 → idmap → mount → pivot → caps → nnp → execve；父进程 epoll + 管道；计量；`AC/RE` | `python -c` 跑通；`docs/example.py` 全字段有值 |
 | 3 P1 cgroup | §7 单例、run cgroup、限制 knob、`cgroup.kill`、`TLE/MLE/OLE` 判定 | 死循环 / 大内存 / 写爆 stdout / fork bomb 用例状态正确 |
-| 4 P2 加固 | seccomp denylist、Landlock、`attack` 测试组 | 嵌套 userns、netlink、写 rootfs、symlink copy_out 全部被拒 |
+| 4 P2 加固 ✅ 2026-11-24 | seccomp denylist、Landlock、`attack` 测试组 | 嵌套 userns、netlink、写 rootfs、symlink copy_out 全部被拒（已达成） |
 | 5 P3 I/O | copy_in/out、`*_file`、`stdin`、meta.json、README | pytest 全绿，README 可照做 |
 | 6 P4 发布 | manylinux wheel（docker 内构建）、版本号 | `pip install` 开箱即用 |
 

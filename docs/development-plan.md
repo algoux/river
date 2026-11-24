@@ -15,13 +15,13 @@
 - CI 不在当前阶段范围内。除非要求，不做冒烟测试。
 - 设计已经定稿（`docs/design.md`），实现中遇到设计没覆盖的情况：小的自行决定并回写到 design.md；涉及语义/接口的先问。
 
-## 1. 仓库现状（2026-11-24，PR 2 之后）
+## 1. 仓库现状（2026-11-24，PR 4 之后）
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `9955a84`（PR 3），`origin = git@github.com:algoux/river.git` |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `1ff318b`（PR 4），`origin = git@github.com:algoux/river.git` |
 | 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
-| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
+| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/test_attack.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
 | 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
 | 依赖 | `pyo3 0.30`（`abi3-py312`）、`libc`、`rustix 0.38`、`seccompiler 0.5`、`landlock 0.4`（crates.io 上的 crate 名；项目名叫 rust-landlock）、`caps 0.5`；Python ≥ 3.12，pytest ≥ 8 |
 
@@ -122,13 +122,15 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 **结果：全部满足。** WSL 与远端 tester 各 41 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 20/20、limits 9/9）。判定链按设计工作：256 MB vs `memory.max=64M`（`memory.oom.group=1` 整组 SIGKILL，`memory.events` 计数 → `MLE`）；1 MB stdout vs 64K 管道超限即 `cgroup.kill` → `OLE`（恰等于上限不算）；文件分支 RLIMIT_FSIZE 钳位 + 事后 `stat`；墙钟 300 ms → `cgroup.kill` → `TLE`；fork 炸弹 `proc_limit=16`（`pids.max`+`RLIMIT_NPROC` 双保险）→ 子进程 `EAGAIN`、主程序 `AC`；`copy_out_limit_bytes` 超限 → `CopyOutError`（`.result` 留 PR 5）。执行中修正了两个假设：① pid 1（`SIGNAL_UNKILLABLE`）同样丢弃内核 `send_sig`（非 priv）发的 `SIGXCPU`/`SIGXFSZ`——CPU 死循环不死于 24，由 hard=soft+1 的 `SIGKILL` 在 +1 s 兜底 + `cpu.stat` 事后判定（两套内核实测均 signal=9）；文件写超限拿 `EFBIG` 走 OSError traceback，文件恰好停在 cap 上，判定补"cap 上限 + 非正常退出 → OLE"（已回写 design.md §5/§6）。② `docs/example.py` 的 `memory_limit_bytes=256*1024` 是 PR 2 限制未生效时写的玩具值，生效后 CPython 无法在 256 KB 内启动（瞬时 OOM → `MLE`），改为 `64*1024*1024`（与 PR 2 修 `stdin_file`/`copy_in` 矛盾同类，镜像测试同步）。knob 观测用例从宿主读活 cgroup 断言：`None` 时 `memory.max`/`memory.swap.max`/`pids.max` 为 `max`、`memory.oom.group=0`；设限时对应值写入。远端 ssh+sudo 的 pytest `PermissionError`（碰 `/root/pytest.toml`）已修正归因为 **cwd**（ssh 远端命令落在 /root，`sudo` 不改 cwd），`bash -lc` 内先 `cd ~/river`，记录在 environment.local.md。
 
-### PR 4 P2 加固
+### PR 4 P2 加固 ✅ 已完成（2026-11-24，`dev` @ `1ff318b`）
 
 目标：seccomp denylist + Landlock 生效，攻击用例全部被拒。
 
 范围：`src/exec/seccomp.rs`（design.md §9 列表，`seccompiler` 按 syscall 名生成；`clone3` → `ENOSYS`；`clone`/`unshare` masked 过滤；`socket` 域白名单）、`src/exec/landlock.rs` 完整规则。
 
 测试（`tests/test_attack.py`，marker `attack`）：沙箱内 `unshare -U` / `clone(CLONE_NEWUSER)` 失败；`socket(AF_NETLINK)` → `EPERM`；`mount` → `EPERM`；写 `/usr/x` → `EROFS`；写 `/work/x` 成功；`echo > /dev/null` 成功；写 `/sys/x` 失败；`/proc` 只能看到自己的 pid；`/sys/fs/cgroup` 不存在；`ls /` 无宿主目录；`copy_out` 一个指向 `/etc/passwd` 的 symlink → `CopyOutError`（若 PR 5 未做，挪到 PR 5）。
+
+**结果：全部满足。** WSL 与远端 tester 各 56 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 20/20、limits 11/11、attack 15/15），非委托环境各 6 过 52 跳。seccomp 按 design.md §9 全表落地（56 个无条件拒绝的 syscall + `clone`/`socket` 的参数规则），attack 组用原始 syscall 逐条验证 `EPERM`——探针刻意选了没有过滤器时会成功的调用（`open_tree`、`ptrace(TRACEME)`、自身 `process_vm_*v`、`add_key`、`settimeofday(NULL, NULL)` 等），保证拒绝来自 seccomp 而不是能力丢弃；`clone3` → `ENOSYS`、带 ns flag 的 `clone` → `EPERM`、x32 编号 → `SIGSYS`；`Seccomp: 2` / `NoNewPrivs: 1`；`RIVER_HARDENING=off` 作为对照组放行 `AF_NETLINK` 与 `/proc/self/comm` 写入。Landlock 规则在 PR 2 已为 V7/V9 补齐，本 PR 无改动：写矩阵 `/usr`、`/etc`、`/meta.json`、`/sys` → `EROFS`，`/proc/self/comm` → `EACCES`（Landlock 已生效的直接证据），`/work`、`/tmp`、`/dev/shm`、`/dev/null` 可写，`/work` 下 `mknod` 设备节点被拒。执行中的发现：① seccompiler 0.5 的三个限制（§5 V10）→ 两个叠加程序（`RIVER_LOG=debug` 打印大小：14 + 377 条指令）+ `clone` 9 条按位规则 + `socket` 两段区间 + 手写 x32 guard，已回写 design.md §9；② 测试初稿把 `nfsservctl` 写成 184（实为 `tuxcall`），libc 的 `SYS_nfsservctl = 180`，已按 libc 修正；③ `AF_UNSPEC` 虽在白名单，内核本身拒绝创建（`EAFNOSUPPORT`），正向用例不含它。copy_out symlink 用例按计划留在本组：PR 2 的 `symlink_metadata` 已拒绝非普通文件，PR 5 换成 `openat2 RESOLVE_NO_SYMLINKS` 消除 TOCTOU。
 
 ### PR 5 P3 I/O 与文档
 
@@ -159,6 +161,7 @@ PR 2 开始前（或进行中）用最小代价确认，结果回写到 design.m
 | V7 | `/dev/ptmx` 从 `/dev/pts/ptmx` bind 后 `openpty` 可用 | PR 2 功能测试：沙箱内 `python -c "import pty; pty.openpty()"` | 改为 bind 宿主 `/dev/ptmx` | ✅ 通过（2026-11-24，WSL）：但 bind 的必须是**新实例自己的** `./dev/pts/ptmx`（bind 宿主 ptmx 会链到宿主 devpts 实例，`openpty` 拿不到 slave）；另外 Landlock 必须给设备授 `IOCTL_DEV`（`openpty` 的 `TIOCGPTN` ioctl），否则 `ENXIO` |
 | V8 | docker 导出的 rootfs 以运行用户解压后 Python 能在沙箱内启动 | PR 2 的 hello world | 检查 `ld.so.cache`、`/usr/local/bin/python` 符号链接是否保留（`tar -p`） | ✅ 通过（2026-11-24，WSL）：hello world 在 `python:3.12-slim` rootfs 内 `AC` |
 | V9 | user namespace 内能只读挂载 sysfs；Landlock 开启后 `/dev/null`、`/dev/urandom` 读写正常 | PR 2：沙箱内 `python -c "import os; os.write(os.open('/dev/null', os.O_WRONLY), b'x'); print(os.listdir('/sys')[:3])"` | sysfs 挂载失败 → 改为只读 bind 宿主 `/sys`；设备写入失败 → 补 Landlock `WRITE_FILE` 规则（design.md §9） | ✅ 通过（2026-11-24，WSL）：sysfs 只读挂载、`/dev/null` 可写、`/dev/urandom` 可读；6.6+ 内核在 userns 内挂 sysfs 会**自动挂 cgroup2** 到 `/sys/fs/cgroup`（视图暴露调用方 cgroup 子树），用 ro tmpfs 覆盖 `./sys/fs` 解决 |
+| V10 | `seccompiler` 能表达 design.md §9 的每条规则 | PR 4 前读 seccompiler 0.5 源码；attack 组逐条验证 | 手写 BPF，或改用 libseccomp 绑定 | ❌ 部分不成立（2026-11-24）：规则按 syscall 编号精确匹配、每个过滤器只有一个 on-match 动作、位测试只有"掩码相等"→ 两个叠加程序（`clone3`→`ENOSYS` / denylist→`EPERM`）、`clone` 9 条按位规则、`socket` 两段 denylist 区间；**x32 绕过**：x32 的 arch 仍是 `AUDIT_ARCH_X86_64`、只有 `nr` 带 `0x40000000`，编号匹配不到任何规则 → 程序 1 前置 4 条手写 cBPF 把这类调用 `KILL_PROCESS`（已回写 design.md §9） |
 
 ## 6. 风险
 
