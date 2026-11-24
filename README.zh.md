@@ -109,7 +109,7 @@ with River("/rootfs/python") as river:
 
 有两个环境变量，只用于调试、不是配置项：`RIVER_LOG=debug` 会在 stderr 上跟踪父进程与子进程的每一步；`RIVER_HARDENING=off` 只关闭 seccomp 和 Landlock（命名空间、只读 rootfs 和能力集丢弃仍然保留），用来区分「程序本身有问题」和「加固层拦住了它」。
 
-沙箱内部：程序是新 pid 命名空间里的 pid 1（它一死，整棵进程树跟着死）；`/work` 是唯一由宿主支撑的可写目录（`copy_in`/`copy_out`/`*_file` 的路径必须落在它下面）；rootfs 只读；`/proc` 与 `/sys` 是全新的实例；网络只有一个孤立的 `lo`；seccomp 与 Landlock 会挡住命名空间创建、非常规的 syscall 家族，以及所有可写挂载点之外的写入。
+沙箱内部：程序是新 pid 命名空间里的 pid 1（它一死，整棵进程树跟着死）；`/work` 是唯一由宿主支撑的可写目录（`copy_in`/`copy_out`/`*_file` 的路径必须落在它下面）；rootfs 只读；`/proc` 与 `/sys` 是全新的实例；网络只有一个孤立的 `lo`；seccomp 对白名单（x86_64 上约 250 个，见 `src/exec/seccomp.rs`；`clone` 只在不带 namespace flag 时放行，`socket` 只放行 `AF_UNIX`/`AF_INET`/`AF_INET6`）之外的每一个 syscall 都答 `EPERM`，Landlock 则挡住所有可写挂载点之外的写入。
 
 ## 开发
 

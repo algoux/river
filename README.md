@@ -148,8 +148,10 @@ Inside the sandbox: the program is pid 1 of a fresh pid namespace (its death
 kills the whole tree), `/work` is the only host-backed writable directory
 (`copy_in`/`copy_out`/`*_file` keys must resolve below it), the rootfs is
 read-only, `/proc` and `/sys` are fresh instances, the network is a lone `lo`,
-and seccomp plus Landlock block namespace creation, unusual syscall families
-and writes outside the writable mounts.
+and seccomp answers `EPERM` to every syscall outside an explicit allowlist
+(about 250 on x86_64, listed in `src/exec/seccomp.rs`; `clone` only without a
+namespace flag, `socket` only for `AF_UNIX`/`AF_INET`/`AF_INET6`) while
+Landlock blocks writes outside the writable mounts.
 
 ## Development
 

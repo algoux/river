@@ -13,8 +13,8 @@ use pyo3::prelude::*;
 mod _river {
     #[pymodule_export]
     use super::api::{
-        CgroupNotDelegatedError, CopyOutError, ExecResult, ExecSetupError, KernelTooOldError, River,
-        RiverError, RootfsError, UserNamespaceDeniedError,
+        _seccomp_table, CgroupNotDelegatedError, CopyOutError, ExecResult, ExecSetupError,
+        KernelTooOldError, River, RiverError, RootfsError, UserNamespaceDeniedError,
     };
 
     #[pymodule_export]

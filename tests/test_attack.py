@@ -1,6 +1,6 @@
 """Attack-surface tests: what the sandbox must refuse (marker: attack).
 
-The seccomp denylist and the Landlock rules are always on, every attack
+The seccomp allowlist and the Landlock rules are always on, every attack
 below is rejected, and the
 legitimate operations around each one keep working. Like the functional
 group, these need a delegated cgroup and `RIVER_TEST_ROOTFS`; the raw
@@ -17,6 +17,7 @@ import pytest
 
 from conftest import delegated
 from river import CopyOutError
+from river._river import _seccomp_table
 
 pytestmark = [
     pytest.mark.attack,
@@ -75,14 +76,14 @@ def wrong(got, expected):
     }
 
 
-# ------------------------------------------------------- seccomp: the denylist
+# ------------------------------------------------------ seccomp: the allowlist
 
-# (name, call) — one raw probe per denied syscall, each judged by
-# the errno it answers. The probes are chosen so that *without* the filter
-# several of them would simply succeed (open_tree, ptrace TRACEME,
-# process_vm_*v on self, add_key, settimeofday(NULL, NULL), ...); reboot
-# is left out because a success inside a pid namespace signals pid 1.
-RAW_DENYLIST = [
+# (name, call) — one raw probe per syscall outside the allowlist, each
+# judged by the errno it answers. The probes are chosen so that *without*
+# the filter several of them would simply succeed (open_tree, ptrace
+# TRACEME, process_vm_*v on self, add_key, settimeofday(NULL, NULL), ...);
+# reboot is left out because a success inside a pid namespace signals pid 1.
+RAW_REFUSED = [
     ("mount", "syscall(165, b'none', b'/tmp/mnt', b'tmpfs', 0, None)"),
     ("umount2", "syscall(166, b'/tmp', 0)"),
     ("pivot_root", "syscall(155, b'/tmp', b'/tmp')"),
@@ -137,10 +138,85 @@ RAW_DENYLIST = [
 ]
 
 
-def test_denylisted_syscalls_answer_eperm(river_):
-    table = [(name, f"({call})[1]") for name, call in RAW_DENYLIST]
+def test_unlisted_syscalls_answer_eperm(river_):
+    table = [(name, f"({call})[1]") for name, call in RAW_REFUSED]
     got = run_table(river_, table)
     assert wrong(got, dict.fromkeys([name for name, _ in table], EPERM)) == {}
+
+
+# -------------------------------------------------- seccomp: the whole table
+
+# Every x86_64 number, probed with harmless (zero) arguments against the
+# table the extension exports: the allowlist really is a whitelist. Each
+# probe runs in a forked child and reports the errno through a pipe, so a
+# syscall the kernel itself kills or never returns from (vfork corrupts
+# the suspended parent, rseq's neighbour uretprobe answers SIGILL) only
+# counts as "not EPERM" instead of taking the probe down.
+#
+# Numbers that would block the child forever with zero arguments.
+SKIP_PROBES = {23, 270, 271, 34}  # select, pselect6, ppoll, pause
+# clone/fork with flags 0 go through like fork: the copy leaves at once.
+FORKING = {56, 57, 58}
+# Outside the table, yet not the filter's EPERM: clone3 (ENOSYS, for
+# glibc's fallback) and uretprobe/uprobe, the one exception the kernel
+# makes for every seccomp filter (`seccomp_uprobe_exception`).
+KERNEL_EXEMPT = {435: ENOSYS, 335: None, 336: None}
+# Listed, yet the kernel itself answers EPERM with these arguments:
+# fchmod/fchown on fd 0 (host-owned /dev/null when no stdin is given),
+# setsid (a process group leader), setgroups (the idmap denies it),
+# mlock/mlock2/mlockall (RLIMIT_MEMLOCK of 0 on the host).
+KERNEL_EPERM = {91, 93, 112, 116, 149, 151, 325}
+
+PROBE = f"""\
+import select
+def probe(nr):
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r)
+        rr, e = syscall(nr, 0, 0, 0, 0, 0, 0)
+        if rr == 0 and nr in {FORKING!r}:
+            os._exit(0)
+        os.write(w, str(e).encode())
+        os._exit(0)
+    os.close(w)
+    ready, _, _ = select.select([r], [], [], 2)
+    if ready:
+        data = os.read(r, 16).decode()
+    else:
+        os.kill(pid, 9)
+        data = "hang"
+    os.close(r)
+    os.waitpid(pid, 0)
+    return data
+"""
+
+
+def test_whole_syscall_table(river_):
+    listed = {nr for _, nr in _seccomp_table()}
+    code = (
+        PROLOGUE
+        + PROBE
+        + "import json\n"
+        + "results = {}\n"
+        + "for nr in range(512):\n"
+        + f"    if nr not in {SKIP_PROBES!r}:\n"
+        + "        results[nr] = probe(nr)\n"
+        + "print(json.dumps(results))\n"
+    )
+    result = py(river_, code)
+    assert result.status == "AC", (result.stdout, result.stderr, result.error)
+    got = {int(nr): e for nr, e in json.loads(result.stdout).items()}
+    # The probe really walked the table.
+    assert len(got) == 512 - len(SKIP_PROBES)
+    # Outside the table: the filter's EPERM, clone3 and the kernel's
+    # uprobe exception aside.
+    refused = {nr: e for nr, e in got.items() if nr not in listed and nr not in KERNEL_EXEMPT}
+    assert got[435] == str(ENOSYS), got[435]
+    assert wrong(refused, dict.fromkeys(refused, str(EPERM))) == {}
+    # Inside the table: never the filter's EPERM.
+    listed_eperm = {nr for nr, e in got.items() if nr in listed and e == str(EPERM)}
+    assert listed_eperm <= KERNEL_EPERM, sorted(listed_eperm - KERNEL_EPERM)
 
 
 # Raw clone(2) probes: a clone that went through (it never must) continues
@@ -180,9 +256,10 @@ def test_nested_namespaces_are_denied(river_):
 
 def test_x32_syscalls_are_killed(river_):
     # The x32 ABI shares AUDIT_ARCH_X86_64 with the native one, only
-    # __X32_SYSCALL_BIT (0x40000000) in nr tells them apart — a denylist
-    # that keys on nr would let 0x40000000 + socket through. The first
-    # program kills such calls outright (SIGSYS, SECCOMP_RET_KILL_PROCESS).
+    # __X32_SYSCALL_BIT (0x40000000) in nr tells them apart. No allowlist
+    # rule matches such a number (EPERM already); the guard in front of the
+    # clone3 program escalates it to a kill (SIGSYS,
+    # SECCOMP_RET_KILL_PROCESS).
     result = py(river_, PROLOGUE + "syscall(0x40000000 | 41, 1, 1, 0)\n")
     assert result.status == "RE", (result.stdout, result.stderr, result.error)
     assert result.signal == 31, (result.signal, result.error)

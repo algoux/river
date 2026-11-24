@@ -222,7 +222,8 @@ pub struct ChildSpec {
     pub stdin_pipe_r: RawFd,
     pub stdout_pipe_w: RawFd,
     pub stderr_pipe_w: RawFd,
-    /// Installed in order, stacked; empty = no seccomp (`RIVER_HARDENING=off`).
+    /// Installed in order, stacked — the order matters, see
+    /// `seccomp::build_programs`; empty = no seccomp (`RIVER_HARDENING=off`).
     pub seccomp_programs: Vec<BpfProgram>,
     /// `None` = Landlock unavailable or `RIVER_HARDENING=off`.
     pub landlock_masks: Option<landlock::Masks>,

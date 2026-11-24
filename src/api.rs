@@ -469,3 +469,10 @@ impl ExecResult {
         ))
     }
 }
+
+/// `_seccomp_table()` for the test-suite: the syscalls seccomp lets
+/// through, as `(name, number)`. Not part of the public API.
+#[pyfunction]
+pub fn _seccomp_table() -> Vec<(String, i64)> {
+    exec::seccomp::table()
+}
