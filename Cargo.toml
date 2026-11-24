@@ -1,6 +1,6 @@
 [package]
 name = "river"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
 description = "Rootless Linux sandbox for untrusted programs, with judge-grade resource limits and accounting"
 license = "Apache-2.0"

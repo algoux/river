@@ -1,0 +1,28 @@
+# Push a tag (v*) to publish: builds the manylinux wheel and attaches it to a
+# GitHub Release. PyPI is not used for now (the `river` name there belongs to
+# the online machine learning library); users install the wheel straight from
+# the release URL.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  github-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the wheel
+        run: >
+          docker run --rm -v "$PWD:/io" ghcr.io/pyo3/maturin:latest
+          build --release --locked -i python3.12 -o /io/dist
+
+      - name: Create the release with the wheel attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.whl --verify-tag --generate-notes

@@ -1,0 +1,40 @@
+# Build the manylinux wheel on every code push to dev. Tests are deliberately
+# NOT run here: the suite needs a delegated cgroup and a docker-exported
+# rootfs, which the hosted runners cannot provide; verification stays on the
+# two documented environments (docs/development-plan.md §4 preamble).
+name: wheels
+
+on:
+  push:
+    branches: [dev]
+    paths-ignore:
+      - "docs/**"
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wheels-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  manylinux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same command as the README install section: the pyo3/maturin image is
+      # manylinux2014 (glibc 2.17), and -i python3.12 makes the abi3 wheel
+      # carry the cp312 tag that matches requires-python >= 3.12.
+      - name: Build the wheel
+        run: >
+          docker run --rm -v "$PWD:/io" ghcr.io/pyo3/maturin:latest
+          build --release --locked -i python3.12 -o /io/dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: river-manylinux-x86_64
+          path: dist/*.whl
+          if-no-files-found: error

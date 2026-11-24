@@ -18,8 +18,11 @@ The design in [docs/design.md](docs/design.md) is the single source of truth;
 plan and PR breakdown, and [docs/example.py](docs/example.py) is the target
 API.
 
-**Status: in development.** The feature set is complete (sandbox, limits,
-hardening, I/O); what remains before a release is the manylinux wheel (PR 6).
+**Status: feature-complete at v0.1.0, unreleased.** The manylinux wheel
+builds with the one-liner in [Install](#install). A distribution channel is
+still undecided: the `river` name on PyPI belongs to the (unrelated) online
+machine learning library, so for now install from source — or, once a tag
+exists, straight from a GitHub release.
 
 ## Requirements
 
@@ -39,15 +42,29 @@ print(river.doctor())
 
 ## Install
 
-Built from source with [maturin](https://www.maturin.rs/) (a Rust toolchain is
-required) into the current virtualenv:
+Linux x86_64, Python ≥ 3.12. One docker command builds a manylinux wheel from
+source — no Rust toolchain needed, because the
+[pyo3/maturin image](https://www.maturin.rs/distribution) is a manylinux2014
+(glibc 2.17) build environment:
 
 ```sh
-pip install maturin
 git clone https://github.com/algoux/river.git
 cd river
-maturin develop
+docker run --rm -v "$(pwd):/io" ghcr.io/pyo3/maturin:latest \
+    build --release --locked -i python3.12 -o "$(pwd)/target/wheels"
+pip install target/wheels/river-*.whl
 ```
+
+`-i python3.12` pins the interpreter so the abi3 wheel carries the `cp312`
+tag matching `requires-python >= 3.12`: the result,
+`river-<version>-cp312-abi3-manylinux_2_17_x86_64.whl`, installs on any
+CPython ≥ 3.12. With a Rust toolchain you can instead build straight into the
+active virtualenv (`pip install maturin && maturin develop`); a tagged push
+attaches the same wheel to the GitHub release via
+[.github/workflows/release.yml](.github/workflows/release.yml).
+
+aarch64 wheels are not built: the seccomp denylist uses x86_64-only syscall
+numbers (design.md §9 notes what to trim when porting).
 
 ## Preparing a rootfs
 
