@@ -15,13 +15,13 @@
 - CI 不在当前阶段范围内。除非要求，不做冒烟测试。
 - 设计已经定稿（`docs/design.md`），实现中遇到设计没覆盖的情况：小的自行决定并回写到 design.md；涉及语义/接口的先问。
 
-## 1. 仓库现状（2026-11-24，PR 5 之后）
+## 1. 仓库现状（2026-11-24，PR 6 之后）
 
 | 项 | 现状 |
 |---|---|
-| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `11643a9`（PR 5），`origin = git@github.com:algoux/river.git` |
+| 分支 / 远端 | `master` @ `4d98ce6`（旧实现，未动）；`dev` @ `c5f13f7`（PR 6），`origin = git@github.com:algoux/river.git` |
 | 工作分支 | 所有开发在 `dev`；其他开发机从 GitHub 拉 `dev`（同步方式见 `docs/environment.local.md`） |
-| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/test_attack.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
+| 已跟踪 | `Cargo.toml`、`Cargo.lock`、`pyproject.toml`、`uv.lock`、`README.md`、`LICENSE`、`.gitignore`、`python/river/`、`src/{lib,api,preflight,cgroup}.rs`、`src/exec/{mod,child,mount,caps,idmap,landlock,seccomp,supervise,io}.rs`、`.github/workflows/{wheels,release}.yml`、`tests/test_doctor.py`、`tests/test_functional.py`、`tests/test_limits.py`、`tests/test_attack.py`、`tests/conftest.py`、`docs/`（`design.md`、本计划、`example.py`） |
 | 不提交 | `docs/environment.local.md`（`*.local.md`）、`.venv/`、`target/`、`python/river/_river.abi3.so`（`maturin develop` 的 editable 产物，`*.so` 已忽略）、`.dsh/`、`.mypy_cache/`、`.ruff_cache/` |
 | 依赖 | `pyo3 0.30`（`abi3-py312`）、`libc`、`rustix 0.38`、`seccompiler 0.5`、`landlock 0.4`（crates.io 上的 crate 名；项目名叫 rust-landlock）、`caps 0.5`；Python ≥ 3.12，pytest ≥ 8 |
 
@@ -46,7 +46,7 @@
 - 树级 `cpu.stat` 轮询（CPU 总量靶向 = `RLIMIT_CPU` + 墙钟 + 事后判定）；不再使用 `cpu.max`。
 - D-Bus / `zbus` 自动申请 cgroup scope；拿不到委托就报错。
 - overlay CoW rootfs、subuid/`newuidmap`、idmapped mount、squashfs/loopdev。
-- CI / GitHub Actions（P4 再说）。
+- 测试进 CI：hosted runner 上搭 cgroup 委托无先例，CI 只做构建/发布（`wheels.yml` push 构建上传 artifact、`release.yml` tag 触发 GitHub Release，PR 6 落地）；测试仍在两套环境人工跑。
 - Windows / macOS 后端。
 - 沙箱内网络（只有 `lo`）。
 - 旧内核兼容、任何形式的 fallback 路径。
@@ -142,11 +142,13 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -m pytest -m doct
 
 **结果：全部满足。** WSL 与远端 tester 各 81 过 2 跳（跳过的是 doctor 组的非委托互斥用例；functional 44/44、limits 9/9、attack 16/16），非委托环境各 6 过 77 跳。copy_out 与 `*_file` 大小判定统一走 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`（libc 有 `SYS_openat2`/`RESOLVE_*` 常量，`struct open_how` 因 `#[non_exhaustive]` 手写，与 `mount_setattr` 同类处理）：最终组件与**中间目录组件**的 symlink 一律 `ELOOP`——attack 组新增的中间组件用例证明宿主侧 stat+read 两步查找会被 `<work>/etc → /etc` 带到宿主的 `/etc/passwd`，openat2 单步解析+打开并把普通文件/大小检查落在 fd 上，TOCTOU 一并消除；FIFO 以 `O_NONBLOCK` 打开后按非普通文件拒绝（宿主侧永不阻塞）；宿主目标**两阶段**写入，任一条失败时不留半写的宿主文件。`CopyOutError.result` 挂完整 `ExecResult`（判定先于收集完成，`files` 为空，`api.rs` 在异常实例上 `setattr`）。执行中补齐一个实现缺口：`extract_copy_out` 此前漏收 `str` 值（design.md §4 一直写明 `None | str | os.PathLike`）。`/work` inode 洪泛评估结论（不加 `nr_inodes`：独立受限 tmpfs 需要 host 侧 mount 权限，rootless 不可达，残余风险被墙钟+结束即删封顶）与两阶段写入语义已回写 design.md §10。
 
-### PR 6 P4 发布
+### PR 6 P4 发布 ✅ 已完成（2026-11-24，`dev` @ `c5f13f7`）
 
-目标：manylinux wheel，`pip install river` 开箱即用。
+目标：manylinux wheel，`pip install` 开箱即用。
 
-范围：在 docker 的 `ghcr.io/pyo3/maturin:latest`（manylinux）里 `maturin build --release`，x86_64 优先，aarch64 用 `cross`/`zigbuild`；版本号 `0.1.0`；README 补安装说明；CI 此时再建。
+范围（执行前拍板）：在 docker 的 `ghcr.io/pyo3/maturin:latest`（manylinux2014，glibc 2.17）里 `maturin build --release --locked -i python3.12`，只出 x86_64（aarch64 顺延：seccomp 表含 x86_64 专属编号，design.md §9 已注明裁剪范围，且无 aarch64 测试机）；版本号 `0.1.0`；README 安装段改为 docker 一条命令自建 wheel；CI 只建构建/发布（`wheels.yml` push→wheel artifact，`release.yml` tag→GitHub Release）；**不发布**——PyPI 上 `river` 名字已被在线机器学习库（riverml）占用，发布渠道未定，本轮也不打 tag。
+
+**结果：全部满足（按拍板后的范围）。** wheel `river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl`（414 KB）在 WSL 与远端 tester 各自构建一份，均装进干净 venv 验证：WSL（Python 3.14.4）与远端（Python 3.12.3，恰为 abi3 下限）`__version__` 均为 0.1.0、模块来自 site-packages，委托 scope 下 `doctor()` 全绿，全量 pytest 各 **81 过 2 跳**（跳过的仍是 doctor 组非委托互斥用例）——这是首个 release 构建形态下的全量验证。`wheels` workflow 推送后首跑一次通过（59 s，构建 52 s）。执行中修正三个环境级假设：① 镜像默认 `python3` 是 3.9（`/opt/python/cp39` 在 PATH 首位），必须 `-i python3.12` 才能得到 `cp312-abi3` 标签，否则 wheel 面向错误版本；② WSL 直连 ghcr 拉镜像反复 `connection reset`，docker daemon 加 Clash 代理 drop-in 后正常（本地信息见 environment.local.md）；③ 远端 `sudo -u tester` 下跑 uv 必须先 `cd ~/river`——uv 与 pytest 一样从 cwd 向上找配置，落在 /root 时撞 `/root/uv.toml` 的 `Permission denied`（与 PR 3 的 pytest 同根因）。
 
 ## 5. 早期需要验证的假设
 

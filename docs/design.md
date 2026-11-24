@@ -290,7 +290,7 @@ printf '{"envs":{"PATH":"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 | 3 P1 cgroup | §7 单例、run cgroup、限制 knob、`cgroup.kill`、`TLE/MLE/OLE` 判定 | 死循环 / 大内存 / 写爆 stdout / fork bomb 用例状态正确 |
 | 4 P2 加固 ✅ 2026-11-24 | seccomp denylist、Landlock、`attack` 测试组 | 嵌套 userns、netlink、写 rootfs、symlink copy_out 全部被拒（已达成） |
 | 5 P3 I/O ✅ 2026-11-24 | copy_in/out、`*_file`、`stdin`、meta.json、README | pytest 全绿，README 可照做（已达成；copy_out 走 openat2，`CopyOutError.result` 已带） |
-| 6 P4 发布 | manylinux wheel（docker 内构建）、版本号 | `pip install` 开箱即用 |
+| 6 P4 发布 ✅ 2026-11-24 | manylinux wheel（docker 内构建）、版本号 | wheel 干净 venv `pip install` 即用，两套环境全量测试绿（已达成）；PyPI 的 `river` 名被在线学习库占用，发布渠道未定、暂不发布 |
 
 CI 不在本阶段范围内。
 
