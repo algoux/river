@@ -17,21 +17,16 @@ usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 
 The API section below is the complete surface, in one page.
 
-**Status: v0.1.1 on PyPI.** The PyPI distribution is `river-sandbox` — the
-`river` name there belongs to the (unrelated) online machine learning library
-— while the import name stays `river`. The v0.1.0 wheels also live on the
-[releases page](https://github.com/algoux/river/releases).
-
 ## Requirements
 
-- Linux ≥ 6.8, x86_64 (the seccomp denylist is x86_64-specific for now).
+- Linux ≥ 6.8, x86_64.
 - systemd with the unified cgroup v2 hierarchy, and a cgroup subtree delegated
   to your user.
 - Unprivileged user namespaces: `user.max_user_namespaces > 0`, and on Ubuntu
   ≥ 23.10 also `kernel.apparmor_restrict_unprivileged_userns = 0`.
 
 `river.doctor()` checks every requirement, reports the Landlock ABI as an
-informational item, and prints the exact fix for whatever fails — run it first:
+informational item, and prints the exact fix for whatever fails:
 
 ```python
 import river
@@ -47,16 +42,7 @@ import name stays `river`:
 pip install river-sandbox
 ```
 
-The released v0.1.0 wheel can also be fetched straight from GitHub:
-
-```sh
-pip install https://github.com/algoux/river/releases/download/v0.1.0/river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-```
-
-To build the same wheel from source, one docker command suffices — no Rust
-toolchain needed, because the
-[pyo3/maturin image](https://www.maturin.rs/distribution) is a manylinux2014
-(glibc 2.17) build environment:
+Build with Docker:
 
 ```sh
 git clone https://github.com/algoux/river.git
@@ -66,24 +52,11 @@ docker run --rm -v "$(pwd):/io" ghcr.io/pyo3/maturin:latest \
 pip install target/wheels/river_sandbox-*.whl
 ```
 
-`-i python3.12` pins the interpreter so the abi3 wheel carries the `cp312`
-tag matching `requires-python >= 3.12`: the result,
-`river_sandbox-<version>-cp312-abi3-manylinux_2_17_x86_64.whl`, installs on any
-CPython ≥ 3.12. With a Rust toolchain you can instead build straight into the
-active virtualenv (`pip install maturin && maturin develop`). Tagged pushes
-attach the same wheel to the GitHub release via
-[.github/workflows/release.yml](.github/workflows/release.yml).
-
-aarch64 wheels are not built: parts of the seccomp denylist (`nfsservctl`,
-`sysfs`, `iopl`, ...) are x86_64-only syscall numbers and the x32 ABI guard is
-x86_64-specific — porting means trimming the list per architecture first.
-
 ## Preparing a rootfs
 
 The rootfs is a directory holding a complete user space, typically exported
 from a container image. Unpack it **as the user that will run river**: the
-sandbox maps your uid to root inside, and files owned by anyone else show up
-broken.
+sandbox maps your uid to root inside.
 
 ```sh
 mkdir -p /rootfs/python
@@ -102,9 +75,8 @@ always creates any missing mount points (`proc`, `sys`, `dev/pts`, `tmp`,
 ## Running: the delegated cgroup
 
 river needs a cgroup v2 subtree delegated to your user for limits, metrics and
-the wall-clock kill; it refuses to run without one (`CgroupNotDelegatedError`
-rather than silently losing every limit). Start the interpreter itself inside
-a delegated scope:
+the wall-clock kill; it refuses to run without one. Start the interpreter
+itself inside a delegated scope:
 
 ```sh
 systemd-run --user --scope -p Delegate=yes -- python app.py
@@ -190,11 +162,4 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -c "import river;
 systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs> -- .venv/bin/python -m pytest -x
 ```
 
-Formatting and import order are ruff's job (its isort rules replace a standalone
-isort): `uv run ruff check . && uv run ruff format .`.
-
-The rootfs for the functional tests is a docker-exported `python:3.12-slim`
-tree (recipe above). The design document and the PR plan that drove the
-implementation were removed once 0.1.0 shipped — both stay recoverable from
-git history, up to tag `v0.1.0`. Machine-specific notes never enter the
-repository.
+Formatting and import order are ruff's job: `uv run ruff check . && uv run ruff format .`.

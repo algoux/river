@@ -1,7 +1,5 @@
 # river
 
-<!-- 中文段落与列表项请保持整行不换行：Markdown 会把句内换行渲染成空格，中文之间多出的空格很难看。 -->
-
 [English](README.md) | 简体中文
 
 river 是一个 Python 库：把任意程序放进一个以调用方提供的 rootfs 为基础搭建的无 root Linux 沙箱里运行，并给出评测级的资源占用与判定结果（`AC` / `RE` / `TLE` / `MLE` / `OLE`）。
@@ -13,15 +11,13 @@ river 是一个 Python 库：把任意程序放进一个以调用方提供的 ro
 
 下面的 API 一节就是完整接口说明。
 
-**状态：PyPI 上已发布 v0.1.1。** PyPI 上的发行名是 `river-sandbox` —— 那里 `river` 这个名字属于另一个（无关的）在线机器学习库 —— 而导入名仍然是 `river`。v0.1.0 的 wheel 也放在 [releases 页面](https://github.com/algoux/river/releases)。
-
 ## 环境要求
 
-- Linux ≥ 6.8，x86_64（seccomp 拒绝清单目前是 x86_64 专用的）。
+- Linux ≥ 6.8，x86_64。
 - systemd，统一 cgroup v2 层级，并且有一棵委派给你的用户的 cgroup 子树。
 - 非特权用户命名空间：`user.max_user_namespaces > 0`；在 Ubuntu ≥ 23.10 上还需要 `kernel.apparmor_restrict_unprivileged_userns = 0`。
 
-`river.doctor()` 会检查每一项要求，把 Landlock ABI 作为提示信息列出，并打印出失败项对应的确切修复方法 —— 先跑它：
+`river.doctor()` 会检查每一项要求，把 Landlock ABI 作为提示信息列出，并打印出失败项对应的确切修复方法：
 
 ```python
 import river
@@ -36,13 +32,7 @@ Linux x86_64，Python ≥ 3.12。PyPI 上的发行名是 `river-sandbox`，导�
 pip install river-sandbox
 ```
 
-已发布的 v0.1.0 wheel 也可以直接从 GitHub 取：
-
-```sh
-pip install https://github.com/algoux/river/releases/download/v0.1.0/river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
-```
-
-想从源码构建同一个 wheel，一条 docker 命令就够了 —— 不需要 Rust 工具链，因为 [pyo3/maturin 镜像](https://www.maturin.rs/distribution)本身就是 manylinux2014（glibc 2.17）构建环境：
+通过 Docker 构建
 
 ```sh
 git clone https://github.com/algoux/river.git
@@ -52,13 +42,9 @@ docker run --rm -v "$(pwd):/io" ghcr.io/pyo3/maturin:latest \
 pip install target/wheels/river_sandbox-*.whl
 ```
 
-`-i python3.12` 固定了解释器版本，于是 abi3 wheel 会带上与 `requires-python >= 3.12` 对应的 `cp312` tag：产物 `river_sandbox-<version>-cp312-abi3-manylinux_2_17_x86_64.whl` 可以装到任何 CPython ≥ 3.12 上。如果你已经有 Rust 工具链，也可以直接构建进当前虚拟环境（`pip install maturin && maturin develop`）。推送 tag 时，同一个 wheel 会通过 [.github/workflows/release.yml](.github/workflows/release.yml) 挂到 GitHub release 上。
-
-不构建 aarch64 wheel：seccomp 拒绝清单里的若干项（`nfsservctl`、`sysfs`、`iopl` 等）是 x86_64 专有的系统调用号，x32 ABI 守卫也是 x86_64 专有的 —— 要移植得先按架构裁剪这份清单。
-
 ## 准备 rootfs
 
-rootfs 是一个存放完整用户空间的目录，通常从容器镜像导出。**要以将来运行 river 的那个用户来解包**：沙箱会把你的 uid 映射成内部的 root，别人拥有的文件会显示为损坏。
+rootfs 是一个存放完整用户空间的目录，通常从容器镜像导出。**要以将来运行 river 的那个用户来解包**：沙箱会把你的 uid 映射成内部的 root。
 
 ```sh
 mkdir -p /rootfs/python
@@ -72,7 +58,7 @@ printf '{"envs":{"PATH":"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 
 ## 运行：被委派的 cgroup
 
-river 需要一棵委派给你的用户的 cgroup v2 子树来施加限额、采集指标以及实现墙钟超时 kill；没有它 river 会直接拒绝运行（抛 `CgroupNotDelegatedError`，而不是悄悄丢掉所有限额）。让解释器本身跑在被委派的 scope 里：
+river 需要一棵委派给你的用户的 cgroup v2 子树来施加限额、采集指标以及实现墙钟超时 kill；没有它 river 会直接拒绝运行。让解释器本身跑在被委派的 scope 里：
 
 ```sh
 systemd-run --user --scope -p Delegate=yes -- python app.py
@@ -135,6 +121,5 @@ systemd-run --user --scope -p Delegate=yes -- .venv/bin/python -c "import river;
 systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs> -- .venv/bin/python -m pytest -x
 ```
 
-代码格式与导入顺序统一交给 ruff（它的 isort 规则取代了独立的 isort）：`uv run ruff check . && uv run ruff format .`。
+代码格式与导入顺序统一交给 ruff：`uv run ruff check . && uv run ruff format .`。
 
-功能测试用的 rootfs 是 docker 导出的 `python:3.12-slim` 目录树（做法见上文）。驱动这次实现的设计文档与 PR 计划在 0.1.0 发布后已删除 —— 两者仍可从 git 历史里找回，直到 tag `v0.1.0` 为止。机器相关的笔记不会进仓库。
