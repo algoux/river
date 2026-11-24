@@ -16,9 +16,9 @@ river 是一个 Python 库：把任意程序放进一个以调用方提供的 ro
 
 下面的 API 一节就是完整接口说明。
 
-**状态：v0.1.0 已发布。** wheel 放在
-[releases 页面](https://github.com/algoux/river/releases)，而不是 PyPI —— 那里
-`river` 这个名字属于另一个（无关的）在线机器学习库。
+**状态：v0.1.0 已发布。** PyPI 上的发行名是 `river-sandbox` —— 那里 `river`
+这个名字属于另一个（无关的）在线机器学习库 —— 而导入名仍然是 `river`。wheel
+放在 [releases 页面](https://github.com/algoux/river/releases)。
 
 ## 环境要求
 
@@ -37,7 +37,14 @@ print(river.doctor())
 
 ## 安装
 
-Linux x86_64，Python ≥ 3.12。直接从 GitHub 安装已发布的 wheel：
+Linux x86_64，Python ≥ 3.12。PyPI 上的发行名是 `river-sandbox`，导入名仍然是
+`river`：
+
+```sh
+pip install river-sandbox
+```
+
+已发布的 v0.1.0 wheel 也可以直接从 GitHub 取：
 
 ```sh
 pip install https://github.com/algoux/river/releases/download/v0.1.0/river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -52,12 +59,12 @@ git clone https://github.com/algoux/river.git
 cd river
 docker run --rm -v "$(pwd):/io" ghcr.io/pyo3/maturin:latest \
     build --release --locked -i python3.12 -o "$(pwd)/target/wheels"
-pip install target/wheels/river-*.whl
+pip install target/wheels/river_sandbox-*.whl
 ```
 
 `-i python3.12` 固定了解释器版本，于是 abi3 wheel 会带上与 `requires-python >=
 3.12` 对应的 `cp312` tag：产物
-`river-<version>-cp312-abi3-manylinux_2_17_x86_64.whl` 可以装到任何
+`river_sandbox-<version>-cp312-abi3-manylinux_2_17_x86_64.whl` 可以装到任何
 CPython ≥ 3.12 上。如果你已经有 Rust 工具链，也可以直接构建进当前虚拟环境
 （`pip install maturin && maturin develop`）。推送 tag 时，同一个 wheel 会通过
 [.github/workflows/release.yml](.github/workflows/release.yml) 挂到 GitHub

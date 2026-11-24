@@ -1,7 +1,7 @@
 # Push a tag (v*) to publish: builds the manylinux wheel and attaches it to a
-# GitHub Release. PyPI is not used for now (the `river` name there belongs to
-# the online machine learning library); users install the wheel straight from
-# the release URL.
+# GitHub Release. The wheel is named after the PyPI distribution
+# (`river_sandbox-<version>-...whl`); PyPI publishing is not wired up yet, so
+# users install the wheel straight from the release URL.
 name: release
 
 on:

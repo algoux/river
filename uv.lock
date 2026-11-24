@@ -64,7 +64,7 @@ wheels = [
 ]
 
 [[package]]
-name = "river"
+name = "river-sandbox"
 source = { virtual = "." }
 
 [package.optional-dependencies]

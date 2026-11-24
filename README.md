@@ -17,10 +17,10 @@ usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 
 The API section below is the complete surface, in one page.
 
-**Status: v0.1.0 released.** Wheels live on the
-[releases page](https://github.com/algoux/river/releases), not on PyPI — the
-`river` name there belongs to the (unrelated) online machine learning
-library.
+**Status: v0.1.0 released.** The PyPI distribution is `river-sandbox` — the
+`river` name there belongs to the (unrelated) online machine learning library
+— while the import name stays `river`. Wheels live on the
+[releases page](https://github.com/algoux/river/releases).
 
 ## Requirements
 
@@ -40,7 +40,14 @@ print(river.doctor())
 
 ## Install
 
-Linux x86_64, Python ≥ 3.12. Install the released wheel straight from GitHub:
+Linux x86_64, Python ≥ 3.12. The PyPI distribution is `river-sandbox`, the
+import name stays `river`:
+
+```sh
+pip install river-sandbox
+```
+
+The released v0.1.0 wheel can also be fetched straight from GitHub:
 
 ```sh
 pip install https://github.com/algoux/river/releases/download/v0.1.0/river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
@@ -56,12 +63,12 @@ git clone https://github.com/algoux/river.git
 cd river
 docker run --rm -v "$(pwd):/io" ghcr.io/pyo3/maturin:latest \
     build --release --locked -i python3.12 -o "$(pwd)/target/wheels"
-pip install target/wheels/river-*.whl
+pip install target/wheels/river_sandbox-*.whl
 ```
 
 `-i python3.12` pins the interpreter so the abi3 wheel carries the `cp312`
 tag matching `requires-python >= 3.12`: the result,
-`river-<version>-cp312-abi3-manylinux_2_17_x86_64.whl`, installs on any
+`river_sandbox-<version>-cp312-abi3-manylinux_2_17_x86_64.whl`, installs on any
 CPython ≥ 3.12. With a Rust toolchain you can instead build straight into the
 active virtualenv (`pip install maturin && maturin develop`). Tagged pushes
 attach the same wheel to the GitHub release via

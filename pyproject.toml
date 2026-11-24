@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "river"
+name = "river-sandbox"
 description = "Rootless Linux sandbox for untrusted programs, with judge-grade resource limits and accounting"
 readme = "README.md"
 license = "Apache-2.0"
