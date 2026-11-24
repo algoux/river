@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use seccompiler::sock_filter;
+use seccompiler::BpfProgram;
 
 use crate::cgroup;
 use crate::preflight;
@@ -222,8 +222,8 @@ pub struct ChildSpec {
     pub stdin_pipe_r: RawFd,
     pub stdout_pipe_w: RawFd,
     pub stderr_pipe_w: RawFd,
-    /// Empty = do not install a filter (`RIVER_HARDENING=off`).
-    pub seccomp_prog: Vec<sock_filter>,
+    /// Installed in order, stacked; empty = no seccomp (`RIVER_HARDENING=off`).
+    pub seccomp_programs: Vec<BpfProgram>,
     /// `None` = Landlock unavailable or `RIVER_HARDENING=off`.
     pub landlock_masks: Option<landlock::Masks>,
     /// The design.md §6 rlimits; only the `Some` entries are applied.
@@ -329,10 +329,13 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     // 4. Hardening artifacts (design.md §9). `RIVER_HARDENING=off` disables
     //    only these two; namespaces, the read-only rootfs and the cap drop
     //    stay (design.md §4).
-    let seccomp_prog = if hardening_off {
+    let seccomp_programs = if hardening_off {
         Vec::new()
     } else {
-        seccomp::build_program().map_err(ExecFailure::Host)?
+        let programs = seccomp::build_programs().map_err(ExecFailure::Host)?;
+        let sizes: Vec<String> = programs.iter().map(|p| p.len().to_string()).collect();
+        log(debug, &format!("seccomp programs ({} instructions)", sizes.join(" + ")));
+        programs
     };
     let landlock_masks = if hardening_off {
         None
@@ -482,7 +485,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         stdin_pipe_r: stdin_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
         stdout_pipe_w: stdout_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
         stderr_pipe_w: stderr_child.as_ref().map_or(-1, |fd| fd.as_raw_fd()),
-        seccomp_prog,
+        seccomp_programs,
         landlock_masks,
         rlimits,
         sync_fd: sync_child.as_raw_fd(),

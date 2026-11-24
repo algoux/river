@@ -328,8 +328,8 @@ unsafe fn run(spec: &ChildSpec) -> ! {
                 fail(spec, Step::Landlock, e);
             }
         }
-        if !spec.seccomp_prog.is_empty() {
-            let e = seccomp::install(&spec.seccomp_prog);
+        for program in &spec.seccomp_programs {
+            let e = seccomp::install(program);
             if e != 0 {
                 fail(spec, Step::Seccomp, e);
             }
