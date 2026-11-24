@@ -39,6 +39,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      # gh needs the repository (and the tag) to create the release.
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: river-sandbox-dist
@@ -62,7 +65,7 @@ jobs:
       # keep it a repository secret (Settings -> Secrets and variables ->
       # Actions -> PYPI_API_TOKEN).
       - name: Publish to PyPI
-        uses: pypi/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
           # A re-run of the same tag must not fail on the files already there.
