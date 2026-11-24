@@ -16,8 +16,10 @@ pub struct CgroupBase {
     /// Delegated cgroup, e.g.
     /// `/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/run-r123.scope`.
     pub base: PathBuf,
-    /// `<base>/river`: this process is parked here so that `<base>` itself holds
-    /// no processes and can enable the domain controllers for its children.
+    /// `<base>/river`: every process of `<base>` — this one and any wrapper
+    /// parent still alive (`uv run`, `make`, ...) — is parked here so that
+    /// `<base>` itself holds no processes and can enable the domain controllers
+    /// for its children.
     pub river: PathBuf,
 }
 
@@ -56,26 +58,40 @@ fn init() -> Result<Arc<CgroupBase>, String> {
         ));
     }
 
-    // 4. Park this process in <base>/river so that <base> holds no processes.
+    // 4. Park every process of <base> — this one and any wrapper parent still alive
+    //    (`uv run`, `make`, a shell) — in <base>/river so that <base> holds no
+    //    processes. A pid that cannot be moved (another user's) is left for step 5
+    //    to report; the passes catch a child forked by a wrapper during the move.
     let river = base.join("river");
     fs::create_dir(&river)
         .or_else(|e| if e.kind() == io::ErrorKind::AlreadyExists { Ok(()) } else { Err(e) })
         .map_err(|e| format!("cannot create {}: {e} (not delegated to this user)", river.display()))?;
-    write_file(&river.join("cgroup.procs"), std::process::id().to_string())?;
+    let river_procs = river.join("cgroup.procs");
+    write_file(&river_procs, std::process::id().to_string())?;
+    let base_procs = base.join("cgroup.procs");
+    for _ in 0..3 {
+        let procs = fs::read_to_string(&base_procs).unwrap_or_default();
+        if procs.trim().is_empty() {
+            break;
+        }
+        for pid in procs.split_whitespace() {
+            let _ = fs::write(&river_procs, format!("{pid}\n"));
+        }
+    }
 
     // 5. Enable the domain controllers below <base>. EACCES/EPERM mean "not delegated";
-    //    EBUSY means other processes still live in <base> (a `uv run`/`make` parent, say).
+    //    EBUSY means processes still live in <base> that step 4 could not move.
     let subtree_control = base.join("cgroup.subtree_control");
     let enabled = CONTROLLERS.iter().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ");
     fs::write(&subtree_control, enabled).map_err(|e| match e.raw_os_error() {
         Some(libc::EBUSY) => format!(
-            "cannot enable controllers in {}: {e}; other processes still live in {} ({}): \
-             river needs a cgroup that holds only its own process, e.g. \
-             `systemd-run --user --scope -p Delegate=yes -- .venv/bin/python app.py` \
-             instead of wrapping it in `uv run`/`make`",
+            "cannot enable controllers in {}: {e}; processes still live in {} ({}) and could not be \
+             moved into {} (another user's?); river moves every process of the cgroup there, \
+             so a wrapper parent such as `uv run`/`make` is fine",
             subtree_control.display(),
             base.display(),
-            procs_of(&base)
+            procs_of(&base),
+            river.display()
         ),
         _ => format!(
             "cannot write {}: {e} (not delegated to this user)",

@@ -58,13 +58,13 @@ printf '{"envs":{"PATH":"/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:
 
 ## 运行：被委派的 cgroup
 
-river 需要一棵委派给你的用户的 cgroup v2 子树来施加限额、采集指标以及实现墙钟超时 kill；没有它 river 会直接拒绝运行。让解释器本身跑在被委派的 scope 里：
+river 需要一棵委派给你的用户的 cgroup v2 子树来施加限额、采集指标以及实现墙钟超时 kill；没有它 river 会直接拒绝运行。让程序跑在被委派的 scope 里 —— 直接启动解释器，或套着 `uv run`、`make` 之类的包装脚本都行：
 
 ```sh
 systemd-run --user --scope -p Delegate=yes -- python app.py
 ```
 
-解释器必须是该 scope 里唯一的进程：会常驻的包装脚本（`uv run`、`make` 等）会在 cgroup 里留下第二个进程，river 无法在那里启用控制器 —— 出现这种情况时 `river.doctor()` 会准确地报出来。
+会常驻的包装脚本（`uv run`、`make`、shell 等）没问题：river 在启用控制器之前会把该 cgroup 里的所有进程搬进 `<cgroup>/river`，只有别的用户的进程才会挡住它 —— 出现这种情况时 `river.doctor()` 会准确地报出来。
 
 ## API
 

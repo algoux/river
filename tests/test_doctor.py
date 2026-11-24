@@ -182,6 +182,38 @@ class TestDoctorInDelegatedEnvironment:
         assert "CgroupNotDelegatedError" in proc.stderr
         assert CGROUP_FIX in proc.stderr
 
+    def test_wrapper_parent_is_moved_along(self, tmp_path):
+        # A wrapper that stays alive (uv run, make, this outer python) starts in a
+        # fresh scope next to the interpreter; river moves it into <scope>/river too.
+        inner = tmp_path / "inner.py"
+        inner.write_text(
+            "import os, pathlib, river\n"
+            "river.doctor()\n"
+            "me = next(l[3:] for l in open('/proc/self/cgroup') if l.startswith('0::'))\n"
+            "procs = pathlib.Path('/sys/fs/cgroup', me.strip().lstrip('/'), 'cgroup.procs')\n"
+            "assert str(os.getppid()) in procs.read_text().split(), (os.getppid(), procs)\n"
+        )
+        wrapper = tmp_path / "wrapper.py"
+        wrapper.write_text("import subprocess, sys\nsubprocess.run(sys.argv[1:], check=True)\n")
+        proc = subprocess.run(
+            [
+                "systemd-run",
+                "--user",
+                "--scope",
+                "-p",
+                "Delegate=yes",
+                "--quiet",
+                "--",
+                sys.executable,
+                str(wrapper),
+                sys.executable,
+                str(inner),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
 
 @pytest.mark.skipif(_delegated(), reason="already in a delegated cgroup")
 class TestDoctorInNonDelegatedEnvironment:

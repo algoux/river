@@ -75,17 +75,17 @@ always creates any missing mount points (`proc`, `sys`, `dev/pts`, `tmp`,
 ## Running: the delegated cgroup
 
 river needs a cgroup v2 subtree delegated to your user for limits, metrics and
-the wall-clock kill; it refuses to run without one. Start the interpreter
-itself inside a delegated scope:
+the wall-clock kill; it refuses to run without one. Start the program inside a
+delegated scope — the interpreter itself or whatever wraps it:
 
 ```sh
 systemd-run --user --scope -p Delegate=yes -- python app.py
 ```
 
-The interpreter must be the scope's only process: wrappers that stay alive
-(`uv run`, `make`, ...) leave a second process in the cgroup and river cannot
-enable the controllers there — `river.doctor()` reports exactly that when it
-happens.
+Wrappers that stay alive (`uv run`, `make`, a shell, ...) are fine: river moves
+every process of the cgroup into `<cgroup>/river` before enabling the
+controllers, so only a process of another user can block it — `river.doctor()`
+reports exactly that when it happens.
 
 ## API
 
