@@ -178,7 +178,7 @@ river.RiverError(RuntimeError)
 | `cpu_time_limit_ms` | `RLIMIT_CPU` soft=`ceil(ms/1000)`（到期 `SIGXCPU`，默认终止）、hard=soft+1（`SIGKILL`） | `cpu.stat usage_usec` | `WTERMSIG==SIGXCPU`，或结束后 `cpu_used > limit` → `TLE` |
 | `wall_time_limit_ms` | epoll 超时 = deadline | `CLOCK_MONOTONIC`：发 "go" → `waitid` 返回 | 到期 → `cgroup.kill` → `TLE` |
 | `memory_limit_bytes` | `memory.max`、`memory.swap.max=0`、`memory.oom.group=1` | `memory.peak`（等 `cgroup.events populated=0` 后读） | `memory.events` 的 `oom_kill` 或 `oom_group_kill` 计数 > 0，或结束后 `peak ≥ limit` 且非正常退出 → `MLE` |
-| `stdout_limit_bytes` / `stderr_limit_bytes` | 管道：读到**超过**上限（恰等于不算）后置 `output_limit_hit` 并 `cgroup.kill`，继续读并丢弃；文件：`RLIMIT_FSIZE = max(两者)`（写入被钳在上限并返回 `EFBIG`；pid 1 丢弃内核发的 `SIGXFSZ`，见 §5 信号注记） | 实际收到的字节数 | `output_limit_hit`，或文件 **>** 各自上限，或文件恰好停在各自上限且运行非正常退出 → `OLE`。文件判定由宿主经 /work bind `stat`（`*_file` 解析后不在 /work 下且写入者是 fork 子进程的极端情况无法观测，判 `RE`） |
+| `stdout_limit_bytes` / `stderr_limit_bytes` | 管道：读到**超过**上限（恰等于不算）后置 `output_limit_hit` 并 `cgroup.kill`，继续读并丢弃；文件：`RLIMIT_FSIZE = max(两者)`（写入被钳在上限并返回 `EFBIG`；pid 1 丢弃内核发的 `SIGXFSZ`，见 §5 信号注记） | 实际收到的字节数 | `output_limit_hit`，或文件 **>** 各自上限，或文件恰好停在各自上限且运行非正常退出 → `OLE`。文件判定由宿主经 /work bind 以 `openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS` 打开后 `fstat`（与 copy_out 同一 hardened 查找；`*_file` 解析后不在 /work 下且写入者是 fork 子进程的极端情况无法观测，判 `RE`） |
 | `copy_out_limit_bytes` | 拷贝时截断检查 | — | 超过 → `CopyOutError` |
 | `proc_limit` | `pids.max`、`RLIMIT_NPROC` | — | — |
 | `open_file_limit` / `stack_limit_bytes` / `address_space_limit_bytes` | `RLIMIT_NOFILE` / `RLIMIT_STACK` / `RLIMIT_AS` | — | — |
@@ -243,9 +243,9 @@ cgroup2 文件系统不能在 user namespace 内挂载，必须使用宿主上**
 
 ## 10. I/O
 
-- **`/work` 宿主目录**：`$XDG_RUNTIME_DIR/river/<pid>/<id>`（tmpfs），否则 `/dev/shm/river-<uid>/<pid>/<id>`；exec 结束（无论成败）后删除。填满风险由 `memory.max`（tmpfs 页计入 memcg）+ `RLIMIT_FSIZE` + 结束即删兜底。
-- **`copy_in`**：key 为沙箱内路径，相对路径相对 `cwd`，规范化后必须位于 `/work` 下，否则 `RootfsError`。值：`bytes`/`str`（UTF-8）= 内容；`os.PathLike` = 宿主文件（复制内容，不跟随到 `/work` 外）。`copy_in` 在 exec 之前写入宿主侧 `/work` 目录。
-- **`copy_out`**：key 同上；value `None` → 内容进 `r.files[key]`；路径 → 覆盖写到宿主。读取用 `openat2(work_dir_fd, path, O_RDONLY|O_NOFOLLOW, RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`，非普通文件 / 缺失 / 超过 `copy_out_limit_bytes` → `CopyOutError`（`.result` 已带）。
+- **`/work` 宿主目录**：`$XDG_RUNTIME_DIR/river/<pid>/<id>`（tmpfs），否则 `/dev/shm/river-<uid>/<pid>/<id>`；exec 结束（无论成败）后删除。填满风险由 `memory.max`（tmpfs 页计入 memcg）+ `RLIMIT_FSIZE` + 结束即删兜底；**不单独限制 inode 数**——为单次 exec 挂独立的 nr_inodes 受限 tmpfs 需要 host 侧 mount 权限（rootless 不可达），残余风险只剩单次运行内的 inode 洪泛对同 tmpfs 的短暂 DoS，且被墙钟与结束即删封顶，判可接受（PR 5 评估结论）。
+- **`copy_in`**：key 为沙箱内路径，相对路径相对 `cwd`，规范化后必须位于 `/work` 下，否则 `RootfsError`。值：`bytes`/`str`（UTF-8）= 内容；`os.PathLike` = 宿主文件（复制内容，不跟随到 `/work` 外）。`copy_in` 在 exec 之前写入宿主侧 `/work` 目录——此时目录由 river 刚创建、无人可竞争，用普通路径操作即可（与 copy_out 的 hardened 查找相对）。
+- **`copy_out`**：key 同上；value `None` → 内容进 `r.files[key]`；宿主路径（`str`/`os.PathLike`）→ 覆盖写到宿主。读取用 `openat2(work_dir_fd, path, O_RDONLY|O_NOFOLLOW|O_NONBLOCK, RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`——路径上任何 symlink（含中间目录组件）`ELOOP`、越出目录 `EXDEV`，一次调用完成解析与打开，普通文件与大小检查都落在打开的 fd 上（`O_NONBLOCK` 保证恶意 FIFO 不阻塞宿主侧打开——它的写入者已死）；非普通文件 / 缺失 / 超过 `copy_out_limit_bytes` → `CopyOutError`（`.result` 已带，判定先行完成、`files` 为空）。宿主目标**两阶段**写入：先读完所有条目，全部成功后才覆盖写宿主文件，失败时不留半写的宿主文件。
 - **stdio**：见 §5 `child.stdio`；输出管道由父进程 epoll 循环收集进 `Vec<u8>`，上限后继续读并丢弃；进程退出后把管道剩余数据读完（计入上限判断）。
 
 ## 11. 工程结构

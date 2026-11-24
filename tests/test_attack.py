@@ -398,3 +398,18 @@ def test_copy_out_symlink_is_rejected(river_):
             "import os; os.symlink('/etc/passwd', 'passwd.txt')\n",
             copy_out={"passwd.txt": None},
         )
+
+
+def test_copy_out_symlinked_directory_does_not_leak_host_files(river_):
+    # The symlink in an *intermediate* position: on the host the work
+    # directory is a plain directory tree, so `<work>/etc -> /etc` points at
+    # the host's /etc and a stat-then-read pair would hand the caller the
+    # host's /etc/passwd. openat2 RESOLVE_NO_SYMLINKS refuses the whole
+    # lookup (ELOOP) and the error still carries the finished run.
+    with pytest.raises(CopyOutError, match="symlink") as info:
+        py(
+            river_,
+            "import os; os.symlink('/etc', 'etc')\n",
+            copy_out={"etc/passwd": None},
+        )
+    assert info.value.result.status == "AC"

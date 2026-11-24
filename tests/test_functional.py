@@ -11,7 +11,7 @@ import concurrent.futures
 
 import pytest
 
-from river import ExecSetupError, River
+from river import CopyOutError, ExecResult, ExecSetupError, River, RootfsError
 
 from conftest import delegated
 
@@ -159,6 +159,11 @@ def test_openpty_works(river_):
 
 
 # ------------------------------------------------------------ copy_in/copy_out
+#
+# development-plan.md §4 PR 5: keys normalize below /work (relative ones
+# against cwd), every host-side read of the work directory goes through
+# openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS (design.md §10), and a
+# copy_out failure raises CopyOutError with the finished run on `.result`.
 
 
 def test_copy_in_nested_path(river_):
@@ -170,6 +175,45 @@ def test_copy_in_nested_path(river_):
     assert result.stdout == b"42\n"
 
 
+def test_copy_in_keys_resolve_against_cwd(river_):
+    # A relative key lands below cwd (which copy_in may have to create),
+    # an absolute one is used as-is.
+    result = river_.exec(
+        "python",
+        ["-c", "print(open('data.txt').read(), open('abs.txt').read())"],
+        cwd="/work/job",
+        copy_in={"data.txt": "rel", "/work/job/abs.txt": "abs"},
+    )
+    assert result.status == "AC", (result.stderr, result.error)
+    assert result.stdout == b"rel abs\n"
+
+
+def test_copy_in_from_host_file(tmp_path, river_):
+    # An os.PathLike value copies the host file's *content* (design.md §10);
+    # the host file is outside the sandbox and stays there.
+    src = tmp_path / "data.bin"
+    src.write_bytes(b"\x00\x01binary\xff")
+    result = river_.exec(
+        "python",
+        ["-c", "import sys; sys.stdout.buffer.write(open('data.bin', 'rb').read())"],
+        copy_in={"data.bin": src},
+    )
+    assert result.status == "AC", (result.stderr, result.error)
+    assert result.stdout == b"\x00\x01binary\xff"
+
+
+def test_copy_in_missing_host_file_is_rootfs_error(tmp_path, river_):
+    with pytest.raises(RootfsError, match="copy_in"):
+        river_.exec("python", copy_in={"data.txt": tmp_path / "missing.txt"})
+
+
+@pytest.mark.parametrize("key", ["/etc/passwd", "/work", "../out", "/work/../etc/x", ""])
+def test_copy_keys_must_stay_below_work(river_, key):
+    for kwargs in ({"copy_in": {key: "x"}}, {"copy_out": {key: None}}):
+        with pytest.raises(RootfsError, match="below /work|sandbox path"):
+            river_.exec("python", **kwargs)
+
+
 def test_copy_out_returns_files(river_):
     result = river_.exec(
         "python",
@@ -178,6 +222,194 @@ def test_copy_out_returns_files(river_):
     )
     assert result.status == "AC"
     assert result.files == {"out.txt": b"done"}
+
+
+def test_copy_out_nested_and_relative_keys(river_):
+    # copy_in also has to create the cwd directory (the child chdirs into
+    # /work/out before it can write there).
+    result = river_.exec(
+        "python",
+        ["-c", "import os; os.mkdir('sub'); open('result.txt', 'w').write('42'); open('sub/other.txt', 'w').write('7')"],
+        cwd="/work/out",
+        copy_in={"seed.txt": ""},
+        copy_out={"result.txt": None, "/work/out/sub/other.txt": None},
+    )
+    assert result.status == "AC", (result.stderr, result.error)
+    assert result.files == {"result.txt": b"42", "/work/out/sub/other.txt": b"7"}
+
+
+def test_copy_out_to_host_file_as_path_and_str(tmp_path, river_):
+    # A host path (os.PathLike or str) as the value gets the content
+    # written over it; `files` then only holds the `None` entries.
+    dest, dest2, dest3 = (tmp_path / name for name in ("host.txt", "host2.txt", "host3.txt"))
+    dest.write_text("old content that must be overwritten")
+    result = river_.exec(
+        "python",
+        ["-c", "open('a.txt', 'w').write('A'); open('b.txt', 'w').write('B'); open('c.txt', 'w').write('C')"],
+        copy_out={"a.txt": dest, "b.txt": str(dest2), "c.txt": None},
+    )
+    assert result.status == "AC", (result.stderr, result.error)
+    assert result.files == {"c.txt": b"C"}
+    assert dest.read_bytes() == b"A"
+    assert dest2.read_bytes() == b"B"
+    assert not dest3.exists()
+
+
+def test_copy_out_failure_writes_nothing_to_the_host(tmp_path, river_):
+    # Host destinations are written only after every entry was read: a
+    # missing entry later in the mapping leaves earlier host files alone.
+    dest = tmp_path / "host.txt"
+    with pytest.raises(CopyOutError, match="is missing"):
+        river_.exec(
+            "python",
+            ["-c", "open('a.txt', 'w').write('A')"],
+            copy_out={"a.txt": dest, "missing.txt": None},
+        )
+    assert not dest.exists()
+
+
+def test_copy_out_missing_file_is_rejected_with_the_run(river_):
+    with pytest.raises(CopyOutError, match='copy_out "missing.txt": is missing') as info:
+        py(river_, "import sys; sys.exit(3)", copy_out={"missing.txt": None})
+    result = info.value.result
+    assert isinstance(result, ExecResult)
+    assert result.status == "RE"
+    assert result.exit_code == 3
+    assert result.signal is None
+    assert result.files == {}
+    assert result.error is not None and "code 3" in result.error
+    assert result.wall_time_used_ms > 0
+
+
+def test_copy_out_directory_is_rejected(river_):
+    with pytest.raises(CopyOutError, match='"d": is not a regular file') as info:
+        py(river_, "import os; os.mkdir('d')", copy_out={"d": None})
+    assert info.value.result.status == "AC"
+
+
+def test_copy_out_fifo_is_rejected(river_):
+    # The non-regular class (device nodes cannot even be made inside the
+    # sandbox, design.md §9): a FIFO must not block the host-side open.
+    with pytest.raises(CopyOutError, match='"f": is not a regular file'):
+        py(river_, "import os; os.mkfifo('f')", copy_out={"f": None})
+
+
+def test_copy_out_limit_boundary(river_):
+    # Exactly at the limit passes, one byte more raises (design.md §10).
+    code = "open('out.txt', 'wb').write(b'x' * 64)"
+    result = py(river_, code, copy_out={"out.txt": None}, copy_out_limit_bytes=64)
+    assert result.files == {"out.txt": b"x" * 64}
+    with pytest.raises(CopyOutError, match="65 bytes, above copy_out_limit_bytes=64") as info:
+        py(
+            river_,
+            "open('out.txt', 'wb').write(b'x' * 65)",
+            copy_out={"out.txt": None},
+            copy_out_limit_bytes=64,
+        )
+    assert info.value.result.status == "AC"
+
+
+def test_copy_out_without_limit_reads_large_files(river_):
+    result = py(
+        river_,
+        "open('big.txt', 'wb').write(b'z' * (1024 * 1024))",
+        copy_out={"big.txt": None},
+    )
+    assert result.files == {"big.txt": b"z" * (1024 * 1024)}
+
+
+# ------------------------------------------------------ stdin_file / *_file
+#
+# design.md §5 `child.stdio`, §6: `*_file` paths are sandbox paths relative
+# to cwd; the redirected streams come back as `None` and the files are
+# fetched with copy_out (or land on the sandbox tmpfs when outside /work).
+
+
+def test_stdout_file_and_stderr_file_content(river_):
+    result = river_.exec(
+        "python",
+        ["-c", "import sys; print('to out'); print('to err', file=sys.stderr)"],
+        stdout_file="out.txt",
+        stderr_file="err.txt",
+        copy_out={"out.txt": None, "err.txt": None},
+    )
+    assert result.status == "AC", (result.error,)
+    assert result.stdout is None
+    assert result.stderr is None
+    assert result.files == {"out.txt": b"to out\n", "err.txt": b"to err\n"}
+
+
+def test_stdout_file_leaves_stderr_on_the_pipe(river_):
+    result = river_.exec(
+        "python",
+        ["-c", "import sys; print('to out'); print('to err', file=sys.stderr)"],
+        stdout_file="out.txt",
+        copy_out={"out.txt": None},
+    )
+    assert result.files == {"out.txt": b"to out\n"}
+    assert result.stdout is None
+    assert result.stderr == b"to err\n"
+
+
+def test_std_file_paths_are_relative_to_cwd(river_):
+    result = river_.exec(
+        "python",
+        ["-c", "import sys; sys.stdout.write(open('input.txt').read()); print('done')"],
+        cwd="/work/job",
+        copy_in={"input.txt": "the input\n"},
+        stdin_file="input.txt",
+        stdout_file="output.txt",
+        stderr_file="/work/job/err.txt",
+        copy_out={"output.txt": None, "/work/job/err.txt": None},
+    )
+    assert result.status == "AC", (result.error,)
+    assert result.files == {"output.txt": b"the input\ndone\n", "/work/job/err.txt": b""}
+
+
+def test_stdin_file_absolute_path(river_):
+    result = river_.exec(
+        "python",
+        ["-c", "import sys; print(sys.stdin.read().strip())"],
+        copy_in={"input.txt": "abs"},
+        stdin_file="/work/input.txt",
+    )
+    assert result.stdout == b"abs\n"
+
+
+def test_stdin_and_stdin_file_are_mutually_exclusive(river_):
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        river_.exec("python", stdin=b"x", stdin_file="input.txt")
+
+
+def test_stdout_file_outside_work(river_):
+    # /tmp is the sandbox's own tmpfs: the stream goes there, nothing is
+    # host-observable and the run is otherwise unaffected.
+    result = py(river_, "print('gone')", stdout_file="/tmp/out.txt")
+    assert result.status == "AC", (result.error,)
+    assert result.stdout is None
+    assert result.files == {}
+
+
+def test_stdout_file_in_read_only_rootfs_is_exec_setup_error(river_):
+    with pytest.raises(ExecSetupError, match="child.stdio"):
+        py(river_, "print('x')", stdout_file="/usr/out.txt")
+
+
+# ------------------------------------------------------------------ meta.json
+#
+# design.md §4.1: envs=None uses <rootfs>/meta.json; no file and no envs is
+# a RootfsError (the real-rootfs half lives in test_envs_come_from_meta_json
+# and test_explicit_envs_replace_meta_envs above; parsing errors in
+# test_doctor.py).
+
+
+def test_exec_without_envs_needs_meta_json(tmp_path):
+    with River(tmp_path) as sandbox:
+        with pytest.raises(RootfsError, match="meta.json"):
+            sandbox.exec("python")
+        # ... and explicit envs make the rootfs usable without one.
+        with pytest.raises(ExecSetupError, match="child.execve"):
+            sandbox.exec("python", envs={"PATH": META_PATH})
 
 
 # --------------------------------------------------------------- error paths

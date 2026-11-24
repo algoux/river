@@ -34,7 +34,15 @@ class RootfsError(RiverError): ...
 
 class ExecSetupError(RiverError): ...
 
-class CopyOutError(RiverError): ...
+
+class CopyOutError(RiverError):
+    """Raised when a copy_out entry cannot be retrieved.
+
+    `result` is the `ExecResult` of the run that finished before copy_out
+    failed (its `files` is empty); river always sets it.
+    """
+
+    result: ExecResult
 
 
 class ExecResult:

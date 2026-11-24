@@ -137,15 +137,17 @@ def test_fork_bomb_is_capped_by_proc_limit(river_):
 
 
 def test_copy_out_over_limit_raises(river_):
-    # copy_out_limit_bytes is enforced during collection (design.md §10);
-    # CopyOutError.result arrives with PR 5.
-    with pytest.raises(CopyOutError):
+    # copy_out_limit_bytes is enforced on the opened file (design.md §10);
+    # the error carries the run that finished before copy_out.
+    with pytest.raises(CopyOutError, match="copy_out_limit_bytes=65536") as info:
         py(
             river_,
             "open('big.txt', 'w').write('x' * (1024 * 1024))",
             copy_out={"big.txt": None},
             copy_out_limit_bytes=64 * 1024,
         )
+    assert info.value.result.status == "AC"
+    assert info.value.result.files == {}
 
 
 # ------------------------------------------------ knob writes, live observation

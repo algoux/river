@@ -247,8 +247,15 @@ pub enum ExecFailure {
         errno: i32,
         context: String,
     },
-    /// A copy_out entry could not be retrieved (→ `CopyOutError`).
-    CopyOut { key: String, reason: String },
+    /// A copy_out entry could not be retrieved (→ `CopyOutError`). The run
+    /// itself is complete: `result` is the `ExecResult` the call would have
+    /// returned (with empty `files`) and rides on the exception (design.md
+    /// §4, §10).
+    CopyOut {
+        key: String,
+        reason: String,
+        result: Box<Outcome>,
+    },
     /// A pending Python signal (usually Ctrl-C) interrupted the run.
     Interrupted,
 }
@@ -324,6 +331,10 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     }
     let _work_cleanup = WorkCleanup(&work_dir);
     io::write_copy_in(&work_dir, &p.cwd, &p.copy_in).map_err(ExecFailure::Rootfs)?;
+    // The dirfd every later host-side lookup below /work starts from
+    // (design.md §10 `openat2 RESOLVE_BENEATH`).
+    let work_fd = io::open_work_dir(&work_dir)
+        .map_err(|e| ExecFailure::Host(format!("cannot open {}: {e}", work_dir.display())))?;
     log(debug, &format!("work dir ready: {}", work_dir.display()));
 
     // 4. Hardening artifacts (design.md §9). `RIVER_HARDENING=off` disables
@@ -627,13 +638,10 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         ),
     );
 
-    // 11. copy_out (design.md §3 step 9).
-    let files = io::read_copy_out(&work_dir, &p.cwd, &p.copy_out, p.copy_out_limit_bytes)
-        .map_err(|(key, reason)| ExecFailure::CopyOut { key, reason })?;
-
-    // 12. Verdict (design.md §4 status semantics, §6 ladder:
-    //     OLE > MLE > TLE > AC/RE).
-    let file_over = output_file_over(&work_dir, p, exit_code);
+    // 11. Verdict (design.md §4 status semantics, §6 ladder:
+    //     OLE > MLE > TLE > AC/RE). It does not depend on copy_out, and
+    //     a copy_out failure has to carry it (design.md §4 `CopyOutError`).
+    let file_over = output_file_over(work_fd.as_raw_fd(), p, exit_code);
     let (status, error) = classify(
         exit_code,
         signal,
@@ -644,8 +652,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         p,
     );
     log(debug, &format!("verdict: {status} ({error:?})"));
-
-    Ok(Outcome {
+    let mut outcome = Outcome {
         status,
         exit_code,
         signal,
@@ -662,9 +669,30 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         } else {
             Some(stderr_buf)
         },
-        files,
+        files: Vec::new(),
         error,
-    })
+    };
+
+    // 12. copy_out (design.md §3 step 9, §10): read below the dirfd with
+    //     `openat2`, so a planted symlink or a swap cannot reach host files.
+    let files = match io::read_copy_out(
+        work_fd.as_raw_fd(),
+        &p.cwd,
+        &p.copy_out,
+        p.copy_out_limit_bytes,
+    ) {
+        Ok(files) => files,
+        Err(failure) => {
+            return Err(ExecFailure::CopyOut {
+                key: failure.key,
+                reason: failure.reason,
+                result: Box::new(outcome),
+            })
+        }
+    };
+    outcome.files = files;
+
+    Ok(outcome)
 }
 
 /// Kills the child through its pidfd and reaps it — for failure paths
@@ -687,12 +715,15 @@ fn kill_child(pid: i32, pidfd: RawFd) {
 
 /// The file half of the output limits (design.md §6): `*_file` paths that
 /// resolve below /work are host-observable through the bind, so their sizes
-/// are checked against their own caps after the run. RLIMIT_FSIZE (= max of
-/// the file-bound caps) clamps a write exactly at the cap with EFBIG — and
-/// pid 1 drops the kernel's SIGXFSZ (`SIGNAL_UNKILLABLE`), so the writer
-/// dies of the error instead of the signal — hence a file sitting exactly
-/// at its cap on a run that did not exit cleanly also counts as over.
-fn output_file_over(work_dir: &Path, p: &ExecParams, exit_code: Option<i32>) -> Vec<&'static str> {
+/// are checked against their own caps after the run — through the same
+/// `openat2` lookup as copy_out, so a symlink planted over a `*_file` is
+/// never followed. RLIMIT_FSIZE (= max of the file-bound caps) clamps a
+/// write exactly at the cap with EFBIG — and pid 1 drops the kernel's
+/// SIGXFSZ (`SIGNAL_UNKILLABLE`), so the writer dies of the error instead
+/// of the signal — hence a file sitting exactly at its cap on a run that
+/// did not exit cleanly also counts as over. A `*_file` that cannot be
+/// opened (replaced by a symlink, outside /work) is simply not observed.
+fn output_file_over(work_fd: RawFd, p: &ExecParams, exit_code: Option<i32>) -> Vec<&'static str> {
     let mut over = Vec::new();
     for (name, file, limit) in [
         ("stdout", p.stdout_file.as_deref(), p.stdout_limit_bytes),
@@ -707,9 +738,11 @@ fn output_file_over(work_dir: &Path, p: &ExecParams, exit_code: Option<i32>) -> 
         if !path.starts_with("/work") {
             continue; // outside the bind, not host-observable
         }
-        let host = work_dir.join(path.strip_prefix("/work").unwrap());
-        if fs::metadata(&host).is_ok_and(|meta| {
-            meta.is_file() && (meta.len() > limit || (meta.len() == limit && exit_code != Some(0)))
+        if io::open_beneath(work_fd, &path).is_ok_and(|f| {
+            f.metadata().is_ok_and(|meta| {
+                meta.is_file()
+                    && (meta.len() > limit || (meta.len() == limit && exit_code != Some(0)))
+            })
         }) {
             over.push(name);
         }

@@ -46,7 +46,7 @@ pyo3::create_exception!(
     river,
     CopyOutError,
     RiverError,
-    "A copy_out entry could not be retrieved."
+    "A copy_out entry could not be retrieved; .result holds the ExecResult of the finished run."
 );
 
 /// Runs programs inside a rootfs. Construction performs every preflight check
@@ -294,7 +294,9 @@ fn extract_copy_in(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, Co
     Ok(out)
 }
 
-/// `Mapping[str, None | os.PathLike]` → copy_out entries (design.md §10).
+/// `Mapping[str, None | str | os.PathLike]` → copy_out entries (design.md
+/// §4, §10): a host path as `str` or `os.PathLike` gets the content written
+/// over it, `None` keeps the content in `ExecResult.files`.
 fn extract_copy_out(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, Option<String>)>> {
     let bound = value.bind(py);
     let items = bound.call_method0("items")?;
@@ -304,6 +306,8 @@ fn extract_copy_out(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, O
         let item = item.bind(py);
         let dest = if item.is_none() {
             None
+        } else if let Ok(text) = item.extract::<String>() {
+            Some(text)
         } else if is_pathlike(py, item)? {
             Some(fspath(py, item)?)
         } else {
@@ -338,8 +342,16 @@ fn failure_to_err(py: Python<'_>, failure: ExecFailure) -> PyErr {
             };
             ExecSetupError::new_err(msg)
         }
-        ExecFailure::CopyOut { key, reason } => {
-            CopyOutError::new_err(format!("copy_out {key:?}: {reason}"))
+        ExecFailure::CopyOut { key, reason, result } => {
+            // design.md §4: `.result` carries the run that finished before
+            // copy_out failed, so the caller keeps the verdict and metrics.
+            // (This function returns PyErr, not PyResult, so the ? operator
+            // is unavailable here.)
+            let err = CopyOutError::new_err(format!("copy_out {key:?}: {reason}"));
+            if let Err(setattr_err) = err.value(py).setattr("result", build_result(py, *result)) {
+                return setattr_err;
+            }
+            err
         }
         ExecFailure::Interrupted => {
             // The child is already killed and reaped; surface the pending
