@@ -1,6 +1,6 @@
 """river: rootless Linux sandbox for untrusted programs.
 
-See docs/design.md for the design and docs/example.py for the target API.
+See docs/example.py for a complete API example.
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ class DoctorReport:
 
 
 def doctor(raise_on_fail: bool = True) -> DoctorReport:
-    """Run every preflight check (design.md §8).
+    """Run every preflight check.
 
     With `raise_on_fail` (the default) the first failed check raises the same
     exception `River()` would raise; otherwise every check is reported.

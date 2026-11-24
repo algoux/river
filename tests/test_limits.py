@@ -1,7 +1,7 @@
 """Resource limits and the TLE/MLE/OLE verdicts (marker: limits).
 
-development-plan.md §4, PR 3: every limit parameter takes effect and the
-verdict ladder (design.md §6: OLE > MLE > TLE > AC/RE) classifies runs the
+Every limit parameter takes effect and the verdict ladder
+(OLE > MLE > TLE > AC/RE) classifies runs the
 judge-grade way. Needs a delegated cgroup and RIVER_TEST_ROOTFS, like the
 functional group; memory sizes stay small for the 1.6 GB remote machine.
 """
@@ -40,7 +40,7 @@ def py(river_, code: str, **kwargs):
 
 
 def test_cpu_deadloop_is_tle(river_):
-    # cpu=1000, wall=5000 (development-plan.md §4): RLIMIT_CPU soft=1s sends
+    # cpu=1000, wall=5000: RLIMIT_CPU soft=1s sends
     # SIGXCPU (24); if pid 1 of the namespace drops it, the hard limit kills
     # at 9 — and the post-run cpu.stat check marks TLE either way.
     result = py(river_, "while True: pass", cpu_time_limit_ms=1000, wall_time_limit_ms=5000)
@@ -65,7 +65,7 @@ def test_wall_deadline_is_tle(river_):
 
 def test_memory_exceeded_is_mle(river_):
     # 256 MB against memory.max=64 MB with memory.oom.group=1: the kernel
-    # OOM-kills the whole cgroup (design.md §6).
+    # OOM-kills the whole cgroup.
     result = py(river_, "a = bytearray(256 * 1024 * 1024)", memory_limit_bytes=64 * MB)
     assert result.status == "MLE", (result.error,)
     assert result.signal == 9
@@ -88,7 +88,7 @@ def test_stdout_over_limit_is_ole(river_):
 
 
 def test_stdout_file_over_limit_is_ole(river_):
-    # The file branch (design.md §6): RLIMIT_FSIZE clamps the write at the
+    # The file branch: RLIMIT_FSIZE clamps the write at the
     # cap and returns EFBIG — and pid 1 of the namespace drops the kernel's
     # SIGXFSZ (SIGNAL_UNKILLABLE), so the writer dies of the OSError
     # traceback (exit 1) instead of the signal. The file sits exactly at
@@ -110,7 +110,7 @@ def test_stdout_file_over_limit_is_ole(river_):
 def test_fork_bomb_is_capped_by_proc_limit(river_):
     # proc_limit=16 (pids.max + RLIMIT_NPROC): once the tree holds 16
     # processes os.fork() fails with EAGAIN, the parent notices, prints and
-    # exits cleanly — the bomb never gets out (development-plan.md §4).
+    # exits cleanly — the bomb never gets out.
     result = py(
         river_,
         "import os\n"
@@ -137,7 +137,7 @@ def test_fork_bomb_is_capped_by_proc_limit(river_):
 
 
 def test_copy_out_over_limit_raises(river_):
-    # copy_out_limit_bytes is enforced on the opened file (design.md §10);
+    # copy_out_limit_bytes is enforced on the opened file;
     # the error carries the run that finished before copy_out.
     with pytest.raises(CopyOutError, match="copy_out_limit_bytes=65536") as info:
         py(
@@ -156,7 +156,7 @@ def test_copy_out_over_limit_raises(river_):
 def _run_and_watch(river_, **kwargs):
     """Runs one sleeping exec in a thread and reads the live run cgroup's
     knobs once the child is attached — `cgroup.procs` non-empty means every
-    knob was already written (design.md §3 steps 2/6)."""
+    knob was already written."""
     out = {}
 
     def target():
@@ -190,7 +190,7 @@ def _run_and_watch(river_, **kwargs):
 
 
 def test_unlimited_knobs_stay_at_defaults(river_):
-    # development-plan.md PR 3 completion criterion: a limit of None never
+    # A limit of None never
     # writes its knob — the cgroup files stay at their defaults.
     result, knobs = _run_and_watch(river_)
     assert result.status == "AC", (result.error,)

@@ -13,16 +13,12 @@ usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 - **latest kernels only** (≥ 6.8): user namespaces, delegated cgroup v2,
   Landlock and seccomp are always on; no compatibility fallbacks.
 
-The design in [docs/design.md](docs/design.md) is the single source of truth;
-[docs/development-plan.md](docs/development-plan.md) holds the implementation
-plan and PR breakdown, and [docs/example.py](docs/example.py) is the target
-API.
+[docs/example.py](docs/example.py) is the complete API in one file.
 
-**Status: feature-complete at v0.1.0, unreleased.** The manylinux wheel
-builds with the one-liner in [Install](#install). A distribution channel is
-still undecided: the `river` name on PyPI belongs to the (unrelated) online
-machine learning library, so for now install from source — or, once a tag
-exists, straight from a GitHub release.
+**Status: v0.1.0 released.** Wheels live on the
+[releases page](https://github.com/algoux/river/releases), not on PyPI — the
+`river` name there belongs to the (unrelated) online machine learning
+library.
 
 ## Requirements
 
@@ -42,8 +38,14 @@ print(river.doctor())
 
 ## Install
 
-Linux x86_64, Python ≥ 3.12. One docker command builds a manylinux wheel from
-source — no Rust toolchain needed, because the
+Linux x86_64, Python ≥ 3.12. Install the released wheel straight from GitHub:
+
+```sh
+pip install https://github.com/algoux/river/releases/download/v0.1.0/river-0.1.0-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+```
+
+To build the same wheel from source, one docker command suffices — no Rust
+toolchain needed, because the
 [pyo3/maturin image](https://www.maturin.rs/distribution) is a manylinux2014
 (glibc 2.17) build environment:
 
@@ -59,12 +61,13 @@ pip install target/wheels/river-*.whl
 tag matching `requires-python >= 3.12`: the result,
 `river-<version>-cp312-abi3-manylinux_2_17_x86_64.whl`, installs on any
 CPython ≥ 3.12. With a Rust toolchain you can instead build straight into the
-active virtualenv (`pip install maturin && maturin develop`); a tagged push
-attaches the same wheel to the GitHub release via
+active virtualenv (`pip install maturin && maturin develop`). Tagged pushes
+attach the same wheel to the GitHub release via
 [.github/workflows/release.yml](.github/workflows/release.yml).
 
-aarch64 wheels are not built: the seccomp denylist uses x86_64-only syscall
-numbers (design.md §9 notes what to trim when porting).
+aarch64 wheels are not built: parts of the seccomp denylist (`nfsservctl`,
+`sysfs`, `iopl`, ...) are x86_64-only syscall numbers and the x32 ABI guard is
+x86_64-specific — porting means trimming the list per architecture first.
 
 ## Preparing a rootfs
 
@@ -140,10 +143,19 @@ with River("/rootfs/python") as river:
 
 `ExecResult` also carries `stdout` / `stderr` (`bytes | None`, `None` when a
 `*_file` was given), `files` (the `copy_out` entries whose value was `None`)
-and `error` (the human-readable reason behind any non-`AC` verdict). Every
-end state inside the sandbox lands in the `ExecResult`; only setup failures
-raise — `ExecSetupError` (with the failing step, e.g. `child.mount.proc`),
-`RootfsError`, and `CopyOutError`, whose `.result` holds the finished run.
+and `error` (the human-readable reason behind any non-`AC` verdict).
+
+Verdicts: `AC` — exited 0; `RE` — nonzero exit or killed by a signal (`signal`
+names it); `TLE` — the wall clock or the CPU budget ran out; `MLE` — the
+cgroup OOM-killed the tree; `OLE` — output past the cap. Ties resolve as
+`OLE` > `MLE` > `TLE` > `AC`/`RE`.
+
+Every end state inside the sandbox lands in the `ExecResult`; only setup
+failures raise — `ExecSetupError` (with the failing step, e.g.
+`child.mount.proc`), `RootfsError`, and `CopyOutError`, whose `.result` holds
+the finished run. All of them derive from `river.RiverError`, as do
+`KernelTooOldError`, `UserNamespaceDeniedError` and `CgroupNotDelegatedError`
+(what `doctor()` raises on its first failed check).
 
 Two environment variables exist for debugging, not configuration:
 `RIVER_LOG=debug` traces every parent and child step on stderr;
@@ -170,6 +182,7 @@ systemd-run --user --scope -p Delegate=yes --setenv=RIVER_TEST_ROOTFS=<rootfs> -
 ```
 
 The rootfs for the functional tests is a docker-exported `python:3.12-slim`
-tree (recipe above). The plan and the environment-specific notes are in
-[docs/development-plan.md](docs/development-plan.md); machine details never
-enter the repository.
+tree (recipe above). The design document and the PR plan that drove the
+implementation were removed once 0.1.0 shipped — both stay recoverable from
+git history, up to tag `v0.1.0`. Machine-specific notes never enter the
+repository.

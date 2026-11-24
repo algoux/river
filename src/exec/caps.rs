@@ -1,4 +1,4 @@
-//! Capability drop (design.md §5 `child.caps`, §9).
+//! Capability drop (`child.caps`).
 
 /// <linux/capability.h>, hand-declared: libc 0.2 has no capset binding.
 #[repr(C)]
@@ -76,7 +76,7 @@ pub unsafe fn drop_all() -> i32 {
         return unsafe { *libc::__errno_location() };
     }
 
-    // SECBIT_NOROOT|LOCKED from design.md §5 is unreachable rootless:
+    // SECBIT_NOROOT|LOCKED is unreachable rootless:
     // PR_SET_SECUREBITS requires CAP_SETPCAP in the initial user namespace
     // (EPERM here). The uid-0-regain path it guards is already closed by
     // PR_SET_NO_NEW_PRIVS, which the child sets right after this step.

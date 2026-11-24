@@ -1,4 +1,4 @@
-//! uid/gid mapping (design.md §5 `child.idmap`, §9).
+//! uid/gid mapping (`child.idmap`).
 //!
 //! The child is the user-namespace creator and holds CAP_SETUID/SETGID
 //! inside it, so it writes its own maps without parent involvement. The
@@ -14,7 +14,7 @@ pub struct Idmap {
 }
 
 /// Writes `/proc/self/setgroups`=deny, then `uid_map`, then `gid_map`
-/// (design.md §5). Returns 0 on success, otherwise the failed step's errno.
+/// Returns 0 on success, otherwise the failed step's errno.
 ///
 /// # Safety
 /// Child-only: open/write/close on fixed `/proc/self` paths; no allocation.

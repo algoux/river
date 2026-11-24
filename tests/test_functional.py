@@ -2,7 +2,7 @@
 
 Every test here needs a delegated cgroup (the `River()` preflight) and, for
 the real-rootfs group, `RIVER_TEST_ROOTFS` pointing at a docker-exported
-`python:3.12-slim` tree (see docs/development-plan.md §4, PR 2).
+`python:3.12-slim` tree.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ pytestmark = [
     ),
 ]
 
-# The rootfs's meta.json provides these (docs/design.md §4.1).
+# The rootfs's meta.json provides these.
 META_PATH = "/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 
@@ -160,9 +160,9 @@ def test_openpty_works(river_):
 
 # ------------------------------------------------------------ copy_in/copy_out
 #
-# development-plan.md §4 PR 5: keys normalize below /work (relative ones
+# Keys normalize below /work (relative ones
 # against cwd), every host-side read of the work directory goes through
-# openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS (design.md §10), and a
+# openat2 RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS, and a
 # copy_out failure raises CopyOutError with the finished run on `.result`.
 
 
@@ -189,7 +189,7 @@ def test_copy_in_keys_resolve_against_cwd(river_):
 
 
 def test_copy_in_from_host_file(tmp_path, river_):
-    # An os.PathLike value copies the host file's *content* (design.md §10);
+    # An os.PathLike value copies the host file's *content*;
     # the host file is outside the sandbox and stays there.
     src = tmp_path / "data.bin"
     src.write_bytes(b"\x00\x01binary\xff")
@@ -289,13 +289,13 @@ def test_copy_out_directory_is_rejected(river_):
 
 def test_copy_out_fifo_is_rejected(river_):
     # The non-regular class (device nodes cannot even be made inside the
-    # sandbox, design.md §9): a FIFO must not block the host-side open.
+    # sandbox): a FIFO must not block the host-side open.
     with pytest.raises(CopyOutError, match='"f": is not a regular file'):
         py(river_, "import os; os.mkfifo('f')", copy_out={"f": None})
 
 
 def test_copy_out_limit_boundary(river_):
-    # Exactly at the limit passes, one byte more raises (design.md §10).
+    # Exactly at the limit passes, one byte more raises.
     code = "open('out.txt', 'wb').write(b'x' * 64)"
     result = py(river_, code, copy_out={"out.txt": None}, copy_out_limit_bytes=64)
     assert result.files == {"out.txt": b"x" * 64}
@@ -320,7 +320,7 @@ def test_copy_out_without_limit_reads_large_files(river_):
 
 # ------------------------------------------------------ stdin_file / *_file
 #
-# design.md §5 `child.stdio`, §6: `*_file` paths are sandbox paths relative
+# `child.stdio`: `*_file` paths are sandbox paths relative
 # to cwd; the redirected streams come back as `None` and the files are
 # fetched with copy_out (or land on the sandbox tmpfs when outside /work).
 
@@ -397,7 +397,7 @@ def test_stdout_file_in_read_only_rootfs_is_exec_setup_error(river_):
 
 # ------------------------------------------------------------------ meta.json
 #
-# design.md §4.1: envs=None uses <rootfs>/meta.json; no file and no envs is
+# envs=None uses <rootfs>/meta.json; no file and no envs is
 # a RootfsError (the real-rootfs half lives in test_envs_come_from_meta_json
 # and test_explicit_envs_replace_meta_envs above; parsing errors in
 # test_doctor.py).
@@ -488,7 +488,7 @@ def test_example_py_call_shape(river_):
     assert result.exit_code == 0
     assert result.signal is None
     # stdout_file/stderr_file redirect the streams into /work, so the pipes
-    # see nothing and the fields are None (design.md §4).
+    # see nothing and the fields are None.
     assert result.stdout is None
     assert result.stderr is None
     assert result.files == {}

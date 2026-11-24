@@ -13,7 +13,7 @@ def cgroup_base() -> Path:
     for line in Path("/proc/self/cgroup").read_text().splitlines():
         if line.startswith("0::"):
             base = Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-            # doctor()/River() park the process in <base>/river (design.md §7).
+            # doctor()/River() park the process in <base>/river.
             return base.parent if base.name == "river" else base
     raise RuntimeError("no unified cgroup v2 hierarchy in /proc/self/cgroup")
 

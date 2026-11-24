@@ -1,4 +1,4 @@
-//! Parent-side orchestration of one `River.exec()` (design.md §3).
+//! Parent-side orchestration of one `River.exec()`.
 //!
 //! Everything here runs with the GIL released; failures are plain Rust
 //! values and `api.rs` turns them into Python exceptions.
@@ -26,7 +26,7 @@ use seccompiler::BpfProgram;
 use crate::cgroup;
 use crate::preflight;
 
-/// design.md §5 step names, in the order the child executes them. The
+/// Step names, in the order the child executes them. The
 /// `child.*` names travel to `ExecSetupError` messages; `parent.*` steps
 /// mark orchestration failures around the clone.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +35,7 @@ pub enum Step {
     Pdeathsig = 0,
     Idmap = 1,
     MountPrivate = 2,
-    /// design.md §5 `bind_root` + `root_attr`, merged: the read-only root
+    /// `bind_root` + `root_attr`, merged: the read-only root
     /// bind is one detached-clone-attr-attach dance (see child.rs).
     MountBindRoot = 3,
     MountProc = 4,
@@ -131,7 +131,7 @@ impl Step {
 }
 
 /// One 8-byte packet on the sync socket: the step that failed plus the
-/// errno (design.md §5). `SOCK_SEQPACKET` keeps it a single message.
+/// errno. `SOCK_SEQPACKET` keeps it a single message.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SyncMsg {
@@ -172,14 +172,14 @@ pub struct ExecParams {
     pub copy_out_limit_bytes: Option<u64>,
 }
 
-/// Child-side rlimits, precomputed in the parent (design.md §6): CPU is
+/// Child-side rlimits, precomputed in the parent: CPU is
 /// soft=`ceil(ms/1000)` with hard=soft+1 (SIGXCPU, then SIGKILL), every
 /// other touched limit is soft=hard. `None` = leave the resource alone.
 #[derive(Default)]
 pub struct RlimitSpec {
     pub cpu: Option<(libc::rlim_t, libc::rlim_t)>,
     /// `max(stdout_limit, stderr_limit)` over the streams bound to files —
-    /// the kernel backstop for file OLE and the /work fill guard (§10).
+    /// the kernel backstop for file OLE and the /work fill guard.
     pub fsize: Option<libc::rlim_t>,
     pub nproc: Option<libc::rlim_t>,
     pub nofile: Option<libc::rlim_t>,
@@ -187,7 +187,7 @@ pub struct RlimitSpec {
     pub as_bytes: Option<libc::rlim_t>,
 }
 
-/// The whole pre-serialized child state (design.md §3 step 4): strings are
+/// The whole pre-serialized child state: strings are
 /// `CString`s, argv/envp pointer arrays are pre-built (heap addresses stay
 /// valid in the clone's COW copy), fds are inherited raw numbers.
 pub struct ChildSpec {
@@ -226,7 +226,7 @@ pub struct ChildSpec {
     pub seccomp_programs: Vec<BpfProgram>,
     /// `None` = Landlock unavailable or `RIVER_HARDENING=off`.
     pub landlock_masks: Option<landlock::Masks>,
-    /// The design.md §6 rlimits; only the `Some` entries are applied.
+    /// The rlimits; only the `Some` entries are applied.
     pub rlimits: RlimitSpec,
     pub sync_fd: RawFd,
 }
@@ -249,8 +249,7 @@ pub enum ExecFailure {
     },
     /// A copy_out entry could not be retrieved (→ `CopyOutError`). The run
     /// itself is complete: `result` is the `ExecResult` the call would have
-    /// returned (with empty `files`) and rides on the exception (design.md
-    /// §4, §10).
+    /// returned (with empty `files`) and rides on the exception.
     CopyOut {
         key: String,
         reason: String,
@@ -275,8 +274,7 @@ pub struct Outcome {
 }
 
 /// `struct clone_args`, hand-declared: libc 0.2 has no gnu binding for
-/// clone3/clone_args (development-plan.md §5 V4), so this goes through
-/// `libc::syscall`.
+/// clone3/clone_args, so this goes through `libc::syscall`.
 #[repr(C)]
 #[derive(Default)]
 struct CloneArgs {
@@ -291,7 +289,7 @@ struct CloneArgs {
 }
 const _: () = assert!(std::mem::size_of::<CloneArgs>() == 64);
 
-/// Executes one run end to end (design.md §3). The GIL must be released.
+/// Executes one run end to end. The GIL must be released.
 pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     let debug = std::env::var_os("RIVER_LOG").is_some_and(|v| v.eq_ignore_ascii_case("debug"));
     let hardening_off =
@@ -301,9 +299,9 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         &format!("exec starting: executable={:?} cwd={:?}", p.executable, p.cwd),
     );
 
-    // 2. The run cgroup (design.md §3 step 2, §7): every limit knob, the
-    //    sandbox process tree and the metrics live here — it must exist
-    //    even when not a single limit is passed (design.md §3).
+    // 2. The run cgroup: every limit knob, the sandbox process tree and the
+    //    metrics live here — it must exist even when not a single limit is
+    //    passed.
     let run_knobs = cgroup::RunKnobs {
         memory_limit_bytes: p.memory_limit_bytes,
         proc_limit: p.proc_limit,
@@ -313,7 +311,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     );
     log(debug, &format!("run cgroup ready: {}", run_cg.path().display()));
 
-    // 3. The host work directory and copy_in (design.md §3 step 3, §10).
+    // 3. The host work directory and copy_in.
     let base = preflight::workdir_base().map_err(ExecFailure::Host)?;
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let work_dir = base
@@ -322,7 +320,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     fs::create_dir_all(&work_dir).map_err(|e| {
         ExecFailure::Host(format!("cannot create {}: {e}", work_dir.display()))
     })?;
-    // design.md §10: removed when the run ends, whatever happened.
+    // Removed when the run ends, whatever happened.
     struct WorkCleanup<'a>(&'a Path);
     impl Drop for WorkCleanup<'_> {
         fn drop(&mut self) {
@@ -332,14 +330,13 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     let _work_cleanup = WorkCleanup(&work_dir);
     io::write_copy_in(&work_dir, &p.cwd, &p.copy_in).map_err(ExecFailure::Rootfs)?;
     // The dirfd every later host-side lookup below /work starts from
-    // (design.md §10 `openat2 RESOLVE_BENEATH`).
+    // (`openat2 RESOLVE_BENEATH`).
     let work_fd = io::open_work_dir(&work_dir)
         .map_err(|e| ExecFailure::Host(format!("cannot open {}: {e}", work_dir.display())))?;
     log(debug, &format!("work dir ready: {}", work_dir.display()));
 
-    // 4. Hardening artifacts (design.md §9). `RIVER_HARDENING=off` disables
-    //    only these two; namespaces, the read-only rootfs and the cap drop
-    //    stay (design.md §4).
+    // 4. Hardening artifacts. `RIVER_HARDENING=off` disables only these two;
+    //    namespaces, the read-only rootfs and the cap drop stay.
     let seccomp_programs = if hardening_off {
         Vec::new()
     } else {
@@ -361,8 +358,8 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         masks
     };
 
-    // 5. File descriptors: the sync socket and the stdio pipes (design.md §3
-    //    step 4). Parent ends and child ends live in separate `OwnedFd`s so
+    // 5. File descriptors: the sync socket and the stdio pipes. Parent ends
+    //    and child ends live in separate `OwnedFd`s so
     //    closing happens exactly once.
     let (sync_parent, sync_child) = {
         let (a, b) = io::socketpair_seqpacket()
@@ -414,7 +411,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         (None, None)
     };
 
-    // 6. Pre-serialize the child state (design.md §3 step 4).
+    // 6. Pre-serialize the child state.
     let euid = unsafe { libc::geteuid() };
     let egid = unsafe { libc::getegid() };
     let cstring = |s: &str| -> Result<CString, ExecFailure> {
@@ -455,7 +452,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
             .collect::<Result<Vec<_>, _>>()?
     };
     let work_src = cstring(&work_dir.display().to_string())?;
-    // The design.md §6 rlimits, precomputed so the child only calls
+    // The rlimits, precomputed so the child only calls
     // setrlimit: CPU soft=ceil(ms/1000)/hard=soft+1, the file cap is the
     // max of the *file-bound* stream limits, everything else is flat.
     let rlimits = RlimitSpec {
@@ -502,7 +499,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         sync_fd: sync_child.as_raw_fd(),
     };
 
-    // 7. clone3: one call creates every namespace (design.md §3 step 5).
+    // 7. clone3: one call creates every namespace.
     let flags: u64 = (libc::CLONE_NEWUSER
         | libc::CLONE_NEWNS
         | libc::CLONE_NEWPID
@@ -553,7 +550,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
     drop(stderr_child);
     drop(stdin_child);
 
-    // 8. design.md §3 step 6: park the child in the run cgroup *before*
+    // 8. Park the child in the run cgroup *before*
     //    "go", so every limit is in force before the first sandboxed
     //    instruction. A failure here means the child is still unattached —
     //    kill it through the pidfd (`cgroup.kill` cannot reach it yet).
@@ -566,8 +563,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         &format!("child {pid} attached to {}", run_cg.path().display()),
     );
 
-    // 9. "go" + supervise (design.md §3 step 6–7). The wall clock runs from
-    //    "go" to the reap (design.md §4, §6).
+    // 9. "go" + supervise. The wall clock runs from "go" to the reap.
     let t0 = Instant::now();
     if let Err(e) = io::write_all_fd(sync_parent.as_raw_fd(), b"g") {
         kill_child(pid, pidfd.as_raw_fd());
@@ -603,8 +599,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         }
     };
 
-    // 10. Reap (design.md §3 step 8) and interpret the sync report
-    //     (ExecSetupError, design.md §5).
+    // 10. Reap and interpret the sync report (ExecSetupError).
     let wait_status = waitpid_blocking(pid);
     let (exit_code, signal) = decode_status(wait_status);
     let wall_time_used_ms = t0.elapsed().as_millis() as u64;
@@ -628,7 +623,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
 
     // With the pid-1 reap the namespace teardown kills the rest of the
     // tree; wait for the cgroup to drain, read the final numbers, remove
-    // the directory (design.md §3 step 8).
+    // the directory.
     let metrics = run_cg.finish();
     log(
         debug,
@@ -638,9 +633,8 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         ),
     );
 
-    // 11. Verdict (design.md §4 status semantics, §6 ladder:
-    //     OLE > MLE > TLE > AC/RE). It does not depend on copy_out, and
-    //     a copy_out failure has to carry it (design.md §4 `CopyOutError`).
+    // 11. Verdict (ladder: OLE > MLE > TLE > AC/RE). It does not depend on
+    //     copy_out, and a copy_out failure has to carry it (`CopyOutError`).
     let file_over = output_file_over(work_fd.as_raw_fd(), p, exit_code);
     let (status, error) = classify(
         exit_code,
@@ -673,7 +667,7 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
         error,
     };
 
-    // 12. copy_out (design.md §3 step 9, §10): read below the dirfd with
+    // 12. copy_out: read below the dirfd with
     //     `openat2`, so a planted symlink or a swap cannot reach host files.
     let files = match io::read_copy_out(
         work_fd.as_raw_fd(),
@@ -697,8 +691,8 @@ pub fn run(rootfs: &Path, p: &ExecParams) -> Result<Outcome, ExecFailure> {
 
 /// Kills the child through its pidfd and reaps it — for failure paths
 /// between clone3 and supervise, where the child may not be in the run
-/// cgroup yet, so `cgroup.kill` cannot reach it (design.md §3 step 6
-/// attaches only just before "go").
+/// cgroup yet, so `cgroup.kill` cannot reach it (the child is attached
+/// only just before "go").
 fn kill_child(pid: i32, pidfd: RawFd) {
     // SAFETY: pidfd_send_signal(2) with a null siginfo.
     let _ = unsafe {
@@ -713,7 +707,7 @@ fn kill_child(pid: i32, pidfd: RawFd) {
     supervise::reap(pid);
 }
 
-/// The file half of the output limits (design.md §6): `*_file` paths that
+/// The file half of the output limits: `*_file` paths that
 /// resolve below /work are host-observable through the bind, so their sizes
 /// are checked against their own caps after the run — through the same
 /// `openat2` lookup as copy_out, so a symlink planted over a `*_file` is
@@ -750,7 +744,7 @@ fn output_file_over(work_fd: RawFd, p: &ExecParams, exit_code: Option<i32>) -> V
     over
 }
 
-/// design.md §4 status semantics behind the §6 verdict ladder
+/// Status semantics behind the verdict ladder
 /// (`OLE > MLE > TLE > AC/RE`), each verdict with a human-readable `error`.
 fn classify(
     exit_code: Option<i32>,
@@ -784,8 +778,7 @@ fn classify(
     }
 
     // MLE: the cgroup OOM-killed the tree, or the peak crossed the limit on
-    // a run that did not finish cleanly (page cache exempts normal exits,
-    // design.md §6).
+    // a run that did not finish cleanly (page cache exempts normal exits).
     if metrics.oom_kill {
         return (
             "MLE".to_string(),
@@ -810,7 +803,7 @@ fn classify(
     }
 
     // TLE: our wall kill, SIGXCPU from RLIMIT_CPU, or the post-run cpu.stat
-    // check (design.md §6 — no tree-wide polling, judge after the fact).
+    // check (no tree-wide polling, judge after the fact).
     if supervised.wall_timeout {
         return (
             "TLE".to_string(),
@@ -838,7 +831,7 @@ fn classify(
         }
     }
 
-    // AC/RE (design.md §4).
+    // AC/RE.
     match (exit_code, signal) {
         (Some(0), _) => ("AC".to_string(), None),
         (Some(code), _) => ("RE".to_string(), Some(format!("exited with code {code}"))),

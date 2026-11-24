@@ -1,4 +1,4 @@
-//! Mount helpers for the child sequence (design.md §5 `child.mount.*`).
+//! Mount helpers for the child sequence (`child.mount.*`).
 //!
 //! Everything here is a bare syscall: no `io::Result` construction that
 //! could allocate, no locks. Paths come pre-serialized as `&CStr` (either
@@ -23,8 +23,7 @@ const OPEN_TREE_CLONE: libc::c_uint = 1;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
 
 /// `struct mount_attr`, hand-declared: rustix 0.38 does not expose
-/// `mount_setattr` (development-plan.md §5, V5), so this goes through
-/// `libc::syscall`.
+/// `mount_setattr`, so this goes through `libc::syscall`.
 #[repr(C)]
 struct MountAttr {
     attr_set: u64,
@@ -64,8 +63,8 @@ pub unsafe fn mount(
 }
 
 /// `mount("none", "/", NULL, MS_REC|MS_PRIVATE, NULL)`: stop every mount
-/// event from propagating to or from the host (design.md §5
-/// `child.mount.private`). 0 on success, errno otherwise.
+/// event from propagating to or from the host (`child.mount.private`).
+/// 0 on success, errno otherwise.
 ///
 /// # Safety
 /// Child-only, same contract as [`mount`].

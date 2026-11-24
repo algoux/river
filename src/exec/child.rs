@@ -1,4 +1,4 @@
-//! The child sequence after clone3 (design.md §5) — bare syscalls only.
+//! The child sequence after clone3 — bare syscalls only.
 //!
 //! The calling process is multi-threaded; at clone time another thread may
 //! hold any lock, so between clone3 and execve this code must not allocate,
@@ -9,8 +9,8 @@ use std::ffi::CStr;
 
 use super::{caps, idmap, landlock, mount, seccomp, ChildSpec, Step, SyncMsg};
 
-/// Host device nodes bound into every sandbox (design.md §5
-/// `child.mount.dev_*`): userns-created `mknod` nodes are unusable, so the
+/// Host device nodes bound into every sandbox (`child.mount.dev_*`):
+/// userns-created `mknod` nodes are unusable, so the
 /// host ones are bind-mounted and only then get `NOSUID`.
 const DEV_BINDS: [(&CStr, &CStr); 5] = [
     (c"/dev/null", c"./dev/null"),
@@ -32,7 +32,7 @@ pub unsafe fn entry(spec: &ChildSpec) -> ! {
 }
 
 unsafe fn run(spec: &ChildSpec) -> ! {
-    // a: PDEATHSIG first (design.md §5 `child.pdeathsig`).
+    // a: PDEATHSIG first (`child.pdeathsig`).
     // SAFETY: prctl with a scalar argument.
     let r = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) };
     if r < 0 {
@@ -47,7 +47,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { libc::_exit(42) };
     }
 
-    // b: idmap — setgroups deny, then uid_map/gid_map (design.md §5).
+    // b: idmap — setgroups deny, then uid_map/gid_map.
     // SAFETY: bare open/write/close on fixed /proc paths.
     let e = unsafe { idmap::write_maps(&spec.idmap) };
     if e != 0 {
@@ -55,8 +55,8 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { fail(spec, Step::Idmap, e) };
     }
 
-    // c: wait for "go" — the parent parks us in the run cgroup (design.md
-    //    §3 step 6) before handing control over.
+    // c: wait for "go" — the parent parks us in the run cgroup before
+    //    handing control over.
     let mut go = [0u8; 1];
     // SAFETY: plain read(2) on the inherited sync socket.
     let n = unsafe {
@@ -70,7 +70,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
 
     unsafe { debug(spec, c"[river child] idmap done, go received\n") };
 
-    // d: mount sequence -> pivot_root (design.md §5).
+    // d: mount sequence -> pivot_root.
     // SAFETY: every call below is a bare mount-related syscall.
     unsafe {
         // child.mount.private: no propagation to or from the host.
@@ -79,8 +79,8 @@ unsafe fn run(spec: &ChildSpec) -> ! {
             fail(spec, Step::MountPrivate, e);
         }
         debug(spec, c"[river child] private ok\n");
-        // child.mount.bind_root (design.md §5 `bind_root` + `root_attr`,
-        // merged): clone the rootfs as a *detached* mount, set
+        // child.mount.bind_root (`bind_root` + `root_attr`, merged): clone
+        // the rootfs as a *detached* mount, set
         // RDONLY|NOSUID|NODEV while it is still detached — mount_setattr on
         // an attached bind clone of a host-owned tree answers EINVAL, and
         // old-style bind+remount silently ignores the flags on this kernel —
@@ -157,7 +157,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         }
         // child.mount.dev_*: bind each host device node through the same
         // detached-clone dance, with NOSUID (NODEV would make the devices
-        // unusable, design.md §5).
+        // unusable).
         for &(src, dst) in &DEV_BINDS {
             let fd = mount::open_tree_clone(src, false);
             if fd < 0 {
@@ -194,7 +194,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
 
         // child.mount.sys: fresh sysfs, read-only. The user namespace owns
         // the new network namespace, so mounting sysfs is allowed; failure
-        // is a setup failure (design.md §5). Kernels ≥ 6.6 auto-mount
+        // is a setup failure. Kernels ≥ 6.6 auto-mount
         // cgroup2 at /sys/fs/cgroup when sysfs is mounted in a user
         // namespace, and that view would leak the caller's cgroup subtree —
         // a read-only tmpfs over ./sys/fs covers it.
@@ -221,7 +221,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
 
         // child.mount.pivot: swap the roots, then drop the old one. The old
         // root ends up stacked on the new root at "."; `umount2(".", MNT_DETACH)`
-        // reveals the new root (design.md §5).
+        // reveals the new root.
         let e = mount::pivot_root_dot();
         if e != 0 {
             fail(spec, Step::MountPivot, e);
@@ -237,7 +237,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         debug(spec, c"[river child] pivot done\n");
     }
 
-    // e: lo up (design.md §5 `child.net.lo`) — before the caps drop.
+    // e: lo up (`child.net.lo`) — before the caps drop.
     // SAFETY: socket(2) + ioctl(2) with a stack `ifreq`.
     unsafe {
         let sock = libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
@@ -262,7 +262,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         }
     }
 
-    // f: rlimits (design.md §5 `child.rlimit.*`, §6) — only the limits the
+    // f: rlimits (`child.rlimit.*`) — only the limits the
     //    caller passed; RLIMIT_CPU carries the (soft, hard) pair, every
     //    other touched limit is soft=hard.
     // SAFETY: bare setrlimit(2) on precomputed `ChildSpec` values.
@@ -309,7 +309,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         debug(spec, c"[river child] rlimits done\n");
     }
 
-    // g: caps -> no_new_privs -> Landlock -> seccomp (design.md §5).
+    // g: caps -> no_new_privs -> Landlock -> seccomp.
     // SAFETY: bare prctl/capset and the allocation-free landlock/seccomp steps.
     unsafe {
         let e = caps::drop_all();
@@ -345,7 +345,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
         unsafe { fail(spec, Step::Chdir, errno()) };
     }
 
-    // i: stdio (design.md §5 `child.stdio`).
+    // i: stdio (`child.stdio`).
     // SAFETY: open/dup2 on `ChildSpec` paths and fds.
     let e = unsafe { set_up_stdio(spec) };
     if e != 0 {
@@ -370,7 +370,7 @@ unsafe fn run(spec: &ChildSpec) -> ! {
     }
 }
 
-/// stdin/stdout/stderr (design.md §5 `child.stdio`): `stdin_file` is opened
+/// stdin/stdout/stderr (`child.stdio`): `stdin_file` is opened
 /// relative to the (already chdir'd) cwd; outputs go to `*_file` or to the
 /// inherited pipe write ends; a missing input defaults to /dev/null.
 ///
@@ -522,7 +522,7 @@ unsafe fn parent_is_alive(spec: &ChildSpec) -> bool {
 }
 
 /// Reports the failed step on the sync socket and exits the child; the
-/// parent turns the pair into `ExecSetupError` (design.md §5).
+/// parent turns the pair into `ExecSetupError`.
 ///
 /// # Safety
 /// Child-only, and it never returns.

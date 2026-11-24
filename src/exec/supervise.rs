@@ -1,9 +1,9 @@
-//! Parent-side event loop (design.md §3 step 7): a single-threaded epoll over
+//! Parent-side event loop: a single-threaded epoll over
 //! the pidfd, the sync socket, the output pipes and the stdin write end.
 //!
 //! The epoll timeout is the shorter of the Ctrl-C checkpoint (100 ms) and
 //! the remaining wall budget; a tripped wall clock or output cap kills the
-//! run through the run cgroup (`cgroup.kill`, design.md §6/§7) and the loop
+//! run through the run cgroup (`cgroup.kill`) and the loop
 //! keeps draining the pipes until the teardown closes them.
 
 use std::io;
@@ -41,11 +41,11 @@ pub struct Input {
     pub stdin_bytes: Vec<u8>,
     pub stdout_limit_bytes: Option<u64>,
     pub stderr_limit_bytes: Option<u64>,
-    /// design.md §6: the absolute wall-clock deadline measured from "go"
+    /// The absolute wall-clock deadline measured from "go"
     /// (`None` = no limit). Firing means river killed the run and the
     /// verdict is `TLE` — see `Supervised::wall_timeout`.
     pub wall_deadline: Option<Instant>,
-    /// Kills go through the run cgroup (design.md §7 `cgroup.kill`).
+    /// Kills go through the run cgroup (`cgroup.kill`).
     pub cgroup: Arc<RunCgroup>,
 }
 
@@ -71,8 +71,8 @@ pub enum Error {
     Io(String),
 }
 
-/// Runs the loop until the sandbox child and every pipe have gone quiet
-/// (design.md §3 step 7, §10). Returns the collected `(stdout, stderr)`.
+/// Runs the loop until the sandbox child and every pipe have gone quiet.
+/// Returns the collected `(stdout, stderr)`.
 pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
     let epfd = epoll::create(epoll::CreateFlags::CLOEXEC).map_err(io_fail("epoll_create"))?;
     let add = |fd: &OwnedFd, token: u64| {
@@ -103,7 +103,7 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
 
     let mut stdout_buf: Vec<u8> = Vec::new();
     let mut stderr_buf: Vec<u8> = Vec::new();
-    // True byte counts (the buffers are capped, design.md §10); the OLE
+    // True byte counts (the buffers are capped); the OLE
     // verdict needs what was actually produced, not what was kept.
     let mut stdout_total: u64 = 0;
     let mut stderr_total: u64 = 0;
@@ -123,7 +123,7 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
 
     let result = loop {
         // The timeout is the shorter of the Ctrl-C checkpoint and the
-        // remaining wall budget (design.md §3 step 7). `pid_exited` guards
+        // remaining wall budget. `pid_exited` guards
         // the boundary race: a child that died just before the deadline
         // finished on its own — no kill, no TLE.
         let timeout: libc::c_int = match input.wall_deadline {
@@ -237,7 +237,7 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
             break Err(e);
         }
 
-        // OLE (design.md §6): strictly past a cap — a stream sitting exactly
+        // OLE: strictly past a cap — a stream sitting exactly
         // at its limit produced no excess. The first offender kills the run
         // once; draining continues so the pipes never block the writers.
         if !output_killed {
@@ -253,7 +253,7 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
             break Ok(());
         }
 
-        // Ctrl-C checkpoint (design.md §4): every wakeup checks for pending
+        // Ctrl-C checkpoint: every wakeup checks for pending
         // Python signals; on error the child is killed and reaped below.
         if Python::attach(|py| py.check_signals()).is_err() {
             break Err(Error::Interrupted);
@@ -261,8 +261,8 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
     };
 
     if result.is_err() {
-        // No orphan sandbox: `cgroup.kill` takes the whole tree at once
-        // (design.md §7), then reap pid 1 so the caller never blocks on a
+        // No orphan sandbox: `cgroup.kill` takes the whole tree at once,
+        // then reap pid 1 so the caller never blocks on a
         // zombie.
         input.cgroup.kill();
         reap(input.pid);
@@ -284,7 +284,7 @@ pub fn run(mut input: Input) -> Result<(Supervised, Vec<u8>, Vec<u8>), Error> {
 
 /// Reads until `EAGAIN` or EOF; `Ok(true)` = EOF reached. Bytes past the cap
 /// are kept out of `buf` but still counted in `total` — the OLE verdict
-/// (design.md §6) needs the real byte count, not the capped buffer.
+/// needs the real byte count, not the capped buffer.
 fn drain(fd: RawFd, buf: &mut Vec<u8>, limit: Option<u64>, total: &mut u64) -> io::Result<bool> {
     let mut chunk = [0u8; 64 * 1024];
     loop {

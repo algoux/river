@@ -1,4 +1,4 @@
-//! Preflight checks shared by `river.doctor()` and `River.__new__` (design.md §8).
+//! Preflight checks shared by `river.doctor()` and `River.__new__`.
 //!
 //! Every check yields a `Check` row `(name, ok, detail, remediation)`. The name
 //! also selects which exception a failed check raises, so this module is the
@@ -22,7 +22,7 @@ use crate::cgroup;
 /// `(name, ok, detail, remediation)` — one row of a doctor report.
 pub type Check = (String, bool, String, Option<String>);
 
-/// Minimum kernel version (design.md appendix A).
+/// Minimum kernel version.
 const MIN_KERNEL: (u32, u32) = (6, 8);
 
 const KERNEL_FIX: &str = "run river on Linux 6.8 or newer";
@@ -271,7 +271,7 @@ fn check_workdir() -> Check {
 }
 
 /// Where sandbox `/work` directories live: `$XDG_RUNTIME_DIR/river`, otherwise
-/// `/dev/shm/river-<uid>` (design.md §10). Created with mode 0700 and verified
+/// `/dev/shm/river-<uid>`. Created with mode 0700 and verified
 /// to be owned by the current user.
 pub fn workdir_base() -> Result<PathBuf, String> {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
@@ -307,7 +307,7 @@ fn euid() -> u32 {
 
 fn check_landlock_abi() -> Check {
     // Informational only: a kernel without Landlock just runs without the
-    // filesystem hardening layer (design.md §9).
+    // filesystem hardening layer.
     let detail = match crate::exec::landlock::probe_abi() {
         Ok(abi) => format!("Landlock ABI v{abi}"),
         Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
@@ -322,7 +322,7 @@ fn check_landlock_abi() -> Check {
 // ------------------------------------------------------------------ rootfs
 
 /// Directories and regular files river needs as mount points inside the rootfs
-/// (design.md §5, §8). Missing ones are always created; existing ones untouched.
+/// Missing ones are always created; existing ones untouched.
 const MOUNT_DIRS: [&str; 7] = ["proc", "sys", "dev/pts", "dev/shm", "dev/mqueue", "tmp", "work"];
 const MOUNT_FILES: [&str; 6] =
     ["dev/null", "dev/zero", "dev/full", "dev/random", "dev/urandom", "dev/ptmx"];
@@ -381,7 +381,7 @@ fn ensure_mount_point(rootfs: &Path, rel: &str, is_dir: bool) -> PyResult<()> {
     })
 }
 
-/// `meta.json` (design.md §4.1): only `envs` is defined; unknown keys are ignored.
+/// `meta.json`: only `envs` is defined; unknown keys are ignored.
 fn parse_meta(py: Python<'_>, meta: &Path, text: &str) -> PyResult<HashMap<String, String>> {
     let parsed = (|| -> PyResult<HashMap<String, String>> {
         let json = py.import("json")?;

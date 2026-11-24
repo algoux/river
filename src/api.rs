@@ -1,5 +1,4 @@
-//! Python-facing API: `River`, `ExecResult` and the exception hierarchy
-//! (design.md §4).
+//! Python-facing API: `River`, `ExecResult` and the exception hierarchy.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -50,12 +49,12 @@ pyo3::create_exception!(
 );
 
 /// Runs programs inside a rootfs. Construction performs every preflight check
-/// (design.md §8) and raises on the first failure; instances are immutable and
-/// safe to share between threads.
+/// and raises on the first failure; instances are immutable and safe to share
+/// between threads.
 #[pyclass(frozen, module = "river")]
 pub struct River {
     rootfs: PathBuf,
-    /// `envs` from `<rootfs>/meta.json`, consumed by `exec()` (design.md §4.1).
+    /// `envs` from `<rootfs>/meta.json`, consumed by `exec()`.
     envs: Option<HashMap<String, String>>,
 }
 
@@ -90,7 +89,7 @@ impl River {
         false
     }
 
-    /// Executes `executable` inside the sandbox (design.md §4). The sandbox
+    /// Executes `executable` inside the sandbox. The sandbox
     /// child is pid 1 of a fresh pid namespace; every end state lands in the
     /// returned `ExecResult`, only setup failures raise.
     #[pyo3(signature = (
@@ -181,7 +180,7 @@ impl River {
             None => Vec::new(),
             Some(value) => extract_copy_out(py, value)?,
         };
-        // design.md §10: keys normalize strictly below /work.
+        // Keys normalize strictly below /work.
         for (key, _) in &copy_in {
             exec::io::sandbox_path(key, &cwd).map_err(RootfsError::new_err)?;
         }
@@ -189,7 +188,7 @@ impl River {
             exec::io::sandbox_path(key, &cwd).map_err(RootfsError::new_err)?;
         }
 
-        // design.md §6: from here the limits reach the run cgroup
+        // From here the limits reach the run cgroup
         // (`memory.max`, `pids.max`), the rlimits (`RLIMIT_*`) or the
         // supervisor (wall clock, output caps).
 
@@ -225,7 +224,7 @@ impl River {
     }
 }
 
-/// `str | os.PathLike` → `String` (design.md §4).
+/// `str | os.PathLike` → `String`.
 fn str_or_path(py: Python<'_>, value: Py<PyAny>) -> PyResult<String> {
     let bound = value.bind(py);
     if let Ok(text) = bound.extract::<String>() {
@@ -269,7 +268,7 @@ fn extract_envs(py: Python<'_>, value: Py<PyAny>) -> PyResult<HashMap<String, St
     Ok(out)
 }
 
-/// `Mapping[str, bytes | str | os.PathLike]` → copy_in entries (design.md §10).
+/// `Mapping[str, bytes | str | os.PathLike]` → copy_in entries.
 fn extract_copy_in(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, CopyInValue)>> {
     let bound = value.bind(py);
     let items = bound.call_method0("items")?;
@@ -294,8 +293,8 @@ fn extract_copy_in(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, Co
     Ok(out)
 }
 
-/// `Mapping[str, None | str | os.PathLike]` → copy_out entries (design.md
-/// §4, §10): a host path as `str` or `os.PathLike` gets the content written
+/// `Mapping[str, None | str | os.PathLike]` → copy_out entries: a host path
+/// as `str` or `os.PathLike` gets the content written
 /// over it, `None` keeps the content in `ExecResult.files`.
 fn extract_copy_out(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, Option<String>)>> {
     let bound = value.bind(py);
@@ -321,15 +320,14 @@ fn extract_copy_out(py: Python<'_>, value: Py<PyAny>) -> PyResult<Vec<(String, O
     Ok(out)
 }
 
-/// `ExecFailure` → the Python exception it represents (design.md §4).
+/// `ExecFailure` → the Python exception it represents.
 fn failure_to_err(py: Python<'_>, failure: ExecFailure) -> PyErr {
     match failure {
         ExecFailure::BadParams(msg) => PyValueError::new_err(msg),
         ExecFailure::Rootfs(msg) => RootfsError::new_err(msg),
         ExecFailure::Host(msg) => RiverError::new_err(msg),
         ExecFailure::Setup { step, errno, context } => {
-            // ExecSetupError carries the step name and the errno text
-            // (design.md §4).
+            // ExecSetupError carries the step name and the errno text.
             let errno_text = if errno == 0 {
                 String::new()
             } else {
@@ -343,7 +341,7 @@ fn failure_to_err(py: Python<'_>, failure: ExecFailure) -> PyErr {
             ExecSetupError::new_err(msg)
         }
         ExecFailure::CopyOut { key, reason, result } => {
-            // design.md §4: `.result` carries the run that finished before
+            // `.result` carries the run that finished before
             // copy_out failed, so the caller keeps the verdict and metrics.
             // (This function returns PyErr, not PyResult, so the ? operator
             // is unavailable here.)
@@ -355,7 +353,7 @@ fn failure_to_err(py: Python<'_>, failure: ExecFailure) -> PyErr {
         }
         ExecFailure::Interrupted => {
             // The child is already killed and reaped; surface the pending
-            // signal now that the GIL is back (design.md §4).
+            // signal now that the GIL is back.
             match py.check_signals() {
                 Err(err) => err,
                 Ok(()) => PyKeyboardInterrupt::new_err("river.exec() was interrupted"),
@@ -384,7 +382,7 @@ fn build_result(py: Python<'_>, outcome: exec::Outcome) -> ExecResult {
     }
 }
 
-/// Immutable outcome of one `River.exec()` (design.md §4).
+/// Immutable outcome of one `River.exec()`.
 #[pyclass(frozen, module = "river", get_all)]
 pub struct ExecResult {
     pub status: String,

@@ -1,4 +1,4 @@
-//! Landlock filesystem rules (design.md §9).
+//! Landlock filesystem rules.
 //!
 //! The parent computes the ABI-gated access masks (using the `landlock`
 //! crate's `AccessFs` flag values, which mirror the kernel UAPI bits); the
@@ -12,7 +12,7 @@ use std::os::fd::RawFd;
 use landlock::{Access, ABI, AccessFs, BitFlags};
 
 /// Access rights river handles, each paired with the ABI that introduced it
-/// (design.md §9). Read/execute rights are never handled: the rootfs is
+/// Read/execute rights are never handled: the rootfs is
 /// mounted read-only and `/proc` is a fresh instance.
 const HANDLED: [(AccessFs, u32); 11] = [
     (AccessFs::WriteFile, 1),
@@ -63,7 +63,7 @@ pub fn probe_abi() -> io::Result<u32> {
 
 /// Masks for the running kernel; `None` when Landlock is unavailable (ABI 0,
 /// `ENOSYS` or `EOPNOTSUPP`) and the hardening layer is skipped with a debug
-/// warning (design.md §9).
+/// warning.
 pub fn compute_masks() -> Option<Masks> {
     let abi = probe_abi().ok()?;
     if abi == 0 {
@@ -101,7 +101,7 @@ fn bits(right: AccessFs) -> u64 {
 
 // ------------------------------------------------------------- child side
 
-/// Fixed rule targets inside every sandbox (design.md §9): the full handled
+/// Fixed rule targets inside every sandbox: the full handled
 /// set for the writable mounts, `WRITE_FILE` only for the pseudo-terminal
 /// and the bound device nodes.
 const RULES: [(&CStr, bool); 10] = [
@@ -135,7 +135,7 @@ struct PathBeneathAttr {
 const RULE_PATH_BENEATH: libc::c_int = 1;
 
 /// Creates the ruleset, adds every rule, then restricts self. Runs in the
-/// child after `no_new_privs` (design.md §5); returns 0 or the errno.
+/// child after `no_new_privs`; returns 0 or the errno.
 ///
 /// # Safety
 /// Must run in the child after clone3, with `masks` backed by `ChildSpec`

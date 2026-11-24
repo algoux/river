@@ -1,6 +1,5 @@
 //! cgroup v2: delegation detection, the per-process `river/` singleton
-//! (design.md §7, steps 1–5) and the per-run cgroups (design.md §3 step 2,
-//! §6, §7).
+//! and the per-run cgroups.
 
 use std::fs;
 use std::io;
@@ -24,8 +23,9 @@ pub struct CgroupBase {
 
 static SINGLETON: OnceLock<Result<Arc<CgroupBase>, String>> = OnceLock::new();
 
-/// design.md §7 steps 1–5. The outcome (success or failure) is cached for the
-/// lifetime of the process: delegation does not change under a running process.
+/// Establishes the delegated-subtree singleton, steps 1–5. The outcome
+/// (success or failure) is cached for the lifetime of the process:
+/// delegation does not change under a running process.
 pub fn singleton() -> Result<Arc<CgroupBase>, String> {
     SINGLETON.get_or_init(init).clone()
 }
@@ -114,7 +114,7 @@ fn write_file(path: &Path, data: String) -> Result<(), String> {
 
 // ------------------------------------------------------------------ per-run
 
-/// The knobs the exec() limits put on the run cgroup (design.md §6). Every
+/// The knobs the exec() limits put on the run cgroup. Every
 /// `None` field means the knob is never written: a limit of `None` must
 /// leave the cgroup file at its default.
 pub struct RunKnobs {
@@ -126,11 +126,11 @@ pub struct RunKnobs {
 pub struct RunMetrics {
     pub cpu_time_used_ms: u64,
     pub memory_used_bytes: u64,
-    /// `memory.events` reported an OOM kill in this cgroup (design.md §6).
+    /// `memory.events` reported an OOM kill in this cgroup.
     pub oom_kill: bool,
 }
 
-/// One exec's cgroup `<base>/river-<pid>-<seq>` (design.md §7): the limit
+/// One exec's cgroup `<base>/river-<pid>-<seq>`: the limit
 /// knobs live here, the sandbox tree runs here, `cgroup.kill` clears it and
 /// the metrics are read from it before the `rmdir`. Dropping without
 /// `finish()` is the failure-path cleanup.
@@ -140,7 +140,7 @@ pub struct RunCgroup {
 }
 
 impl RunCgroup {
-    /// design.md §3 step 2 / §7: create the cgroup and write the knobs
+    /// Create the cgroup and write the knobs
     /// before the child exists, so every limit is in force before "go".
     pub fn create(knobs: &RunKnobs) -> Result<Self, String> {
         let base = singleton()?;
@@ -171,20 +171,20 @@ impl RunCgroup {
         &self.dir
     }
 
-    /// design.md §3 step 6: move the freshly cloned child in; the caller
+    /// Move the freshly cloned child in; the caller
     /// sends "go" right after, so every limit precedes the first sandboxed
     /// instruction.
     pub fn attach(&self, pid: i32) -> Result<(), String> {
         write_knob(&self.dir, "cgroup.procs", &pid.to_string())
     }
 
-    /// Atomic kill of every process in the cgroup (5.14+, design.md §7).
+    /// Atomic kill of every process in the cgroup (5.14+).
     pub fn kill(&self) {
         let _ = fs::write(self.dir.join("cgroup.kill"), b"1");
     }
 
-    /// Wait until `cgroup.events` reports `populated 0` (design.md §3
-    /// step 8): after the pid-1 reap the namespace teardown is normally
+    /// Wait until `cgroup.events` reports `populated 0`: after the pid-1
+    /// reap the namespace teardown is normally
     /// instantaneous, and the cap only guards against a stuck straggler.
     fn wait_empty(&self, cap: Duration) -> bool {
         let deadline = Instant::now() + cap;
@@ -204,8 +204,8 @@ impl RunCgroup {
         }
     }
 
-    /// design.md §3 step 8: wait for the teardown, read `cpu.stat` /
-    /// `memory.peak` / `memory.events`, then `rmdir`. The run already
+    /// Wait for the teardown, read `cpu.stat` / `memory.peak` /
+    /// `memory.events`, then `rmdir`. The run already
     /// happened, so an unreadable file degrades to zero instead of failing.
     pub fn finish(&self) -> RunMetrics {
         if !self.wait_empty(Duration::from_secs(5)) {
@@ -241,7 +241,7 @@ impl RunCgroup {
 }
 
 impl Drop for RunCgroup {
-    /// Failure-path cleanup (design.md §7): no live process and no cgroup
+    /// Failure-path cleanup: no live process and no cgroup
     /// directory survive an exec that bailed out mid-run.
     fn drop(&mut self) {
         if !self.finished.swap(true, Ordering::AcqRel) {
@@ -252,7 +252,7 @@ impl Drop for RunCgroup {
     }
 }
 
-/// `memory.events`: did the counter `name` ever tick (design.md §6 MLE)? A
+/// `memory.events`: did the counter `name` ever tick (the MLE verdict's source)? A
 /// group OOM kill shows up as `oom_group_kill`; both count as OOM evidence.
 fn oom_event(text: &str, name: &str) -> bool {
     text.lines().any(|line| {

@@ -1,7 +1,7 @@
 """Attack-surface tests: what the sandbox must refuse (marker: attack).
 
-development-plan.md §4, PR 4: the seccomp denylist and the Landlock rules
-(design.md §9) are always on, every attack below is rejected, and the
+The seccomp denylist and the Landlock rules are always on, every attack
+below is rejected, and the
 legitimate operations around each one keep working. Like the functional
 group, these need a delegated cgroup and `RIVER_TEST_ROOTFS`; the raw
 syscall numbers in the table are x86_64 (the rootfs is too).
@@ -78,7 +78,7 @@ def wrong(got, expected):
 
 # ------------------------------------------------------- seccomp: the denylist
 
-# (name, call) — one raw probe per syscall of design.md §9, each judged by
+# (name, call) — one raw probe per denied syscall, each judged by
 # the errno it answers. The probes are chosen so that *without* the filter
 # several of them would simply succeed (open_tree, ptrace TRACEME,
 # process_vm_*v on self, add_key, settimeofday(NULL, NULL), ...); reboot
@@ -224,7 +224,7 @@ def test_allowed_socket_families_still_work(river_):
 def test_process_creation_and_pidfd_still_work(river_):
     # fork/vfork/pthread_create all go through clone3 first: it must answer
     # ENOSYS (not EPERM) for glibc to fall back to clone. pidfd_open and
-    # pidfd_send_signal are kept on purpose (design.md §9).
+    # pidfd_send_signal are kept on purpose.
     result = py(
         river_,
         PROLOGUE
@@ -263,14 +263,14 @@ def status_lines(river_, **kwargs):
 
 
 def test_hardening_layers_are_active(river_):
-    # Seccomp: 2 = SECCOMP_MODE_FILTER; NoNewPrivs: 1 (design.md §5
-    # `child.nnp`, `child.seccomp`).
+    # Seccomp: 2 = SECCOMP_MODE_FILTER; NoNewPrivs: 1 (`child.nnp`,
+    # `child.seccomp`).
     assert status_lines(river_) == {"Seccomp": "2", "NoNewPrivs": "1"}
 
 
 def test_hardening_off_is_the_control(river_, monkeypatch):
     # RIVER_HARDENING=off switches off seccomp and Landlock only
-    # (design.md §4; the variable is read by the host process). This is the
+    # (the variable is read by the host process). This is the
     # control for the whole group: two attacks that the layers above stop
     # go through here — an AF_NETLINK socket, and a write under /proc,
     # where Landlock has no rule.
@@ -291,7 +291,7 @@ def test_hardening_off_is_the_control(river_, monkeypatch):
 
 
 def test_filesystem_write_matrix(river_):
-    # design.md §9: /work, /tmp and /dev/shm get every handled right; the
+    # /work, /tmp and /dev/shm get every handled right; the
     # device nodes and /dev/pts get WRITE_FILE (+ IOCTL_DEV); everything
     # else — the read-only rootfs, /sys, /proc — refuses writes.
     table = {path: f"attempt(open, {path!r}, 'w')" for path in [
@@ -362,7 +362,7 @@ def test_proc_sys_is_not_writable(river_):
 
 
 def test_host_cgroup_is_invisible(river_):
-    # design.md §5 `child.mount.sys`: /sys/fs is covered by a tmpfs, so the
+    # `child.mount.sys`: /sys/fs is covered by a tmpfs, so the
     # cgroup2 the kernel auto-mounts there inside a userns is not visible.
     result = py(
         river_,
@@ -375,8 +375,8 @@ def test_host_cgroup_is_invisible(river_):
 
 
 def test_root_is_exactly_the_rootfs(river_, rootfs):
-    # "/" is the rootfs plus the mount points river adds inside it (design.md
-    # §8) — nothing of the host's directory tree is reachable.
+    # "/" is the rootfs plus the mount points river adds inside it — nothing
+    # of the host's directory tree is reachable.
     result = py(river_, "import os, json; print(json.dumps(sorted(os.listdir('/'))))\n")
     assert result.status == "AC", (result.stderr, result.error)
     assert set(json.loads(result.stdout)) <= set(os.listdir(rootfs)) | {"work"}
@@ -391,7 +391,7 @@ def test_root_is_exactly_the_rootfs(river_, rootfs):
 
 def test_copy_out_symlink_is_rejected(river_):
     # A symlink planted in /work must not make the host read /etc/passwd
-    # (design.md §10: non-regular files -> CopyOutError).
+    # (non-regular files -> CopyOutError).
     with pytest.raises(CopyOutError, match="not a regular file"):
         py(
             river_,

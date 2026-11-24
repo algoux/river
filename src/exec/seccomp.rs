@@ -1,4 +1,4 @@
-//! seccomp denylist (design.md §5 `child.seccomp`, §9).
+//! seccomp denylist (`child.seccomp`).
 //!
 //! Two BPF programs, both generated with `seccompiler` and installed back
 //! to back by the child right after `no_new_privs` (seccomp stacks filters
@@ -16,7 +16,7 @@
 //! constants instead of raw numbers (libc resolves them per architecture).
 //! Everything without a rule is allowed: this is a denylist, and the
 //! namespaces, the dropped caps, the read-only rootfs and Landlock carry
-//! the rest (design.md §9). `RIVER_HARDENING=off` installs neither.
+//! the rest. `RIVER_HARDENING=off` installs neither.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +25,7 @@ use seccompiler::{
     SeccompFilter, SeccompRule, TargetArch,
 };
 
-/// Syscalls that answer `EPERM` whatever their arguments (design.md §9):
+/// Syscalls that answer `EPERM` whatever their arguments:
 /// the mount family, the kernel attack surface, the system-level group,
 /// fanotify, and the two namespace syscalls denied outright (`clone` and
 /// `clone3` get the flag-sensitive rules below). `adjtime` and `umount`
@@ -94,7 +94,7 @@ const DENIED: &[libc::c_long] = &[
     libc::SYS_setns,
 ];
 
-/// `clone` flags that create or join a namespace (design.md §9).
+/// `clone` flags that create or join a namespace.
 const CLONE_NS_FLAGS: [u64; 9] = [
     libc::CLONE_NEWTIME as u64,
     libc::CLONE_NEWNS as u64,
@@ -158,7 +158,7 @@ fn clone_rules() -> Result<Vec<SeccompRule>, String> {
         .collect()
 }
 
-/// `socket(2)` families the sandbox may create (design.md §9):
+/// `socket(2)` families the sandbox may create:
 /// `AF_UNSPEC`, `AF_UNIX`, `AF_INET`, `AF_INET6`. A denylist cannot name
 /// "everything else", but the allowlist is two gaps wide: the families
 /// between `AF_INET` and `AF_INET6`, and everything above `AF_INET6`

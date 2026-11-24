@@ -1,4 +1,4 @@
-//! Host-side I/O (design.md §10): the `/work` directory, copy_in/copy_out
+//! Host-side I/O: the `/work` directory, copy_in/copy_out
 //! key validation, the hardened reads below `/work` and the stdio pipes.
 //!
 //! Everything the host reads out of a run's work directory goes through
@@ -52,8 +52,7 @@ pub fn normalized_sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> 
     Ok(out)
 }
 
-/// copy_in/copy_out key, normalized and enforced strictly below /work
-/// (design.md §10).
+/// copy_in/copy_out key, normalized and enforced strictly below /work.
 pub fn sandbox_path(key: &str, cwd: &str) -> Result<PathBuf, String> {
     let out = normalized_sandbox_path(key, cwd)?;
     if out == Path::new("/work") {
@@ -76,7 +75,7 @@ fn host_path(work_dir: &Path, sandbox: &Path) -> PathBuf {
     work_dir.join(sandbox.strip_prefix("/work").unwrap())
 }
 
-/// Writes every copy_in entry into the host work directory (design.md §10).
+/// Writes every copy_in entry into the host work directory.
 /// Nested keys get their parent directories created. The directory was
 /// created by river a moment ago and nothing else has seen it yet, so
 /// plain path operations are fine here (contrast [`open_beneath`]).
@@ -163,8 +162,8 @@ pub fn open_beneath(work_fd: RawFd, sandbox: &Path) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(r as RawFd) })
 }
 
-/// The human-readable half of a `CopyOutError` (design.md §4: missing /
-/// not a regular file / over the limit), for a lookup that failed.
+/// The human-readable half of a `CopyOutError` (missing / not a regular
+/// file / over the limit), for a lookup that failed.
 fn describe_open_error(e: &io::Error) -> String {
     match e.raw_os_error() {
         Some(libc::ENOENT) => "is missing".to_string(),
@@ -178,7 +177,7 @@ fn describe_open_error(e: &io::Error) -> String {
     }
 }
 
-/// One copy_out entry that could not be retrieved (design.md §10).
+/// One copy_out entry that could not be retrieved.
 pub struct CopyOutFailure {
     /// The offending `copy_out` key, exactly as the caller spelled it.
     pub key: String,
@@ -195,7 +194,7 @@ impl CopyOutFailure {
     }
 }
 
-/// Retrieves every copy_out entry (design.md §10): `None` values land in
+/// Retrieves every copy_out entry: `None` values land in
 /// `r.files[key]`, host paths get the content written over them. Every
 /// entry is read first and the host destinations are written only once
 /// all of them succeeded, so a failing run leaves no half-written host

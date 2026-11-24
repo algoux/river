@@ -1,7 +1,7 @@
 # Build the manylinux wheel on every code push to dev. Tests are deliberately
 # NOT run here: the suite needs a delegated cgroup and a docker-exported
-# rootfs, which the hosted runners cannot provide; verification stays on the
-# two documented environments (docs/development-plan.md §4 preamble).
+# rootfs, which the hosted runners cannot provide; verification runs on the
+# development machines instead.
 name: wheels
 
 on:
