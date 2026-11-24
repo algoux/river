@@ -17,9 +17,9 @@ usage and verdicts (`AC` / `RE` / `TLE` / `MLE` / `OLE`).
 
 The API section below is the complete surface, in one page.
 
-**Status: v0.1.0 released.** The PyPI distribution is `river-sandbox` — the
+**Status: v0.1.1 on PyPI.** The PyPI distribution is `river-sandbox` — the
 `river` name there belongs to the (unrelated) online machine learning library
-— while the import name stays `river`. Wheels live on the
+— while the import name stays `river`. The v0.1.0 wheels also live on the
 [releases page](https://github.com/algoux/river/releases).
 
 ## Requirements

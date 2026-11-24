@@ -16,9 +16,9 @@ river 是一个 Python 库：把任意程序放进一个以调用方提供的 ro
 
 下面的 API 一节就是完整接口说明。
 
-**状态：v0.1.0 已发布。** PyPI 上的发行名是 `river-sandbox` —— 那里 `river`
-这个名字属于另一个（无关的）在线机器学习库 —— 而导入名仍然是 `river`。wheel
-放在 [releases 页面](https://github.com/algoux/river/releases)。
+**状态：PyPI 上已发布 v0.1.1。** PyPI 上的发行名是 `river-sandbox` —— 那里 `river`
+这个名字属于另一个（无关的）在线机器学习库 —— 而导入名仍然是 `river`。v0.1.0 的
+wheel 也放在 [releases 页面](https://github.com/algoux/river/releases)。
 
 ## 环境要求
 
